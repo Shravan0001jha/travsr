@@ -653,8 +653,24 @@ fn extract_macro_calls(
         // LSIF drops, under the same fail-closed contract as the call recovery
         // above: the name is resolved against the real node table and anything
         // that matches nothing is dropped, never guessed at.
+        //
+        // Known precision limit: this scans every string literal in the
+        // token_tree, not only format-string arguments, because the macro name
+        // is not in scope here (the top-level `macro_invocation` is several
+        // parents up) and a name-keyed allowlist would have to enumerate every
+        // format macro — `tracing::info!` included, which is this PR's own repro
+        // — and silently regress the fix whenever it missed one. So a data
+        // literal that happens to hold `{NAME}` (`vec!["{MAX_LEN}"]`) can
+        // fabricate a reference when `NAME` is a real const. This trades a narrow
+        // false-positive for not regressing the headline recall fix; the
+        // fail-closed drop only removes captures that resolve to nothing.
         for child in &children {
-            if child.kind() != "string_literal" {
+            // Raw strings are a distinct node kind but are ordinary format
+            // strings: `println!(r"{CONST}")`, common for path/regex messages
+            // that carry backslashes. `utf8_text` returns the whole node
+            // including the `r`/`r#"` prefix and `capture_position` measures from
+            // the node start, so the recovered offsets stay aligned with source.
+            if !matches!(child.kind(), "string_literal" | "raw_string_literal") {
                 continue;
             }
             let Ok(lit) = child.utf8_text(source) else {
@@ -1310,6 +1326,40 @@ fn f(count: usize) {
             !out.iter().any(|u| u.callee_sig.starts_with("const:")),
             "no const refs expected, got {out:?}"
         );
+    }
+
+    #[test]
+    fn macro_format_capture_is_recovered_from_a_raw_string() {
+        // Raw strings are a distinct tree-sitter node kind but are ordinary
+        // format strings, and are exactly how a format message carrying
+        // backslashes or quotes is written (`r"C:\{DIR}\x"`). The #864 defect is
+        // fully present for them until the scan accepts `raw_string_literal`.
+        let source = br##"
+fn scaffold() {
+    println!(r"C:\{RULE_DIR}\rules");
+    println!(r#"cache at {CACHE_DIR} now"#);
+}
+"##;
+        let tree = parse_rust(source);
+        let mut out = Vec::new();
+        extract_macro_calls(tree.root_node(), source, "c", "src/lib.rs", &mut out);
+
+        assert!(
+            out.iter().any(|u| u.callee_sig == "const:RULE_DIR")
+                && out.iter().any(|u| u.callee_sig == "const:CACHE_DIR"),
+            "both raw format strings must yield a capture, got {out:?}"
+        );
+
+        // The reported column indexes the name in the source line, so an
+        // off-by-prefix (the `r` / `r#"` prefix, included in the node text)
+        // cannot pass.
+        let line3 = "    println!(r\"C:\\{RULE_DIR}\\rules\");";
+        let rule = out
+            .iter()
+            .find(|u| u.callee_sig == "const:RULE_DIR")
+            .expect("RULE_DIR capture present");
+        let col = rule.caller_col.expect("capture carries a column") as usize;
+        assert_eq!(&line3[col..col + "RULE_DIR".len()], "RULE_DIR");
     }
 
     fn parse_rust(source: &[u8]) -> tree_sitter::Tree {

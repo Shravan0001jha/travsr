@@ -731,10 +731,14 @@ fn phase_b_lang_incomplete(store: &SqliteStore, lang: &str) -> Option<&'static s
 /// healthy run and therefore lets a definitive zero through.
 ///
 /// `crashed:` is deliberately absent — the caller checks it first and has its
-/// own wording with a `--force` rebuild hint. The classes here are the rest of
-/// the set [`phase_b_unanalyzed_note`] treats as "this language produced no call
-/// edges", kept equal to it so this gate and the `semantic:` line in `travsr
-/// status` never disagree about what counts as incomplete.
+/// own wording with a `--force` rebuild hint. The classes here are every OTHER
+/// `phase_b_warnings` class travsr-daemon writes: whenever the daemon records
+/// that a language's Phase B did not complete, its zero is softened rather than
+/// asserted. This is intentionally broader than [`phase_b_unanalyzed_note`]'s
+/// banner set (which lists only the "no call edges at all" classes): a language
+/// skipped for no compile database, an untrusted corpus, or a mismatched
+/// analyzer version really was not analysed, so the gate and the banner can
+/// name different sets without disagreeing about whether the zero is definitive.
 ///
 /// Scope is the TARGET's language only, never the repo's other languages, so at
 /// most one language is ever named. A repo-wide reading would be more literal —
@@ -773,11 +777,27 @@ fn phase_b_incomplete_reason(store: &SqliteStore, lang: &str) -> Option<String> 
     }
     // Per-language classes: the analyzer was missing, skipped, or is waiting on
     // a one-time approval, so this language has no call edges from that run.
+    // The full set travsr-daemon writes as `<class>:{lang}`, minus the three
+    // (`crashed`, `emitter_missing`, `emitter_failed`) the caller softens ahead
+    // of this gate. Any daemon class not accounted for in one of the two places
+    // would let its language keep the definitive zero, so this list tracks the
+    // daemon's, not `phase_b_unanalyzed_note`'s narrower banner set.
     const CLASSES: &[(&str, &str)] = &[
         ("skipped_no_analyzer", "no analyzer is installed"),
         ("needs_approval", "its analyzer is waiting on approval"),
         ("needs_consent", "its analyzer is waiting on consent"),
         ("skipped_no_compdb", "it has no compilation database"),
+        ("zero_nodes", "its analyzer produced no symbols"),
+        (
+            "no_references",
+            "no reference resolved to an indexed symbol",
+        ),
+        ("version_mismatch", "its analyzer is a mismatched version"),
+        ("skipped_unregistered", "its analyzer is not registered"),
+        (
+            "untrusted_corpus",
+            "this corpus is not trusted for analysis",
+        ),
     ];
     if let Some(warnings) = store.get_meta("phase_b_warnings").ok().flatten() {
         for entry in warnings.split(',') {
@@ -15206,6 +15226,53 @@ mod snippet_tests {
             .record_edge_sites(&[(caller.id, callee.id, 5, None)])
             .unwrap();
         store
+    }
+
+    #[test]
+    fn no_recorded_phase_b_failure_yields_a_definitive_zero() {
+        // Every phase_b_warnings class travsr-daemon writes must soften the zero
+        // for its language: the caller's partial-coverage gate handles crashed /
+        // emitter_*, phase_b_incomplete_reason handles the rest. Iterating the
+        // full daemon set, not a hand-picked subset, means a class added to the
+        // daemon without a decision here fails this test instead of silently
+        // earning a definitive zero. (travsr-daemon writes these as
+        // `<class>:{lang}`; version_mismatch carries `:{expected}:{got}` too.)
+        let daemon_classes = [
+            "crashed:rust",
+            "zero_nodes:rust",
+            "no_references:rust",
+            "version_mismatch:rust:1.0:2.0",
+            "needs_approval:rust",
+            "needs_consent:rust",
+            "skipped_unregistered:rust",
+            "untrusted_corpus:rust",
+            "skipped_no_analyzer:rust",
+            "skipped_no_compdb:rust",
+            "emitter_missing:rust",
+            "emitter_failed:rust",
+        ];
+        for warning in daemon_classes {
+            let mut store = store_with_analyzed_target();
+            store.set_meta("phase_b_warnings", warning).unwrap();
+            let out = find_references(&store, "unused", None);
+            assert!(
+                !out.contains("No uses recorded"),
+                "'{warning}' records that Phase B did not complete for rust, so \
+                 the zero must be softened rather than asserted: {out}"
+            );
+        }
+
+        // Control: a clean run still reaches the definitive zero, so the loop
+        // above cannot pass by hedging everything.
+        let mut clean = store_with_analyzed_target();
+        clean.set_meta("phase_b_warnings", "").unwrap();
+        clean.set_meta("rust_lsif_degraded", "").unwrap();
+        clean.set_meta("phase_b_dirty", "0").unwrap();
+        let out = find_references(&clean, "unused", None);
+        assert!(
+            out.contains("No uses recorded"),
+            "a clean index must still earn the definitive zero: {out}"
+        );
     }
 
     #[test]
