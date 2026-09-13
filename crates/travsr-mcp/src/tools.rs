@@ -720,6 +720,107 @@ fn phase_b_lang_incomplete(store: &SqliteStore, lang: &str) -> Option<&'static s
     })
 }
 
+/// #864: recorded evidence that Phase B did not analyse all of `lang` in this
+/// repo, as a reason phrase for the softened `find_references` zero, or `None`
+/// when the last run was complete for it.
+///
+/// Every source here is a fact Phase B writes about its own run, never an
+/// inference from how the graph turned out. That is the whole point: the
+/// occurrence ratio conflates "never analysed" with "analysed, calls nothing"
+/// and so can never read complete, while each of these is rewritten empty by a
+/// healthy run and therefore lets a definitive zero through.
+///
+/// `crashed:` is deliberately absent — the caller checks it first and has its
+/// own wording with a `--force` rebuild hint. The classes here are every OTHER
+/// `phase_b_warnings` class travsr-daemon writes: whenever the daemon records
+/// that a language's Phase B did not complete, its zero is softened rather than
+/// asserted. This is intentionally broader than [`phase_b_unanalyzed_note`]'s
+/// banner set (which lists only the "no call edges at all" classes): a language
+/// skipped for no compile database, an untrusted corpus, or a mismatched
+/// analyzer version really was not analysed, so the gate and the banner can
+/// name different sets without disagreeing about whether the zero is definitive.
+///
+/// Scope is the TARGET's language only, never the repo's other languages, so at
+/// most one language is ever named. A repo-wide reading would be more literal —
+/// a caller can in principle live in any language — but it re-creates the very
+/// failure this gate was written to avoid: a polyglot repo carries permanent
+/// warnings for languages it cannot analyse (this one has `skipped_no_compdb`
+/// for c and cpp, and no compile database is coming), so every zero in the repo
+/// would hedge and the hedge would stop meaning anything.
+///
+/// The residual gap is a caller in a different, unanalysed language. Measured on
+/// this repo: 25 of 17690 `ref/call` occurrences cross a language boundary
+/// (0.14%), and all 25 have an EMPTY source language — the file-attribution
+/// fallback, not a second analysed language. No analysed-language pair is
+/// affected, so the narrow gate costs nothing real today. Revisit if a genuine
+/// cross-language provider lands.
+///
+/// Targets in the empty language never arrive here: `language_has_edge_sites("")`
+/// is false by construction, so they return at the #299 branch above.
+fn phase_b_incomplete_reason(store: &SqliteStore, lang: &str) -> Option<String> {
+    // Rust-specific: rust-analyzer never ran, or ran and lost every ref.
+    if lang == "rust" {
+        match store
+            .get_meta("rust_lsif_degraded")
+            .ok()
+            .flatten()
+            .as_deref()
+        {
+            Some("sandbox_unavailable") => {
+                return Some("Rust analysis did not run (no OS sandbox)".to_string())
+            }
+            Some("all_refs_dropped") => {
+                return Some("no Rust reference resolved to an indexed symbol".to_string())
+            }
+            _ => {}
+        }
+    }
+    // Per-language classes: the analyzer was missing, skipped, or is waiting on
+    // a one-time approval, so this language has no call edges from that run.
+    // The full set travsr-daemon writes as `<class>:{lang}`, minus the three
+    // (`crashed`, `emitter_missing`, `emitter_failed`) the caller softens ahead
+    // of this gate. Any daemon class not accounted for in one of the two places
+    // would let its language keep the definitive zero, so this list tracks the
+    // daemon's, not `phase_b_unanalyzed_note`'s narrower banner set.
+    const CLASSES: &[(&str, &str)] = &[
+        ("skipped_no_analyzer", "no analyzer is installed"),
+        ("needs_approval", "its analyzer is waiting on approval"),
+        ("needs_consent", "its analyzer is waiting on consent"),
+        ("skipped_no_compdb", "it has no compilation database"),
+        ("zero_nodes", "its analyzer produced no symbols"),
+        (
+            "no_references",
+            "no reference resolved to an indexed symbol",
+        ),
+        ("version_mismatch", "its analyzer is a mismatched version"),
+        ("skipped_unregistered", "its analyzer is not registered"),
+        (
+            "untrusted_corpus",
+            "this corpus is not trusted for analysis",
+        ),
+    ];
+    if let Some(warnings) = store.get_meta("phase_b_warnings").ok().flatten() {
+        for entry in warnings.split(',') {
+            let mut parts = entry.trim().splitn(3, ':');
+            let (Some(class), Some(entry_lang)) = (parts.next(), parts.next()) else {
+                continue;
+            };
+            if entry_lang != lang {
+                continue;
+            }
+            if let Some((_, why)) = CLASSES.iter().find(|(c, _)| *c == class) {
+                return Some(format!("'{lang}' was not analysed, {why}"));
+            }
+        }
+    }
+    // Repo-wide (#583): a mid-edit reindex dropped call edges without moving
+    // HEAD. Cleared to "0" by the next Phase B run, so this does not latch.
+    if store.get_meta("phase_b_dirty").ok().flatten().as_deref() == Some("1") {
+        return Some("a re-index dropped call edges and they are not rebuilt yet".to_string());
+    }
+    None
+}
+
 /// The one-line caveat appended to a get_callers / find_references answer when
 /// [`phase_b_lang_incomplete`] holds for the target language. The `crashed`
 /// wording is unchanged from #715; the #878 classes name the skipped analyzer.
@@ -2049,18 +2150,49 @@ fn reference_fallback_from_edges(store: &SqliteStore, target: &CoreNode, header:
                 if pending_here == 1 { "is" } else { "are" },
             );
         }
-        // Coverage is effectively complete for this language and this symbol has
-        // neither occurrence rows nor ref/call edges. Report that as the fact it
-        // is. We cannot tell from here whether the uses do not exist, whether an
-        // ambiguous bare call was deliberately skipped, or whether the analyzer
-        // never emitted an occurrence for the call shape at all (scip-dotnet, for
-        // one, emits nothing for a generic invocation), so do not name a cause.
+        // The target's own file being analysed is necessary but not sufficient.
+        // A reference lives in whatever file *uses* the symbol, so a repo-wide
+        // "no uses anywhere" claim needs the analysis that would have recorded
+        // that use to have actually run, not just the one file the definition
+        // sits in.
+        //
+        // The gate is a recorded fact, not `language_occurrence_coverage`. #551
+        // rejected that ratio as a proxy for "was THIS file analysed"; it fails
+        // the repo-wide question too, for a different reason. The ratio counts
+        // files holding a `ref/call` occurrence, which cannot distinguish "never
+        // analysed" from "analysed, calls nothing", so it never reaches complete
+        // on a real repo — 208 of 239 real `.rs` files here, and every denominator
+        // we tried (all paths, callable-bearing paths, `files` rows) leaves a
+        // remainder of fixtures and call-free modules. Gating on it would make
+        // the definitive zero below unreachable, so every zero would print a
+        // hedge, which trains a reader to discount all of them.
+        //
+        // These markers are written by Phase B itself and rewritten empty on a
+        // healthy run, so a complete analysis still earns the definitive zero.
+        if let Some(reason) = phase_b_incomplete_reason(store, lang) {
+            return format!(
+                "{header}\n0 reference(s) recorded, but not a definitive zero: {reason}. \
+                 Run `travsr status`, or `find_pattern` for a textual search."
+            );
+        }
+        // Analysis for this language ran to completion and this symbol has
+        // neither occurrence rows nor ref/call edges: a genuine zero.
+        //
+        // The caveat names the recall limits that still exist. #864's repro was a
+        // uniquely-named constant used once inside a Rust format capture
+        // (`"{CONST} default rules"`), which no provider recorded; that gap is now
+        // closed in the extractor rather than described here (travsr-analysis
+        // recovers inline captures). What remains is the ambiguous bare call left
+        // unindexed by design, and analyzers that emit no occurrence for certain
+        // call shapes (scip-dotnet, for one, emits nothing for a generic
+        // invocation). Kept to one sentence on purpose: a paragraph of hedging
+        // would teach a reader to discount every zero, which is the same signal
+        // loss the gates above exist to prevent.
         return format!(
-            "{header}\n0 reference(s). The index recorded no uses of this symbol. \
-             That can mean it has none, or that the call sites were not indexed: \
-             an ambiguous bare call is skipped by design, and some analyzers emit \
-             no occurrence for certain call shapes. Use `find_pattern` for a \
-             textual search to tell the two apart."
+            "{header}\n0 reference(s). No uses recorded. Bare calls to a name defined \
+             in more than one place are left unindexed to avoid mis-targeting, and \
+             some analyzers emit no occurrence for certain call shapes; use \
+             `find_pattern` to be sure."
         );
     }
     let callers = store.get_nodes(&caller_ids).unwrap_or_default();
@@ -15063,19 +15195,17 @@ mod snippet_tests {
             "should name the unanalysed file: {out}"
         );
         assert!(
-            !out.contains("recorded no uses"),
+            !out.contains("No uses recorded"),
             "must not assert absence: {out}"
         );
     }
 
-    #[test]
-    fn find_references_keeps_definitive_zero_when_target_file_is_analyzed() {
-        // Converse of the above: the target's own file carries occurrence rows,
-        // so a zero for this symbol is a real zero and the existing confident
-        // wording must be preserved unchanged.
+    /// Shared fixture for the #864 gate tests: a target whose own file carries
+    /// occurrence rows (so the #450 per-file gate passes and we are testing the
+    /// repo-wide gate, nothing else).
+    fn store_with_analyzed_target() -> travsr_store::SqliteStore {
         use travsr_core::{Node, VName};
         let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
-
         let caller = Node::new(
             VName::new("", "", "src/svc.rs", "rust", "fn:caller"),
             "function",
@@ -15084,7 +15214,6 @@ mod snippet_tests {
             VName::new("", "", "src/svc.rs", "rust", "fn:callee"),
             "function",
         );
-        // Same file, analysed, but nothing references it.
         let unused = Node::new(
             VName::new("", "", "src/svc.rs", "rust", "fn:unused"),
             "function",
@@ -15096,15 +15225,241 @@ mod snippet_tests {
         store
             .record_edge_sites(&[(caller.id, callee.id, 5, None)])
             .unwrap();
+        store
+    }
+
+    #[test]
+    fn no_recorded_phase_b_failure_yields_a_definitive_zero() {
+        // Every phase_b_warnings class travsr-daemon writes must soften the zero
+        // for its language: the caller's partial-coverage gate handles crashed /
+        // emitter_*, phase_b_incomplete_reason handles the rest. Iterating the
+        // full daemon set, not a hand-picked subset, means a class added to the
+        // daemon without a decision here fails this test instead of silently
+        // earning a definitive zero. (travsr-daemon writes these as
+        // `<class>:{lang}`; version_mismatch carries `:{expected}:{got}` too.)
+        let daemon_classes = [
+            "crashed:rust",
+            "zero_nodes:rust",
+            "no_references:rust",
+            "version_mismatch:rust:1.0:2.0",
+            "needs_approval:rust",
+            "needs_consent:rust",
+            "skipped_unregistered:rust",
+            "untrusted_corpus:rust",
+            "skipped_no_analyzer:rust",
+            "skipped_no_compdb:rust",
+            "emitter_missing:rust",
+            "emitter_failed:rust",
+        ];
+        for warning in daemon_classes {
+            let mut store = store_with_analyzed_target();
+            store.set_meta("phase_b_warnings", warning).unwrap();
+            let out = find_references(&store, "unused", None);
+            assert!(
+                !out.contains("No uses recorded"),
+                "'{warning}' records that Phase B did not complete for rust, so \
+                 the zero must be softened rather than asserted: {out}"
+            );
+        }
+
+        // Control: a clean run still reaches the definitive zero, so the loop
+        // above cannot pass by hedging everything.
+        let mut clean = store_with_analyzed_target();
+        clean.set_meta("phase_b_warnings", "").unwrap();
+        clean.set_meta("rust_lsif_degraded", "").unwrap();
+        clean.set_meta("phase_b_dirty", "0").unwrap();
+        let out = find_references(&clean, "unused", None);
+        assert!(
+            out.contains("No uses recorded"),
+            "a clean index must still earn the definitive zero: {out}"
+        );
+    }
+
+    #[test]
+    fn find_references_softens_zero_when_phase_b_skipped_the_language() {
+        // A recorded fact that this language was not analysed: the softened
+        // answer must name the reason rather than assert absence.
+        let mut store = store_with_analyzed_target();
+        store
+            .set_meta("phase_b_warnings", "skipped_no_analyzer:rust")
+            .unwrap();
 
         let out = find_references(&store, "unused", None);
         assert!(
-            out.contains("recorded no uses"),
-            "analysed file should still give a definitive zero: {out}"
+            out.contains("not a definitive zero"),
+            "a language Phase B skipped must soften the claim: {out}"
+        );
+        assert!(
+            out.contains("no analyzer is installed"),
+            "should name the recorded reason: {out}"
+        );
+        assert!(
+            !out.contains("No uses of this symbol are recorded"),
+            "must not assert absence: {out}"
+        );
+    }
+
+    #[test]
+    fn find_references_softens_zero_for_another_languages_warning_only() {
+        // The warning is per-language and must be matched as such: a skipped
+        // Go analyzer says nothing about Rust coverage, so the Rust answer
+        // stays definitive. Guards against a substring match on the meta blob.
+        let mut store = store_with_analyzed_target();
+        store
+            .set_meta(
+                "phase_b_warnings",
+                "skipped_no_analyzer:go,zero_nodes:java,skipped_no_compdb:c",
+            )
+            .unwrap();
+
+        let out = find_references(&store, "unused", None);
+        assert!(
+            out.contains("No uses recorded"),
+            "another language's warning must not soften this one: {out}"
+        );
+
+        // And when the target's own language IS in the blob, it is the one
+        // picked out, not the first entry and not a second language.
+        store
+            .set_meta(
+                "phase_b_warnings",
+                "skipped_no_analyzer:go,needs_approval:rust,skipped_no_compdb:c",
+            )
+            .unwrap();
+        let out = find_references(&store, "unused", None);
+        assert!(
+            out.contains("'rust' was not analysed") && out.contains("waiting on approval"),
+            "must select the target language's own warning: {out}"
+        );
+        // The softening REASON is target-scoped: it must name rust and no other
+        // language. The repo-wide freshness banner appended after it
+        // (`with_phase_b_note` / `phase_b_unanalyzed_note`) lists every
+        // unanalysed language by design, so scope the leak check to the reason,
+        // ahead of that banner.
+        let reason = out.split("[note:").next().unwrap_or(&out);
+        assert!(
+            !reason.contains("go") && !reason.contains("compilation database"),
+            "the reason must not name another language: {out}"
+        );
+    }
+
+    #[test]
+    fn find_references_softens_zero_when_rust_lsif_degraded() {
+        // rust-analyzer never ran, so every Rust call edge is missing even
+        // though the target's own file has Phase A occurrence rows.
+        let mut store = store_with_analyzed_target();
+        store
+            .set_meta("rust_lsif_degraded", "sandbox_unavailable")
+            .unwrap();
+
+        let out = find_references(&store, "unused", None);
+        assert!(
+            out.contains("not a definitive zero") && out.contains("no OS sandbox"),
+            "a degraded Rust LSIF run must soften and explain: {out}"
+        );
+    }
+
+    #[test]
+    fn find_references_softens_zero_when_a_reindex_left_edges_dirty() {
+        // #583: a mid-edit reindex dropped call edges without moving HEAD.
+        let mut store = store_with_analyzed_target();
+        store.set_meta("phase_b_dirty", "1").unwrap();
+
+        let out = find_references(&store, "unused", None);
+        assert!(
+            out.contains("not a definitive zero") && out.contains("dropped call edges"),
+            "dropped edges must soften the claim: {out}"
+        );
+    }
+
+    #[test]
+    fn find_references_keeps_definitive_zero_on_a_healthy_index() {
+        // The property the #864 gate must preserve: on an index whose markers
+        // are all clean, the definitive zero is still REACHABLE. The previous
+        // occurrence-ratio gate failed exactly here — the manifest and external
+        // crate nodes below can never hold a `ref/call` row, so the ratio never
+        // read complete and this branch became dead code on every real repo.
+        use travsr_core::{Node, VName};
+        let mut store = store_with_analyzed_target();
+        // Every real Rust repo has these two. Neither can ever be "covered".
+        store
+            .put_node(&Node::new(
+                VName::new("", "", "crates/foo/Cargo.toml", "rust", "crate:foo"),
+                "crate",
+            ))
+            .unwrap();
+        store
+            .put_node(&Node::new(
+                VName::new("", "", "", "rust", "crate:serde"),
+                "crate",
+            ))
+            .unwrap();
+        // Analysed, simply nothing to call: indistinguishable from unanalysed
+        // in the occurrence ratio, which is why the ratio could not gate this.
+        store
+            .put_node(&Node::new(
+                VName::new("", "", "src/consts.rs", "rust", "const:K"),
+                "constant",
+            ))
+            .unwrap();
+        // Healthy markers, as a completed Phase B run leaves them.
+        store.set_meta("phase_b_warnings", "").unwrap();
+        store.set_meta("rust_lsif_degraded", "").unwrap();
+        store.set_meta("phase_b_dirty", "0").unwrap();
+
+        let out = find_references(&store, "unused", None);
+        assert!(
+            out.contains("No uses recorded"),
+            "a healthy index must still earn the definitive zero: {out}"
         );
         assert!(
             !out.contains("not a definitive zero"),
-            "should not soften when the file was analysed: {out}"
+            "must not hedge on a complete run: {out}"
+        );
+    }
+
+    #[test]
+    fn find_references_definitive_zero_names_only_surviving_recall_limits() {
+        // #864's repro: a uniquely-named constant used once, inside a Rust
+        // inline format capture the provider walks as a string literal. The old
+        // caveat offered only the name-collision reason, which did not apply,
+        // so a miss with a different cause read as an authoritative absence.
+        let store = store_with_analyzed_target();
+
+        let out = find_references(&store, "unused", None);
+        assert!(
+            out.contains("defined in more than one place"),
+            "the caveat must keep the name-collision limit: {out}"
+        );
+        assert!(
+            !out.contains("format"),
+            "inline format captures are recovered by the extractor now, so the \
+             caveat must not claim they are unindexed: {out}"
+        );
+    }
+
+    #[test]
+    fn find_references_structured_softens_note_but_keeps_total_zero() {
+        // The structured contract across the #864 gate: only `note` changes.
+        // `total` stays a real Some(0) per #755 Part B item 9, so a consumer
+        // keying on it is not handed a null it would read as "not counted".
+        let mut store = store_with_analyzed_target();
+        store
+            .set_meta("phase_b_warnings", "skipped_no_analyzer:rust")
+            .unwrap();
+
+        let got = find_references_structured(&store, "unused", None);
+        assert_eq!(got.status, "resolved");
+        assert_eq!(got.total, Some(0), "total must stay a counted zero");
+        assert!(got.references.is_empty());
+        let note = got.note.expect("softened answer must carry a note");
+        assert!(
+            note.contains("not a definitive zero") && note.contains("no analyzer is installed"),
+            "note should carry the softened wording: {note}"
+        );
+        assert!(
+            !note.starts_with("resolved:"),
+            "header belongs in resolved_to, not note: {note}"
         );
     }
 
