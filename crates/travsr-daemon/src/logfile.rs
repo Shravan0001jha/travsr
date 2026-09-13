@@ -33,7 +33,18 @@
 //! sidecar.version.stale    sidecar.version.unreadable
 //! sidecar.version.probe_timeout
 //! editor.attached          editor.detached
+//! query.served             query.failed
 //! ```
+//!
+//! `query.served` and `query.failed` were emitted long before they were listed
+//! here, which is how `query.served` came to be the most frequent line in the
+//! file: a key nobody had signed off as a lifecycle event, logged at INFO once
+//! per query. `query.failed` is WARN (a query that did not answer is a thing to
+//! count). `query.served` splits by content: INFO past
+//! [`crate::SLOW_QUERY_MS`], DEBUG below it, same fields either way, because a
+//! slow query is an event and a fast one is the running commentary this list
+//! exists to keep out. A consumer counting served queries must read the file at
+//! debug; one watching for slow ones can stay at the default.
 //!
 //! The `sidecar.version.*` keys (RFC-025) report the external-binary version
 //! contract. They are emitted from `travsr-plugin-host` on every resolve/spawn,

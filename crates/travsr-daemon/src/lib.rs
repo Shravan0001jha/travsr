@@ -5876,6 +5876,26 @@ mod tests {
     use std::process::Command as StdCommand;
     use std::sync::Mutex;
 
+    /// `query.served` was INFO on every query, which made it 28 of about 130
+    /// lines in this repo's own log, most of them `elapsed_ms=0` cache hits.
+    /// The level now follows the content, so this pins where the line sits and
+    /// that the boundary is inclusive: a threshold read as "slower than" leaves
+    /// a band that is neither event nor commentary.
+    #[test]
+    fn only_a_slow_query_is_worth_an_info_line() {
+        assert!(!query_is_slow(0), "a cache hit is commentary");
+        assert!(!query_is_slow(SLOW_QUERY_MS - 1));
+        assert!(query_is_slow(SLOW_QUERY_MS), "the threshold itself counts");
+        assert!(query_is_slow(SLOW_QUERY_MS + 1));
+        // Comfortably above the 50 ms p95 the bench gate enforces, so a query
+        // at the edge of the budget does not log and one well past it does.
+        // Tightening this to the gate would put the log back where it was.
+        assert!(
+            !query_is_slow(50),
+            "a query inside the p95 budget must not log at info"
+        );
+    }
+
     /// #735: the embed tick body must be single-flight. A tick that fires
     /// while the previous body still runs used to start a second concurrent
     /// full-repo embed-text pass; on repos where one pass outlives the tick
@@ -14339,6 +14359,61 @@ fn live_editor_sessions(
 /// Called from the Unix domain-socket accept loop and the Windows Named Pipe
 /// accept loop. Gated to the two supported control-plane platforms so the
 /// compiler does not emit dead_code on exotic targets.
+/// How long a query has to take before serving it is an event rather than
+/// commentary.
+///
+/// Four times the 50 ms p95 the bench gate enforces, so a query at the edge of
+/// the budget does not log and one well past it does. The point is a threshold
+/// that is quiet when things are normal; tightening it to the gate itself would
+/// put the log back where it was.
+pub(crate) const SLOW_QUERY_MS: u128 = 200;
+
+/// The one `query.served` line, at the level its content earns.
+///
+/// This was unconditionally INFO, which made it the most frequent line in the
+/// file by a wide margin: 28 of about 130 lines in this repo's own log, most of
+/// them `elapsed_ms=0` cache hits. `logfile.rs` states the rule it broke, that a
+/// line is worth INFO where something happened a reader would count or chart,
+/// and not for the running commentary in between, and a line per query is the
+/// definition of commentary.
+///
+/// Dropping it to DEBUG outright would have cost the thing it was added for:
+/// "which query was slow" has to stay answerable without restarting the daemon
+/// at debug. So the level follows the content. A slow query is an event; a fast
+/// one is not. Same `event` key and the same fields either way, so anything
+/// selecting on `query.served` sees one shape, and `--level debug` still shows
+/// every query.
+///
+/// The same split is already the house pattern: `sidecar.version.checked` is
+/// DEBUG because healthy spawns must not flood, while `below_floor` is WARN.
+/// Whether serving a query at this speed is an event or commentary.
+///
+/// Inclusive at the threshold, so `SLOW_QUERY_MS` reads as "this slow counts"
+/// rather than leaving a one-millisecond band that is neither.
+pub(crate) fn query_is_slow(elapsed_ms: u128) -> bool {
+    elapsed_ms >= SLOW_QUERY_MS
+}
+
+fn log_query_served(tool: &str, cached: bool, elapsed_ms: u128) {
+    if query_is_slow(elapsed_ms) {
+        tracing::info!(
+            event = "query.served",
+            tool = %tool,
+            cached,
+            elapsed_ms,
+            "query served"
+        );
+    } else {
+        tracing::debug!(
+            event = "query.served",
+            tool = %tool,
+            cached,
+            elapsed_ms,
+            "query served"
+        );
+    }
+}
+
 #[cfg(any(unix, windows))]
 #[allow(clippy::too_many_arguments)]
 fn handle_control_message(
@@ -14892,13 +14967,7 @@ fn handle_control_message(
             if let Some(versions) = versions {
                 let mut c = cache.lock().unwrap_or_else(|e| e.into_inner());
                 if let Some(cached) = c.get(&tool, &args, &last_commit, &phase_b_commit, versions) {
-                    tracing::info!(
-                        event = "query.served",
-                        tool = %tool,
-                        cached = true,
-                        elapsed_ms = started.elapsed().as_millis(),
-                        "query served"
-                    );
+                    log_query_served(&tool, true, started.elapsed().as_millis());
                     return (ControlResponse::query_result(cached), false);
                 }
             }
@@ -14915,19 +14984,12 @@ fn handle_control_message(
                             value.clone(),
                         );
                     }
-                    // The line that makes "which query was slow" answerable.
-                    // Without it a successful query logged nothing at all, so
-                    // the `req` correlation id had nothing on the happy path to
-                    // bind to and per-request timing did not exist. `cached`
-                    // distinguishes the two costs, which is usually the first
-                    // thing worth knowing about a slow one.
-                    tracing::info!(
-                        event = "query.served",
-                        tool = %tool,
-                        cached = false,
-                        elapsed_ms = started.elapsed().as_millis(),
-                        "query served"
-                    );
+                    // The line that makes "which query was slow" answerable, and
+                    // the anchor the `req` correlation id binds to on the happy
+                    // path. `cached` distinguishes the two costs, which is
+                    // usually the first thing worth knowing about a slow one.
+                    // See `log_query_served` for why the level is not fixed.
+                    log_query_served(&tool, false, started.elapsed().as_millis());
                     (ControlResponse::query_result(value), false)
                 }
                 Err(e) => {

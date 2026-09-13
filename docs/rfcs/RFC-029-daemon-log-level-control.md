@@ -1,7 +1,7 @@
 # RFC-029: Daemon Log Level as a Setting, and a Log That Describes Itself
 
 **Date:** 2026-09-13
-**Status:** Proposed. Parts 1 to 4 are implemented against this branch; part 5
+**Status:** Proposed. Parts 1 to 5 are implemented against this branch; part 6
 (human-readable rendering) is proposed only and nothing in it is built.
 
 **Implemented so far:** the `log.level` config key and its precedence, the
@@ -148,7 +148,61 @@ not picked up renders a note naming what is live now, with a Restart button.
 The panel *offers* the restart rather than performing it: a log-level change
 must not silently cancel an in-flight index.
 
-### 5. Human-readable logs (proposed, not built)
+### 5. Levels that match what the line is worth (implemented for `query.served`)
+
+A level control is only worth having if the levels mean something. Measured
+against this repository's own `daemon.log`, they mostly do, with one clear
+exception.
+
+Message frequency across the checked-in log, by level:
+
+```
+  28  INFO  query served
+  13  INFO  embed_text updated
+  11  INFO  daemon starting
+  10  WARN  write_phase_b_batch: skipped edges with a missing endpoint
+   7  WARN  skipping reindex: this index was built with an older version
+   5  WARN  rust-analyzer skipped, no OS sandbox available
+```
+
+`query.served` was INFO on every query, making it the most frequent line in the
+file by a wide margin, most occurrences being `elapsed_ms=0` cache hits. It
+broke the rule this file's own module docs state: a line earns its place where
+something happened that a reader would count, alert on or chart, not for the
+running commentary in between. It was also never added to the documented `event`
+key list, which is how it grew to that volume unnoticed.
+
+Dropping it to DEBUG outright would have cost the thing it was added for, since
+"which query was slow" has to stay answerable without restarting the daemon. So
+the level follows the content: INFO at or past `SLOW_QUERY_MS` (200 ms, four
+times the 50 ms p95 the bench gate enforces), DEBUG below it, same key and same
+fields either way. The same split is already the house pattern:
+`sidecar.version.checked` is DEBUG so healthy spawns do not flood, while
+`below_floor` is WARN.
+
+Measured on a six-query session: 6 lines at INFO before, 0 after, and all six
+still present under `log.level=debug`.
+
+`query.served` and `query.failed` are now in the documented key list, with the
+level rule recorded beside them. A consumer counting served queries has to read
+at debug; one watching for slow ones can stay at the default.
+
+**Deliberately left alone,** having checked each against its call site rather
+than its frequency:
+
+- `write_phase_b_batch: skipped edges` (WARN) reports real data loss and is
+  already aggregated to one line per batch with a count.
+- `rust-analyzer skipped, no OS sandbox` (WARN) carries a UX-002 comment arguing
+  the case: a degradation the run recovers from, with the recovery folded into
+  the one line.
+- The `live:` and `live_resolve` failures at DEBUG are per-file speculative
+  enrichment on the editor path. Raising them would flood on every keystroke,
+  which is the same argument that keeps the editor plane to two lifecycle lines.
+- `skipping reindex: this index was built with an older version` (WARN) repeats,
+  but once per genuine reindex attempt that did not happen, which is a fact each
+  time rather than a repeated complaint.
+
+### 6. Human-readable logs (proposed, not built)
 
 The stored format is JSON lines and **should stay that way**. It is a contract:
 `travsr daemon logs` renders it, the Health panel renders it, `--json` hands the
