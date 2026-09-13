@@ -1,8 +1,15 @@
 import * as assert from "assert";
-import { buildStatsHtml, buildReposHtml, computeVerdict, UNKNOWN_INDEX } from "../../webviews";
-import type { Diagnostic, HealthData, IndexHealth, StatsView } from "../../webviews";
+import {
+  buildStatsHtml,
+  buildReposHtml,
+  computeVerdict,
+  UNKNOWN_INDEX,
+  LOG_LEVELS,
+} from "../../webviews";
+import type { Diagnostic, HealthData, IndexHealth, RepoRow, StatsView } from "../../webviews";
 import { EMPTY_HEALTH } from "../../webviews";
-import { parseIndexHealth } from "../../commands";
+import { parseIndexHealth, activeLogLevel } from "../../commands";
+import type { LogEntry } from "../../webviews";
 import {
   detectShellKind,
   formatCommandLine,
@@ -43,6 +50,9 @@ const FULL: HealthData = {
   binaryVersion: "1.0.0",
   logFileName: "daemon.log.2026-09-02",
   logFileSize: "4 KB",
+  logLevel: "info",
+  logLevelSource: "default",
+  logLevelActive: "info",
   commitHook: false,
   embedModels: [
     { id: "bge-small", description: "fast, 384 dim", installed: true, active: true, downloadMb: 133 },
@@ -109,6 +119,42 @@ const repoSection = (html: string): string => {
   const start = html.indexOf(">Repositories</span>");
   assert.ok(start >= 0, "the Repositories section is on the page");
   return html.slice(start, html.indexOf("</details>", start));
+};
+
+/** The Repositories section as it actually reads on open, with the collapsed
+ *  groups removed.
+ *
+ *  The capped and test-leftover rows now ship in the document so they can be
+ *  expanded without a round trip, so "is this row on the page" stopped being
+ *  the same question as "does the reader see it". The cap is about the second
+ *  one, which is what the assertions below mean, so they strip the hidden
+ *  containers rather than being relaxed to accept a buried list. */
+const visibleRepoSection = (html: string): string => {
+  let s = repoSection(html);
+  for (const id of ["repoMore", "repoTemps"]) {
+    const open = `<div id="${id}" hidden>`;
+    const at = s.indexOf(open);
+    if (at < 0) continue;
+    // Depth-matched, not a lazy regex: these containers hold `<div class="hrow">`
+    // children, so stopping at the first `</div>` leaves every row after the
+    // first behind and the assertion silently passes on a buried list.
+    let depth = 1;
+    let i = at + open.length;
+    while (i < s.length && depth > 0) {
+      const nextOpen = s.indexOf("<div", i);
+      const nextClose = s.indexOf("</div>", i);
+      assert.ok(nextClose >= 0, `unbalanced markup in #${id}`);
+      if (nextOpen >= 0 && nextOpen < nextClose) {
+        depth += 1;
+        i = nextOpen + 4;
+      } else {
+        depth -= 1;
+        i = nextClose + 6;
+      }
+    }
+    s = s.slice(0, at) + s.slice(i);
+  }
+  return s;
 };
 
 suite("index status parsing", () => {
@@ -253,6 +299,63 @@ suite("verdict", () => {
       const v = computeVerdict(running, running, idx, ds, has);
       assert.ok(v.headline.length > 0, JSON.stringify(v));
       assert.ok(v.detail.length > 0, JSON.stringify(v));
+    }
+  });
+});
+
+suite("active daemon log level", () => {
+  const sessionLine = (time: string, level: string, from = "log.level"): LogEntry => ({
+    time,
+    level: "INFO",
+    target: "daemon",
+    message: "daemon starting",
+    event: "daemon.session.start",
+    detail: `version=1.0.0 pid=1234 log_level=${level} log_level_from=${from} pruned_logs=0`,
+    iso: `2026-09-13T${time}Z`,
+    raw: "{}",
+  });
+
+  test("the newest session wins, because the log arrives oldest-first", () => {
+    // The bug this pins: `readDaemonLogFile` returns the tail in file order, so
+    // reading the FIRST session line reported the level the daemon started the
+    // day with. After changing the level and restarting, the panel kept saying
+    // a restart was owed, for a restart that had already happened.
+    const log = [sessionLine("09:00:00", "info"), sessionLine("15:17:53", "error")];
+    assert.strictEqual(activeLogLevel(log), "error");
+  });
+
+  test("no session line in the window means unknown, not a guess", () => {
+    assert.strictEqual(activeLogLevel([]), "");
+    const noStart: LogEntry = { ...sessionLine("09:00:00", "info"), event: "phase_b.complete" };
+    assert.strictEqual(activeLogLevel([noStart]), "");
+  });
+
+  test("a RUST_LOG directive is not reported as a level", () => {
+    // `travsr_plugin_host=debug` is not comparable with a stored level, and
+    // treating it as one would ask for a restart that changes nothing.
+    const log = [sessionLine("09:00:00", "travsr_plugin_host=debug", "RUST_LOG")];
+    assert.strictEqual(activeLogLevel(log), "");
+  });
+
+  test("a bare RUST_LOG level is not reported either", () => {
+    // The case that shipped broken: `daemon start --verbose` sets
+    // RUST_LOG=debug, so the session line reads `log_level=debug
+    // log_level_from=RUST_LOG`. Judging by the shape of the value accepted it
+    // as a stored level, and the panel then demanded a restart that could not
+    // change anything, because RUST_LOG wins on the next start too. The source
+    // decides, not the shape.
+    assert.strictEqual(activeLogLevel([sessionLine("09:00:00", "debug", "RUST_LOG")]), "");
+    assert.strictEqual(activeLogLevel([sessionLine("09:00:00", "error", "RUST_LOG")]), "");
+  });
+
+  test("a level that came from the config or the default is reported", () => {
+    assert.strictEqual(activeLogLevel([sessionLine("09:00:00", "debug", "log.level")]), "debug");
+    assert.strictEqual(activeLogLevel([sessionLine("09:00:00", "info", "default")]), "info");
+  });
+
+  test("every offered level round-trips out of a session line", () => {
+    for (const level of LOG_LEVELS) {
+      assert.strictEqual(activeLogLevel([sessionLine("09:00:00", level)]), level, level);
     }
   });
 });
@@ -484,7 +587,7 @@ suite("health panel rendering", () => {
       "installHook", "installEmbed", "reinstallEmbed", "changeEmbedModel",
       "runFsck", "compact", "registerMcp", "prune", "removeTempRepos",
       "fixLang", "disableLang",
-      "runFix", "copyFix", "openFile", "setLogLines", "setLogFile", "setLogAuto",
+      "runFix", "copyFix", "openFile", "setLogLines", "setLogFile", "setLogAuto", "setLogLevel",
       "initRepo", "detectLangs", "downloadBinary", "openBinarySetting",
     ]);
     const posted = new Set<string>();
@@ -511,6 +614,60 @@ suite("health panel rendering", () => {
       if (LOG_OWNED.has(h)) continue;
       assert.ok(posted.has(h), `${h} is handled but no button posts it`);
     }
+  });
+
+  test("counted-but-hidden repositories can be expanded in place", () => {
+    // Both groups were reported as a count with no way to see them, which is a
+    // fact the reader cannot act on. The rows ship in the document and expand
+    // without a message, so there is no spawn and no redraw.
+    const many: RepoRow[] = [];
+    for (let i = 0; i < 11; i += 1) {
+      many.push({ name: `repo${i}`, exists: true, path: `c:/db/repo${i}` });
+    }
+    many.push({ name: ".tmpABC123", exists: true, path: "c:/db/tmp1" });
+    many.push({ name: ".tmpDEF456", exists: true, path: "c:/db/tmp2" });
+    const html = buildStatsHtml(STATS, [], [], 500, undefined, 0, FRESH, {
+      ...FULL,
+      repos: many,
+      activeRepo: "repo0",
+    });
+
+    // The cap still governs the default view.
+    assert.ok(html.includes("and 3 more"), "the overflow is still counted");
+    assert.ok(html.includes("2 test repositories left by test runs"), "so are the test repos");
+
+    // And each count now carries a control that reveals its own rows.
+    assert.ok(html.includes(`toggleRepoRows('repoMore',this)`), "the overflow expands");
+    assert.ok(html.includes(`toggleRepoRows('repoTemps',this)`), "the test repos expand");
+    assert.ok(html.includes('<div id="repoMore" hidden>'), "overflow rows ship hidden");
+    assert.ok(html.includes('<div id="repoTemps" hidden>'), "test rows ship hidden");
+
+    // The hidden rows are really in the document, not a promise to fetch them.
+    assert.ok(html.includes("repo10"), "a row past the cap is present");
+    assert.ok(html.includes(".tmpABC123"), "so is a test repo");
+    // Expanding is local, so it must not post a message the controller would
+    // have to handle.
+    assert.ok(!html.includes("command:'expandRepos'"));
+  });
+
+  test("no expander when there is nothing hidden", () => {
+    const html = buildStatsHtml(STATS, [], [], 500, undefined, 0, FRESH, {
+      ...FULL,
+      repos: [{ name: "only", exists: true, path: "c:/db/only" }],
+      activeRepo: "only",
+    });
+    // The call sites, not the bare name: `toggleRepoRows` is also the script's
+    // function definition, which every render carries, so a check on the name
+    // alone passes on a page that offers no expander at all.
+    assert.ok(
+      !html.includes("toggleRepoRows('repoMore'"),
+      "no overflow expander with nothing past the cap"
+    );
+    assert.ok(
+      !html.includes("toggleRepoRows('repoTemps'"),
+      "no test-repo expander with no test repos"
+    );
+    assert.ok(!html.includes('id="repoMore"'), "and no empty container either");
   });
 
   test("the embed row offers a model switch only when there is a choice", () => {
@@ -568,7 +725,10 @@ suite("health panel rendering", () => {
     assert.ok(html.includes("travsr"), "a live repo is shown");
     assert.ok(html.includes("and 62 more"), "the rest are counted, not listed");
     assert.ok(html.includes("Prune stale (68)"), "and the bulk fix is offered");
-    assert.ok((repoSection(html).match(/<div class="hrow">/g) ?? []).length <= 8, "rows are capped");
+    assert.ok(
+      (visibleRepoSection(html).match(/<div class="hrow">/g) ?? []).length <= 8,
+      "rows are capped"
+    );
   });
 
   test("the open repository is listed however full the registry is", () => {
@@ -617,7 +777,12 @@ suite("health panel rendering", () => {
     const html = buildStatsHtml(STATS, [], [], 500, undefined, 0, FRESH, cluttered);
     const sec = html.slice(html.indexOf(">Repositories</span>"));
     assert.ok(sec.includes("travsr"), "the real repo is listed");
-    assert.ok(!/\.tmp0\dzXmr/.test(sec.split("Recent activity")[0]), "the temp ones are not");
+    // Against the collapsed view: the rows exist in the document so the count
+    // beside them can be expanded, but nothing shows them until it is.
+    assert.ok(
+      !/\.tmp0\dzXmr/.test(visibleRepoSection(html)),
+      "the temp ones are not listed on open"
+    );
     assert.ok(sec.includes("1 registered"), "the count is of repos you opened");
     assert.ok(sec.includes("14 from tests"), "and the leftovers are counted separately");
     assert.ok(
@@ -871,6 +1036,93 @@ suite("terminal command building", () => {
     assert.strictEqual(quoteForShell("a b", "cmd"), '"a b"');
     assert.strictEqual(quoteForShell("it's", "posix"), `'it'\\''s'`);
     assert.strictEqual(quoteForShell("it's", "powershell"), "'it''s'");
+  });
+
+  test("the log level control offers every level, with the stored one selected", () => {
+    const html = buildStatsHtml(STATS, [], [], 500, undefined, 0, FRESH, {
+      ...FULL,
+      logLevel: "debug",
+      logLevelSource: "repo config",
+    });
+    assert.ok(html.includes('id="logLevel"'), "the control is rendered");
+    for (const level of LOG_LEVELS) {
+      assert.ok(html.includes(`value="${level}"`), `${level} is offered`);
+    }
+    assert.ok(html.includes('value="debug" selected'), "the stored level is the selection");
+    assert.ok(html.includes("repo config"), "and the layer that set it is named");
+  });
+
+  test("an older binary gets an explanation, not an empty space where the control was", () => {
+    // An older binary has no `log.level`, so `gatherHealth` leaves it empty. A
+    // dropdown defaulted to "info" there would silently do nothing; rendering
+    // nothing at all makes the feature look missing rather than unavailable,
+    // which is what actually happened on a machine whose PATH `travsr`
+    // predated the key.
+    const html = buildStatsHtml(STATS, [], [], 500, undefined, 0, FRESH, {
+      ...FULL,
+      logLevel: "",
+      logLevelSource: "",
+      binaryVersion: "1.0.0+98619a8",
+    });
+    assert.ok(!html.includes('id="logLevel"'), "no control without a setting to bind to");
+    assert.ok(html.includes("needs a newer travsr"), "the absence says why");
+    assert.ok(html.includes("1.0.0+98619a8"), "and names the binary that is behind");
+    // And carries its own fix. Naming the setting is not the same as offering
+    // it: the reader hit this twice before the report became actionable.
+    assert.ok(html.includes("openBinarySetting()"), "the report offers the fix");
+  });
+
+  test("a stored level the running daemon has not picked up says so, and offers the restart", () => {
+    const html = buildStatsHtml(STATS, [], [], 500, undefined, 0, FRESH, {
+      ...FULL,
+      daemonRunning: true,
+      logLevel: "debug",
+      logLevelActive: "info",
+    });
+    // The element, not the bare class name: `.log-note` is also a CSS rule in
+    // every render, so a substring check on the word alone passes on a page
+    // that shows no note at all.
+    assert.ok(html.includes('<div class="log-note">'), "the mismatch is reported");
+    assert.ok(html.includes("still writing at <b>info</b>"), "it names what is live now");
+    assert.ok(html.includes("restartDaemon"), "and offers the action that applies it");
+  });
+
+  test("no note when the daemon is already at the stored level", () => {
+    const html = buildStatsHtml(STATS, [], [], 500, undefined, 0, FRESH, {
+      ...FULL,
+      daemonRunning: true,
+      logLevel: "debug",
+      logLevelActive: "debug",
+    });
+    assert.ok(!html.includes('<div class="log-note">'), "agreement is silent");
+  });
+
+  test("no note about a daemon that is not running", () => {
+    // `logLevelActive` is read from a session line in a file that outlives the
+    // process that wrote it, so with the daemon stopped the note claimed "the
+    // running daemon is still writing at info" about nothing at all, and
+    // offered a restart that would not have changed what it described.
+    const html = buildStatsHtml(STATS, [], [], 500, undefined, 0, FRESH, {
+      ...FULL,
+      daemonRunning: false,
+      logLevel: "error",
+      logLevelActive: "info",
+    });
+    assert.ok(
+      !html.includes('<div class="log-note">'),
+      "a stopped daemon is not described in the present tense"
+    );
+  });
+
+  test("no note when the running daemon's level is unknown", () => {
+    // A log window with no session line in it, or a daemon built before the
+    // field existed. Demanding a restart on that evidence would be a guess.
+    const html = buildStatsHtml(STATS, [], [], 500, undefined, 0, FRESH, {
+      ...FULL,
+      logLevel: "debug",
+      logLevelActive: "",
+    });
+    assert.ok(!html.includes('<div class="log-note">'));
   });
 
   test("PowerShell gets the call operator only when the binary is quoted", () => {

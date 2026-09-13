@@ -57,6 +57,25 @@ pub fn set_allow_unsandboxed_lsif(val: bool) {
     travsr_indexer::sandbox::set_cli_allow_unsandboxed(val);
 }
 
+/// Tracing target for the session lifecycle events that must survive whatever
+/// filter the log is written under: `daemon.session.start` and
+/// `daemon.session.exit`.
+///
+/// A log file has to be able to say which session produced it, under what
+/// filter, and why it stopped, or a reader cannot tell an empty file from a
+/// quiet one and will happily read the previous session's line as if it
+/// described this one. The subscriber setup appends a directive admitting this
+/// target unconditionally.
+///
+/// A high severity is not a substitute for the exemption. ERROR passes any bare
+/// level, but a targeted directive with no bare level (`RUST_LOG=some_crate=debug`)
+/// leaves `EnvFilter`'s unmatched default OFF, so an ERROR on the ordinary
+/// target is dropped. The exit line learned that the hard way.
+///
+/// The extension's `shortTarget` splits on `::`, so entries still render under
+/// `daemon` rather than growing a second name in the log view.
+pub const SESSION_LOG_TARGET: &str = "travsr_daemon::session";
+
 /// The user-facing product version, set once by the `travsr` binary at startup.
 static BUILD_VERSION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
@@ -5863,6 +5882,116 @@ mod tests {
     use super::*;
     use std::process::Command as StdCommand;
     use std::sync::Mutex;
+
+    /// Run `body` under a subscriber filtered by `directive`, and return the
+    /// (target, level) of every event that actually reached it.
+    ///
+    /// Asserting on what a subscriber receives rather than on the directive
+    /// string is the whole point: an unknown word in a directive is read as a
+    /// target name rather than rejected, and severity alone does not carry an
+    /// event past a filter with no bare level.
+    fn capture_with_filter(directive: &str, body: impl FnOnce()) -> Vec<(String, tracing::Level)> {
+        use tracing_subscriber::layer::{Layer as _, SubscriberExt as _};
+
+        #[derive(Clone, Default)]
+        struct Seen(std::sync::Arc<Mutex<Vec<(String, tracing::Level)>>>);
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Seen {
+            fn on_event(
+                &self,
+                ev: &tracing::Event<'_>,
+                _: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                let m = ev.metadata();
+                self.0
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push((m.target().to_string(), *m.level()));
+            }
+        }
+
+        let seen = Seen::default();
+        let subscriber = tracing_subscriber::registry().with(seen.clone().with_filter(
+            tracing_subscriber::EnvFilter::try_new(directive).expect("our directive must parse"),
+        ));
+        tracing::subscriber::with_default(subscriber, body);
+        let out = seen.0.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        out
+    }
+
+    /// A targeted directive with no bare level leaves `EnvFilter`'s unmatched
+    /// default OFF, so severity alone does not get a line into the file: an
+    /// ERROR on the ordinary target is dropped. Both session lifecycle lines
+    /// have to ride the exempt target to survive it, and the exit line did not
+    /// at first, which silently defeated it under exactly the form the CLI's
+    /// troubleshooting text prints and which auto-starts a daemon.
+    #[test]
+    fn session_lifecycle_survives_a_targeted_rust_log() {
+        let directive = filter_directive_for("travsr_plugin_host=debug");
+        let seen = capture_with_filter(&directive, || {
+            tracing::info!(target: SESSION_LOG_TARGET, event = "daemon.session.start", "start");
+            tracing::error!(target: SESSION_LOG_TARGET, event = "daemon.session.exit", "exit");
+            // The same event on the ordinary target, which is what the exit
+            // line used to be and what this test exists to keep it from
+            // becoming again.
+            tracing::error!(event = "daemon.session.exit", "exit on the default target");
+        });
+        let on_exempt = seen.iter().filter(|(t, _)| t == SESSION_LOG_TARGET).count();
+        assert_eq!(
+            on_exempt, 2,
+            "both session lifecycle lines must survive a targeted directive; saw {seen:?}"
+        );
+        assert!(
+            !seen.iter().any(|(t, _)| t == "travsr_daemon"),
+            "an ERROR on the ordinary target is dropped here, which is why the exemption is needed; saw {seen:?}"
+        );
+    }
+
+    /// `log.level = error` has to still record errors, which is the whole point
+    /// of offering the level. Checked against a real `EnvFilter` rather than by
+    /// reading the directive string, because what matters is what the filter
+    /// admits, and an unknown word in a directive is silently read as a target
+    /// name rather than rejected.
+    #[test]
+    fn an_error_only_log_still_records_errors() {
+        let directive = filter_directive_for("error");
+        let got = capture_with_filter(&directive, || {
+            tracing::error!("boom");
+            tracing::warn!("noise");
+            tracing::info!(target: SESSION_LOG_TARGET, "daemon starting");
+        });
+        assert!(
+            got.iter().any(|(_, l)| *l == tracing::Level::ERROR),
+            "an error-only log that drops errors is not a log; saw {got:?}"
+        );
+        assert!(
+            !got.iter().any(|(_, l)| *l == tracing::Level::WARN),
+            "error means error, not warn and above; saw {got:?}"
+        );
+        assert!(
+            got.iter().any(|(t, _)| t == SESSION_LOG_TARGET),
+            "the session line is exempt so the file can identify itself; saw {got:?}"
+        );
+    }
+
+    /// `query.served` was INFO on every query, which made it 28 of about 130
+    /// lines in this repo's own log, most of them `elapsed_ms=0` cache hits.
+    /// The level now follows the content, so this pins where the line sits and
+    /// that the boundary is inclusive: a threshold read as "slower than" leaves
+    /// a band that is neither event nor commentary.
+    #[test]
+    fn only_a_slow_query_is_worth_an_info_line() {
+        assert!(!query_is_slow(0), "a cache hit is commentary");
+        assert!(!query_is_slow(SLOW_QUERY_MS - 1));
+        assert!(query_is_slow(SLOW_QUERY_MS), "the threshold itself counts");
+        assert!(query_is_slow(SLOW_QUERY_MS + 1));
+        // Comfortably above the 50 ms p95 the bench gate enforces, so a query
+        // at the edge of the budget does not log and one well past it does.
+        // Tightening this to the gate would put the log back where it was.
+        assert!(
+            !query_is_slow(50),
+            "a query inside the p95 budget must not log at info"
+        );
+    }
 
     /// #735: the embed tick body must be single-flight. A tick that fires
     /// while the previous body still runs used to start a second concurrent
@@ -13051,20 +13180,81 @@ impl Daemon {
         // Bounded and lossy instead: under pressure the right thing to drop is
         // log lines, never indexing throughput. `non_blocking` reports what it
         // discarded, so the loss is visible rather than silent.
-        let (non_blocking, _appender_guard) =
+        let (non_blocking, appender_guard) =
             tracing_appender::non_blocking::NonBlockingBuilder::default()
                 .buffered_lines_limit(logfile::BUFFERED_LINES)
                 .lossy(true)
                 .finish(file_appender);
+        // Held in an Option so the fatal-exit paths below can flush it.
+        //
+        // Dropping the guard is what flushes the channel and joins the writer
+        // thread, and `std::process::exit` runs no destructors: a guard left to
+        // "drop at end of scope" never drops on those paths, so the last events
+        // written are still in the channel when the process dies. That silently
+        // cost the `daemon.session.exit` line this change added, and usually the
+        // session-start line with it. `.take()` rather than a move because two
+        // different select arms can reach the exit.
+        let mut appender_guard = Some(appender_guard);
         use tracing_subscriber::layer::SubscriberExt as _;
         use tracing_subscriber::util::SubscriberInitExt as _;
         // INFO, not WARN. At WARN the file held nothing a user would want: on
         // this repo, four days of logs were 136 lines, every one of them the
         // same repeated warning and not one lifecycle event. `travsr daemon
         // logs` on top of that would have been a working feature showing
-        // nothing. `RUST_LOG` still overrides in both directions.
-        let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
-            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+        // nothing.
+        //
+        // The level is now a stored setting (`log.level`), not only an
+        // inherited environment variable. `RUST_LOG` still overrides it; see
+        // `travsr_config::resolve_log_filter` for the precedence and why. The
+        // resolved directive is read once here and reported in the session's
+        // first line below, so a file that is unexpectedly quiet or unexpectedly
+        // enormous says which layer chose that.
+        let (log_directive, log_source) = travsr_config::resolve_log_filter(Some(&repo_root));
+        // The session line is exempt from the level it reports.
+        //
+        // It is emitted at INFO, so at `error` or `warn` the filter suppressed
+        // the one line that says which session wrote this file and at what
+        // level — a log that cannot describe itself, and worse, a reader that
+        // then finds the PREVIOUS session's line and believes it. That is
+        // exactly what happened: setting `error` and restarting left the Health
+        // panel reading a dead session's `log_level=info` and insisting
+        // forever that a restart was still owed.
+        //
+        // So it gets its own target, admitted unconditionally by an appended
+        // directive. One line per daemon start is a price worth paying at any
+        // level for a file that identifies itself. `shortTarget` in the
+        // extension splits on `::`, so this still renders as `daemon`.
+        //
+        // Appended whatever chose the directive, `RUST_LOG` included. Exempting
+        // the escape hatch reintroduced the stale-session bug through the one
+        // path that opted out: under `RUST_LOG=warn` no session line was
+        // written, so a reader found a previous session's line and believed it.
+        // Readers tell a `RUST_LOG` run apart by `log_level_from`, which needs
+        // a line to be written at all.
+        //
+        // What is reported is what was INSTALLED, not what was resolved. A
+        // malformed RUST_LOG falls back, and reporting the resolved pair there
+        // would have the line name a level the process is not filtering at. The
+        // fallback also has to go back through `filter_directive_for`, or it
+        // silently drops the session exemption the rest of this depends on.
+        let (env_filter, log_directive, log_source) =
+            match tracing_subscriber::EnvFilter::try_new(filter_directive_for(&log_directive)) {
+                Ok(filter) => (filter, log_directive, log_source),
+                Err(_) => {
+                    let fallback = filter_directive_for(travsr_config::DEFAULT_LOG_LEVEL);
+                    // Built from constants this crate owns, so it parses; the
+                    // `unwrap_or_else` keeps that from being an assertion.
+                    let filter =
+                        tracing_subscriber::EnvFilter::try_new(&fallback).unwrap_or_else(|_| {
+                            tracing_subscriber::EnvFilter::new(travsr_config::DEFAULT_LOG_LEVEL)
+                        });
+                    (
+                        filter,
+                        travsr_config::DEFAULT_LOG_LEVEL.to_string(),
+                        travsr_config::LogFilterSource::Default,
+                    )
+                }
+            };
         // JSON lines on disk. One line is one object, so every field is named
         // and typed rather than recovered by guessing at column positions, and
         // `jq`, Loki and Datadog all read it as-is. Nobody is asked to read JSON:
@@ -13100,10 +13290,19 @@ impl Daemon {
         // First event in every session, so a rotated file is interpretable on
         // its own: which build wrote it, which repo, which process.
         tracing::info!(
+            // See SESSION_LOG_TARGET: this one event outranks the level filter
+            // so the file always says who wrote it and at what level.
+            target: SESSION_LOG_TARGET,
             event = "daemon.session.start",
             version = build_version(),
             pid = std::process::id(),
             repo = %repo_root.display(),
+            // What this file will and will not contain, and who decided. Without
+            // it, "there are no debug lines in here" and "debug is off" are
+            // indistinguishable from the file itself, which is the only
+            // artifact left once the process is gone.
+            log_level = %log_directive,
+            log_level_from = log_source.label(),
             // No `foreground` field on purpose. A backgrounded daemon is a
             // re-exec of `daemon start --foreground`, so the flag is true in the
             // child either way: accurate for the process, and misleading to the
@@ -13639,9 +13838,38 @@ impl Daemon {
                         // C3: .travsr is in SKIP_DIRS so the file watcher never fires
                         // for graph.db deletions. Poll every 5 s as the only trigger.
                         if !db_path.exists() {
+                            // Logged, not only printed. A backgrounded daemon is
+                            // spawned with null stdio, so this `eprintln!` reached
+                            // nobody and the log simply stopped mid-session with no
+                            // reason in it: the one artifact left after the process
+                            // is gone said nothing about why it went. It stays on
+                            // stderr too, for `daemon start --foreground`.
+                            tracing::error!(
+                                // Same exempt target as the session-start line,
+                                // and for the same reason. ERROR passes any
+                                // bare level, but a targeted `RUST_LOG` with no
+                                // bare level leaves EnvFilter's unmatched
+                                // default OFF, so on the default target this
+                                // line was dropped under exactly the form the
+                                // CLI's troubleshooting text prints
+                                // (`RUST_LOG=travsr_plugin_host=debug`), which
+                                // auto-starts a daemon. The log then stopped
+                                // mid-session with no reason in it, which is
+                                // the failure this event exists to remove.
+                                target: SESSION_LOG_TARGET,
+                                event = "daemon.session.exit",
+                                reason = "graph_db_removed",
+                                db = %db_path.display(),
+                                "graph.db removed, daemon exiting; re-run `travsr init` to rebuild"
+                            );
                             eprintln!(
                                 "travsr daemon: graph.db removed, exiting. Re-run `travsr init` to rebuild."
                             );
+                            // Flush before leaving, or the line above never
+                            // reaches the file: `exit` runs no destructors, so
+                            // the guard would not drop and the non-blocking
+                            // writer would never be joined.
+                            drop(appender_guard.take());
                             std::process::exit(0);
                         }
                         // M9: .travsr is in SKIP_DIRS so the watcher never sees a
@@ -13784,9 +14012,38 @@ impl Daemon {
                     _ = phase_b_tick.tick() => {
                         // C3: poll every 5 s since .travsr is in SKIP_DIRS.
                         if !db_path.exists() {
+                            // Logged, not only printed. A backgrounded daemon is
+                            // spawned with null stdio, so this `eprintln!` reached
+                            // nobody and the log simply stopped mid-session with no
+                            // reason in it: the one artifact left after the process
+                            // is gone said nothing about why it went. It stays on
+                            // stderr too, for `daemon start --foreground`.
+                            tracing::error!(
+                                // Same exempt target as the session-start line,
+                                // and for the same reason. ERROR passes any
+                                // bare level, but a targeted `RUST_LOG` with no
+                                // bare level leaves EnvFilter's unmatched
+                                // default OFF, so on the default target this
+                                // line was dropped under exactly the form the
+                                // CLI's troubleshooting text prints
+                                // (`RUST_LOG=travsr_plugin_host=debug`), which
+                                // auto-starts a daemon. The log then stopped
+                                // mid-session with no reason in it, which is
+                                // the failure this event exists to remove.
+                                target: SESSION_LOG_TARGET,
+                                event = "daemon.session.exit",
+                                reason = "graph_db_removed",
+                                db = %db_path.display(),
+                                "graph.db removed, daemon exiting; re-run `travsr init` to rebuild"
+                            );
                             eprintln!(
                                 "travsr daemon: graph.db removed, exiting. Re-run `travsr init` to rebuild."
                             );
+                            // Flush before leaving, or the line above never
+                            // reaches the file: `exit` runs no destructors, so
+                            // the guard would not drop and the non-blocking
+                            // writer would never be joined.
+                            drop(appender_guard.take());
                             std::process::exit(0);
                         }
                         // Auto-arm when Phase B is pending (deferred init, or daemon
@@ -14278,6 +14535,83 @@ fn live_editor_sessions(
         .collect();
     live.sort_by_key(|(_, s)| std::cmp::Reverse(s.updated_at));
     live
+}
+
+/// The directive actually installed, given a resolved one.
+///
+/// Appends the session target so `daemon.session.start` survives whatever level
+/// it reports (see [`SESSION_LOG_TARGET`]).
+///
+/// Appended for `RUST_LOG` too, which it was not at first. The argument for
+/// exempting the escape hatch was that readers tell a `RUST_LOG` run apart by
+/// `log_level_from`, but that only holds if a line is written at all: under
+/// `RUST_LOG=warn` the daemon wrote no session line, so a reader landing on the
+/// same day's file found a *previous* session's line, believed it, and asked
+/// for a restart that could never clear, because every restart under that
+/// `RUST_LOG` writes no line either. That is precisely the stale-session bug
+/// the exemption exists to prevent, reintroduced through the one path that
+/// opted out of it.
+///
+/// One line per process start is a small enough imposition on an explicit
+/// `RUST_LOG` to be worth a file that always says what it is. Everything else
+/// in the directive is still honoured exactly as written.
+pub fn filter_directive_for(directive: &str) -> String {
+    format!("{directive},{SESSION_LOG_TARGET}=trace")
+}
+
+/// How long a query has to take before serving it is an event rather than
+/// commentary.
+///
+/// Four times the 50 ms p95 the bench gate enforces, so a query at the edge of
+/// the budget does not log and one well past it does. The point is a threshold
+/// that is quiet when things are normal; tightening it to the gate itself would
+/// put the log back where it was.
+pub(crate) const SLOW_QUERY_MS: u128 = 200;
+
+/// Whether serving a query at this speed is an event or commentary.
+///
+/// Inclusive at the threshold, so `SLOW_QUERY_MS` reads as "this slow counts"
+/// rather than leaving a one-millisecond band that is neither.
+pub(crate) fn query_is_slow(elapsed_ms: u128) -> bool {
+    elapsed_ms >= SLOW_QUERY_MS
+}
+
+/// The one `query.served` line, at the level its content earns.
+///
+/// This was unconditionally INFO, which made it the most frequent line in the
+/// file by a wide margin: 28 of about 130 lines in this repo's own log, most of
+/// them `elapsed_ms=0` cache hits. `logfile.rs` states the rule it broke, that a
+/// line is worth INFO where something happened a reader would count or chart,
+/// and not for the running commentary in between, and a line per query is the
+/// definition of commentary.
+///
+/// Dropping it to DEBUG outright would have cost the thing it was added for:
+/// "which query was slow" has to stay answerable without restarting the daemon
+/// at debug. So the level follows the content. A slow query is an event; a fast
+/// one is not. Same `event` key and the same fields either way, so anything
+/// selecting on `query.served` sees one shape, and `--level debug` still shows
+/// every query.
+///
+/// The same split is already the house pattern: `sidecar.version.checked` is
+/// DEBUG because healthy spawns must not flood, while `below_floor` is WARN.
+fn log_query_served(tool: &str, cached: bool, elapsed_ms: u128) {
+    if query_is_slow(elapsed_ms) {
+        tracing::info!(
+            event = "query.served",
+            tool = %tool,
+            cached,
+            elapsed_ms,
+            "query served"
+        );
+    } else {
+        tracing::debug!(
+            event = "query.served",
+            tool = %tool,
+            cached,
+            elapsed_ms,
+            "query served"
+        );
+    }
 }
 
 /// Returns `(response, should_shutdown)`.
@@ -14838,13 +15172,7 @@ fn handle_control_message(
             if let Some(versions) = versions {
                 let mut c = cache.lock().unwrap_or_else(|e| e.into_inner());
                 if let Some(cached) = c.get(&tool, &args, &last_commit, &phase_b_commit, versions) {
-                    tracing::info!(
-                        event = "query.served",
-                        tool = %tool,
-                        cached = true,
-                        elapsed_ms = started.elapsed().as_millis(),
-                        "query served"
-                    );
+                    log_query_served(&tool, true, started.elapsed().as_millis());
                     return (ControlResponse::query_result(cached), false);
                 }
             }
@@ -14861,19 +15189,12 @@ fn handle_control_message(
                             value.clone(),
                         );
                     }
-                    // The line that makes "which query was slow" answerable.
-                    // Without it a successful query logged nothing at all, so
-                    // the `req` correlation id had nothing on the happy path to
-                    // bind to and per-request timing did not exist. `cached`
-                    // distinguishes the two costs, which is usually the first
-                    // thing worth knowing about a slow one.
-                    tracing::info!(
-                        event = "query.served",
-                        tool = %tool,
-                        cached = false,
-                        elapsed_ms = started.elapsed().as_millis(),
-                        "query served"
-                    );
+                    // The line that makes "which query was slow" answerable, and
+                    // the anchor the `req` correlation id binds to on the happy
+                    // path. `cached` distinguishes the two costs, which is
+                    // usually the first thing worth knowing about a slow one.
+                    // See `log_query_served` for why the level is not fixed.
+                    log_query_served(&tool, false, started.elapsed().as_millis());
                     (ControlResponse::query_result(value), false)
                 }
                 Err(e) => {
