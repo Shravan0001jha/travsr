@@ -57,13 +57,20 @@ pub fn set_allow_unsandboxed_lsif(val: bool) {
     travsr_indexer::sandbox::set_cli_allow_unsandboxed(val);
 }
 
-/// Tracing target for the one event that must survive whatever level the log is
-/// written at: `daemon.session.start`.
+/// Tracing target for the session lifecycle events that must survive whatever
+/// filter the log is written under: `daemon.session.start` and
+/// `daemon.session.exit`.
 ///
-/// A log file has to be able to say which session produced it and under what
-/// filter, or a reader cannot tell an empty file from a quiet one, and will
-/// happily read the previous session's line as if it described this one. The
-/// subscriber setup appends a directive admitting this target unconditionally.
+/// A log file has to be able to say which session produced it, under what
+/// filter, and why it stopped, or a reader cannot tell an empty file from a
+/// quiet one and will happily read the previous session's line as if it
+/// described this one. The subscriber setup appends a directive admitting this
+/// target unconditionally.
+///
+/// A high severity is not a substitute for the exemption. ERROR passes any bare
+/// level, but a targeted directive with no bare level (`RUST_LOG=some_crate=debug`)
+/// leaves `EnvFilter`'s unmatched default OFF, so an ERROR on the ordinary
+/// target is dropped. The exit line learned that the hard way.
 ///
 /// The extension's `shortTarget` splits on `::`, so entries still render under
 /// `daemon` rather than growing a second name in the log view.
@@ -5876,19 +5883,16 @@ mod tests {
     use std::process::Command as StdCommand;
     use std::sync::Mutex;
 
-    /// `log.level = error` has to still record errors, which is the whole point
-    /// of offering the level. Checked against a real `EnvFilter` rather than by
-    /// reading the directive string, because what matters is what the filter
-    /// admits, and an unknown word in a directive is silently read as a target
-    /// name rather than rejected.
-    #[test]
-    fn an_error_only_log_still_records_errors() {
+    /// Run `body` under a subscriber filtered by `directive`, and return the
+    /// (target, level) of every event that actually reached it.
+    ///
+    /// Asserting on what a subscriber receives rather than on the directive
+    /// string is the whole point: an unknown word in a directive is read as a
+    /// target name rather than rejected, and severity alone does not carry an
+    /// event past a filter with no bare level.
+    fn capture_with_filter(directive: &str, body: impl FnOnce()) -> Vec<(String, tracing::Level)> {
         use tracing_subscriber::layer::{Layer as _, SubscriberExt as _};
-        use tracing_subscriber::EnvFilter;
 
-        let directive = filter_directive_for("error");
-        // A layer that records what actually reached it, so this asserts on the
-        // events a subscriber receives rather than on the directive string.
         #[derive(Clone, Default)]
         struct Seen(std::sync::Arc<Mutex<Vec<(String, tracing::Level)>>>);
         impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Seen {
@@ -5906,18 +5910,55 @@ mod tests {
         }
 
         let seen = Seen::default();
-        let subscriber =
-            tracing_subscriber::registry()
-                .with(seen.clone().with_filter(
-                    EnvFilter::try_new(&directive).expect("our directive must parse"),
-                ));
-        tracing::subscriber::with_default(subscriber, || {
+        let subscriber = tracing_subscriber::registry().with(seen.clone().with_filter(
+            tracing_subscriber::EnvFilter::try_new(directive).expect("our directive must parse"),
+        ));
+        tracing::subscriber::with_default(subscriber, body);
+        let out = seen.0.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        out
+    }
+
+    /// A targeted directive with no bare level leaves `EnvFilter`'s unmatched
+    /// default OFF, so severity alone does not get a line into the file: an
+    /// ERROR on the ordinary target is dropped. Both session lifecycle lines
+    /// have to ride the exempt target to survive it, and the exit line did not
+    /// at first, which silently defeated it under exactly the form the CLI's
+    /// troubleshooting text prints and which auto-starts a daemon.
+    #[test]
+    fn session_lifecycle_survives_a_targeted_rust_log() {
+        let directive = filter_directive_for("travsr_plugin_host=debug");
+        let seen = capture_with_filter(&directive, || {
+            tracing::info!(target: SESSION_LOG_TARGET, event = "daemon.session.start", "start");
+            tracing::error!(target: SESSION_LOG_TARGET, event = "daemon.session.exit", "exit");
+            // The same event on the ordinary target, which is what the exit
+            // line used to be and what this test exists to keep it from
+            // becoming again.
+            tracing::error!(event = "daemon.session.exit", "exit on the default target");
+        });
+        let on_exempt = seen.iter().filter(|(t, _)| t == SESSION_LOG_TARGET).count();
+        assert_eq!(
+            on_exempt, 2,
+            "both session lifecycle lines must survive a targeted directive; saw {seen:?}"
+        );
+        assert!(
+            !seen.iter().any(|(t, _)| t == "travsr_daemon"),
+            "an ERROR on the ordinary target is dropped here, which is why the exemption is needed; saw {seen:?}"
+        );
+    }
+
+    /// `log.level = error` has to still record errors, which is the whole point
+    /// of offering the level. Checked against a real `EnvFilter` rather than by
+    /// reading the directive string, because what matters is what the filter
+    /// admits, and an unknown word in a directive is silently read as a target
+    /// name rather than rejected.
+    #[test]
+    fn an_error_only_log_still_records_errors() {
+        let directive = filter_directive_for("error");
+        let got = capture_with_filter(&directive, || {
             tracing::error!("boom");
             tracing::warn!("noise");
             tracing::info!(target: SESSION_LOG_TARGET, "daemon starting");
         });
-
-        let got = seen.0.lock().unwrap_or_else(|e| e.into_inner()).clone();
         assert!(
             got.iter().any(|(_, l)| *l == tracing::Level::ERROR),
             "an error-only log that drops errors is not a log; saw {got:?}"
@@ -13804,6 +13845,18 @@ impl Daemon {
                             // is gone said nothing about why it went. It stays on
                             // stderr too, for `daemon start --foreground`.
                             tracing::error!(
+                                // Same exempt target as the session-start line,
+                                // and for the same reason. ERROR passes any
+                                // bare level, but a targeted `RUST_LOG` with no
+                                // bare level leaves EnvFilter's unmatched
+                                // default OFF, so on the default target this
+                                // line was dropped under exactly the form the
+                                // CLI's troubleshooting text prints
+                                // (`RUST_LOG=travsr_plugin_host=debug`), which
+                                // auto-starts a daemon. The log then stopped
+                                // mid-session with no reason in it, which is
+                                // the failure this event exists to remove.
+                                target: SESSION_LOG_TARGET,
                                 event = "daemon.session.exit",
                                 reason = "graph_db_removed",
                                 db = %db_path.display(),
@@ -13966,6 +14019,18 @@ impl Daemon {
                             // is gone said nothing about why it went. It stays on
                             // stderr too, for `daemon start --foreground`.
                             tracing::error!(
+                                // Same exempt target as the session-start line,
+                                // and for the same reason. ERROR passes any
+                                // bare level, but a targeted `RUST_LOG` with no
+                                // bare level leaves EnvFilter's unmatched
+                                // default OFF, so on the default target this
+                                // line was dropped under exactly the form the
+                                // CLI's troubleshooting text prints
+                                // (`RUST_LOG=travsr_plugin_host=debug`), which
+                                // auto-starts a daemon. The log then stopped
+                                // mid-session with no reason in it, which is
+                                // the failure this event exists to remove.
+                                target: SESSION_LOG_TARGET,
                                 event = "daemon.session.exit",
                                 reason = "graph_db_removed",
                                 db = %db_path.display(),

@@ -43,6 +43,12 @@
 //! daemon is spawned with null stdio, so the log stopped mid-session with
 //! nothing in it to say why. `daemon.session.stop` remains the orderly case.
 //!
+//! Both `daemon.session.*` lifecycle lines ride [`crate::SESSION_LOG_TARGET`],
+//! and must keep doing so. Severity is not enough: a targeted directive with no
+//! bare level leaves `EnvFilter`'s unmatched default OFF, so even an ERROR on
+//! the ordinary target is dropped under `RUST_LOG=some_crate=debug`, which is
+//! the form the CLI's own troubleshooting text prints.
+//!
 //! `query.served` and `query.failed` were emitted long before they were listed
 //! here, which is how `query.served` came to be the most frequent line in the
 //! file: a key nobody had signed off as a lifecycle event, logged at INFO once

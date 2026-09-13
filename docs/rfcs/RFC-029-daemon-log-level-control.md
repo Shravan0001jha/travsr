@@ -87,9 +87,9 @@ The precedence itself is a pure function of two inputs, separate from the code
 that reads the environment and the config files, because the real function reads
 process-global state that a parallel test cannot own.
 
-### 3. The session line is exempt from the level it reports
+### 3. The session lifecycle lines are exempt from the filter they report
 
-`daemon.session.start` now carries a dedicated target,
+`daemon.session.start` and `daemon.session.exit` both carry a dedicated target,
 `travsr_daemon::session` (`SESSION_LOG_TARGET`), and the subscriber appends a
 directive admitting that target unconditionally:
 
@@ -97,9 +97,24 @@ directive admitting that target unconditionally:
 error  ->  error,travsr_daemon::session=trace
 ```
 
-One line per daemon start is a price worth paying at any level for a file that
-identifies itself. The extension's `shortTarget` splits on `::`, so entries
-still render under `daemon` and the log view is unchanged.
+Two lines per daemon lifetime is a price worth paying at any level for a file
+that says what it is and why it stopped. The extension's `shortTarget` splits on
+`::`, so entries still render under `daemon` and the log view is unchanged.
+
+A high severity is not a substitute for the exemption, which is how the exit
+line was got wrong at first. ERROR passes any bare level, so under the
+`log.level` path it was recorded, but a targeted directive with no bare level
+leaves `EnvFilter`'s unmatched default OFF and drops it. That is precisely the
+form the CLI's troubleshooting text prints, and it auto-starts a daemon:
+
+```
+RUST_LOG=travsr_plugin_host=debug travsr init --semantic --force
+```
+
+so a user following the documented workflow whose `graph.db` then vanished got
+the silent mid-session stop this event exists to remove. `filter_directive_for`
+admits the target, not a severity; anything that must outlive the filter has to
+ride it.
 
 Appended whatever chose the directive, `RUST_LOG` included. The first version
 exempted the escape hatch on the grounds that readers tell a `RUST_LOG` run
