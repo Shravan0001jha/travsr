@@ -135,7 +135,16 @@ fn phase_b_state(payload: &StatusPayload) -> String {
                     // than reporting a flat "complete" for a language that never ran.
                     .chain(warned_langs(payload, "needs_approval"))
                     .collect();
-                if crashed.is_empty() && not_run.is_empty() {
+                // #878: the language's native pass ran, but its compiler-backed
+                // LSIF pass did not, so it is missing most of its cross-file call
+                // edges. Neither "crashed" nor "not run" is true of it; it is
+                // incomplete, and a flat "complete" here is exactly the false
+                // success the issue reports.
+                let incomplete: Vec<String> = warned_langs(payload, "emitter_missing")
+                    .into_iter()
+                    .chain(warned_langs(payload, "emitter_failed"))
+                    .collect();
+                if crashed.is_empty() && not_run.is_empty() && incomplete.is_empty() {
                     "complete".to_string()
                 } else {
                     let mut parts = Vec::new();
@@ -144,6 +153,9 @@ fn phase_b_state(payload: &StatusPayload) -> String {
                     }
                     if !not_run.is_empty() {
                         parts.push(format!("not run: {}", not_run.join(", ")));
+                    }
+                    if !incomplete.is_empty() {
+                        parts.push(format!("incomplete: {}", incomplete.join(", ")));
                     }
                     format!("partial ({})", parts.join("; "))
                 }
@@ -176,6 +188,45 @@ fn warned_langs(payload: &StatusPayload, kind: &str) -> Vec<String> {
         .filter(|l| !l.is_empty())
         .map(str::to_string)
         .collect()
+}
+
+/// #825: render the unreconciled SCIP definitions behind the E6 miss warning.
+///
+/// The miss set is deterministic, so the actionable information is *which*
+/// definitions miss (which language/construct is failing), not a bare count.
+/// Each stored row is `lang\tkind\tsymbol\tpath:line`; a malformed row is passed
+/// through verbatim rather than dropped. Pure (no stderr) so it is unit-testable.
+///
+/// Display is capped at `SHOW`. `missed` is the true total from the warning's
+/// `missed/attempted` rate, which is larger than `list` whenever the daemon hit
+/// its own storage cap (`MAX_MISS_ROWS`) — the overflow line must count from it,
+/// not from the stored rows, or the tail contradicts the warning above it.
+fn unification_miss_lines(list: Option<&str>, missed: Option<usize>) -> Vec<String> {
+    const SHOW: usize = 20;
+    let Some(list) = list.filter(|s| !s.is_empty()) else {
+        return Vec::new();
+    };
+    let rows: Vec<&str> = list.lines().collect();
+    let mut out: Vec<String> = rows
+        .iter()
+        .take(SHOW)
+        .map(|row| {
+            let mut cols = row.split('\t');
+            match (cols.next(), cols.next(), cols.next(), cols.next()) {
+                (Some(lang), Some(kind), Some(symbol), Some(loc)) => {
+                    format!("  {lang} {kind} {symbol}  {loc}")
+                }
+                _ => format!("  {row}"),
+            }
+        })
+        .collect();
+    // `max(rows.len())` keeps the tail honest if the rate and the list ever
+    // disagree the other way (daemon/CLI skew): never under-report the rest.
+    let total = missed.unwrap_or(0).max(rows.len());
+    if total > out.len() {
+        out.push(format!("  … and {} more", total - out.len()));
+    }
+    out
 }
 
 /// #645 WS-B: the caller's live short HEAD, read at `cwd` (before the worktree
@@ -347,12 +398,20 @@ pub fn run() -> anyhow::Result<()> {
                     }
                     ["zero_nodes", lang] => {
                         eprintln!(
-                            "warning: '{lang}' analysis ran but found no symbols, though the repo has '{lang}' sources. The analyzer is installed, so reinstalling will not help, it usually means the analyzer could not read or build this project's sources (a missing SDK or an unbuildable project). Fix the project setup, then re-run `travsr init --semantic --force`"
+                            // `=warn`, not `=debug`: this PR promoted the
+                            // zero-node stderr echo in `travsr-plugin-host`'s
+                            // transport from `debug!` to `warn!` precisely so
+                            // the cause is reachable without turning on
+                            // everything else, and `observability.rs` tells an
+                            // agent `=warn` for this same condition. Two
+                            // surfaces naming two levels for one problem is how
+                            // the advice starts drifting.
+                            "warning: '{lang}' analysis ran but found no symbols, though the repo has '{lang}' sources. The analyzer is installed, so reinstalling will not help. The cause is in the analyzer's own output: re-run `RUST_LOG=travsr_plugin_host=warn travsr init --semantic --force` to see it. It may be this project (a missing SDK, an unbuildable project, or a build that skips part of its sources), or it may be how travsr invoked the analyzer"
                         );
                         // Name the concrete thing to check rather than leaving
-                        // "a missing SDK or an unbuildable project" as the only
-                        // clue — the catalog already knows what this language's
-                        // analyzer needs from the project.
+                        // the possible causes as the only clue: the catalog
+                        // already knows what this language's analyzer needs
+                        // from the project.
                         if let Some(entry) = travsr_plugin_host::phase_b::catalog::lookup(lang) {
                             let prereq = entry.effective_prerequisites();
                             if !prereq.is_empty() && prereq != "none" {
@@ -404,12 +463,51 @@ pub fn run() -> anyhow::Result<()> {
                     ["skipped_no_compdb", lang] => eprintln!(
                         "warning: full '{lang}' analysis needs a compile database (compile_commands.json) at the repo root. Generate one (e.g. `bear -- make`, or CMake's CMAKE_EXPORT_COMPILE_COMMANDS)"
                     ),
+                    // #878: the TypeScript LSIF emitter is discovered relative to
+                    // the travsr binary, so a binary copied out of its build or
+                    // install layout loses it and the language silently kept only
+                    // its tree-sitter call edges. Name the two fixes that exist.
+                    ["emitter_missing", lang] => eprintln!(
+                        "warning: full '{lang}' analysis is incomplete: the TypeScript analyzer (travsr-lsif-ts) could not be started, so cross-file call and reference edges are missing. This happens when the travsr binary is run from outside its install layout. Set TRAVSR_LSIF_TS to the emitter's dist/index.js (or reinstall travsr), then re-run `travsr init --semantic --force`"
+                    ),
+                    ["emitter_failed", lang] => eprintln!(
+                        "warning: full '{lang}' analysis is incomplete: the TypeScript analyzer (travsr-lsif-ts) started but failed, so cross-file call and reference edges are missing. Re-run `RUST_LOG=travsr_daemon=warn travsr init --semantic --force` to see its error"
+                    ),
                     // E6: SCIP definitions that did not unify onto their Phase A
                     // tree-sitter node — their references attribute to an orphaned
                     // duplicate node instead. `rate` is missed/attempted.
-                    ["scip_unification_misses", rate] => eprintln!(
-                        "warning: {rate} semantic definitions did not match their parsed symbol, some references may resolve to a duplicate. Re-run `travsr init --semantic` if it persists."
-                    ),
+                    //
+                    // #825: the miss set is deterministic (same sources + emitter
+                    // output => the identical misses every run), so the old
+                    // "Re-run `travsr init --semantic` if it persists" advice was a
+                    // no-op that could never move the count. Name the symbols
+                    // instead — that is what a dev can act on.
+                    //
+                    // The list itself can legitimately be absent: an index whose
+                    // last Phase B run predates #825 has the warning key but not
+                    // the list key, as does an old daemon serving a new CLI. Only
+                    // then does re-running do something — it writes the list — so
+                    // say that instead of promising rows that never print.
+                    ["scip_unification_misses", rate] => {
+                        let missed = rate
+                            .split_once('/')
+                            .and_then(|(m, _)| m.parse::<usize>().ok());
+                        let rows = unification_miss_lines(
+                            payload.scip_unification_miss_list.as_deref(),
+                            missed,
+                        );
+                        let tail = if rows.is_empty() {
+                            "run `travsr init --semantic` once to record which definitions they are"
+                        } else {
+                            "the unreconciled definitions are listed below"
+                        };
+                        eprintln!(
+                            "warning: {rate} semantic definitions did not match their parsed symbol, so some references may resolve to a duplicate. This is deterministic (re-running the index will not change the count); {tail}."
+                        );
+                        for row in rows {
+                            eprintln!("{row}");
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -576,6 +674,7 @@ mod tests {
             live_refs_resolved: 0,
             live_refs_pending: 0,
             dart_deps_unresolved: None,
+            scip_unification_miss_list: None,
         }
     }
 
@@ -682,6 +781,26 @@ mod tests {
     }
 
     #[test]
+    fn phase_b_downgrades_when_the_lsif_emitter_was_skipped() {
+        // #878: a relocated binary cannot find `travsr-lsif-ts`, so typescript's
+        // native pass runs (it is in `ran`, the marker advances) while its
+        // compiler-backed pass does not. The language is neither crashed nor
+        // not-run; it is incomplete, and must not read as a flat "complete".
+        let mut p = payload("abc", "abc", false);
+        p.phase_b_warnings = Some("emitter_missing:typescript".into());
+        assert_eq!(phase_b_state(&p), "partial (incomplete: typescript)");
+        // An emitter that ran and failed is the same incompleteness.
+        p.phase_b_warnings = Some("emitter_failed:typescript".into());
+        assert_eq!(phase_b_state(&p), "partial (incomplete: typescript)");
+        // Composes with the existing buckets rather than replacing them.
+        p.phase_b_warnings = Some("crashed:go,emitter_missing:typescript".into());
+        assert_eq!(
+            phase_b_state(&p),
+            "partial (crashed: go; incomplete: typescript)"
+        );
+    }
+
+    #[test]
     fn phase_b_still_honours_a_pre_upgrade_needs_approval_warning() {
         // #756 review: elevated access is auto-granted now, so this build never
         // writes `needs_approval`. But a pre-upgrade index persisted it in store
@@ -691,6 +810,56 @@ mod tests {
         let mut p = payload("abc", "abc", false);
         p.phase_b_warnings = Some("needs_approval:java".into());
         assert_eq!(phase_b_state(&p), "partial (not run: java)");
+    }
+
+    #[test]
+    fn unification_misses_render_named_rows() {
+        // #825: the diagnostic names each unreconciled def (lang, kind, symbol,
+        // path:line) instead of only counting them.
+        let list = "swift\tclass\tAdHandler\tAd.swift:12\nruby\tfunction\tApp.missing\tapp.rb:99";
+        let lines = unification_miss_lines(Some(list), Some(2));
+        assert_eq!(
+            lines,
+            vec![
+                "  swift class AdHandler  Ad.swift:12".to_string(),
+                "  ruby function App.missing  app.rb:99".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn unification_misses_cap_display_and_count_the_rest() {
+        let list = (0..25)
+            .map(|i| format!("go\tfunction\tf{i}\tx.go:{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let lines = unification_miss_lines(Some(&list), Some(25));
+        assert_eq!(lines.len(), 21, "20 rows + one overflow line");
+        assert_eq!(lines.last().unwrap(), "  … and 5 more");
+    }
+
+    #[test]
+    fn unification_misses_overflow_counts_from_the_true_total() {
+        // #825 review: `write_phase_b_results` caps the STORED list at 100 rows
+        // while display caps at 20, so for the issue's 152/2632 case counting the
+        // remainder from the stored rows printed "… and 80 more" directly under a
+        // warning that said 152. The overflow must count from the rate.
+        let list = (0..100)
+            .map(|i| format!("swift\tclass\tT{i}\tA.swift:{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let lines = unification_miss_lines(Some(&list), Some(152));
+        assert_eq!(lines.len(), 21);
+        assert_eq!(lines.last().unwrap(), "  … and 132 more");
+        // An unparseable rate must never under-report: fall back to the rows.
+        let lines = unification_miss_lines(Some(&list), None);
+        assert_eq!(lines.last().unwrap(), "  … and 80 more");
+    }
+
+    #[test]
+    fn unification_misses_empty_or_absent_render_nothing() {
+        assert!(unification_miss_lines(None, Some(152)).is_empty());
+        assert!(unification_miss_lines(Some(""), Some(152)).is_empty());
     }
 
     #[test]

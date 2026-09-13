@@ -100,6 +100,21 @@ pub struct EdgeEntry {
     /// store access (noise endpoints are not in `nodes` but still render).
     pub src_sig: String,
     pub dst_sig: String,
+    /// Same flag as [`TreeStep::heuristic`], on the edge list.
+    ///
+    /// The tree view marked these edges and the `edges` array did not, so
+    /// `--format dot` and `get_graph_json` presented a name-matched call as
+    /// resolved. `serde(default)` keeps older daemon payloads deserializable.
+    #[serde(default)]
+    pub heuristic: bool,
+}
+
+/// Whether an edge was matched by bare callee name rather than resolved by
+/// type: a `ref/call` that `resolve_unresolved_calls` wrote, not a compiler.
+/// One predicate for both the tree and the edge list so the two views of a
+/// single traversal cannot disagree.
+pub(crate) fn is_heuristic_edge(kind: &str, provenance: &str) -> bool {
+    kind == travsr_core::EdgeKind::RefCall.as_str() && provenance == "tree-sitter"
 }
 
 /// One BFS spanning-tree expansion step, in discovery order — drives the
@@ -115,6 +130,14 @@ pub struct TreeStep {
     /// payloads from daemons predating this field deserializable.
     #[serde(default)]
     pub incoming: bool,
+    /// `true` for a `ref/call` edge whose provenance is `tree-sitter`: one
+    /// `resolve_unresolved_calls` matched by bare callee name, not one a
+    /// compiler resolved by type. Mirrors the condition `provenance_marker` in
+    /// `tools.rs` uses for its `get_callers` sigil, so the tree view and
+    /// `find_references` cannot describe the same edge differently.
+    /// `serde(default)` keeps older daemon payloads deserializable.
+    #[serde(default)]
+    pub heuristic: bool,
 }
 
 /// Coverage / completeness metadata (#318 O5) — distinguishes "no callers"
@@ -262,6 +285,12 @@ pub struct StatusPayload {
     /// Old daemons omit the field (serde default None).
     #[serde(default)]
     pub dart_deps_unresolved: Option<String>,
+    /// #825: the actual SCIP definitions behind the `scip_unification_misses`
+    /// warning, one per line (`lang\tkind\tsymbol\tpath:line`), capped. Lets
+    /// `travsr status` name the unreconciled symbols instead of only counting
+    /// them. Empty/None = no misses. Old daemons omit it (serde default None).
+    #[serde(default)]
+    pub scip_unification_miss_list: Option<String>,
 }
 
 // ── status ────────────────────────────────────────────────────────────────────
@@ -292,6 +321,7 @@ pub fn status_query(store: &SqliteStore) -> anyhow::Result<StatusPayload> {
         live_refs_resolved: resolved_refs,
         live_refs_pending: pending_refs,
         dart_deps_unresolved: store.get_meta("dart_deps_unresolved")?,
+        scip_unification_miss_list: store.get_meta("scip_unification_miss_list")?,
     })
 }
 
@@ -856,7 +886,12 @@ pub fn graph_query(store: &SqliteStore, args: &GraphQueryArgs) -> anyhow::Result
     let seed =
         match crate::tools::resolve_reference_targets(store, &args.query, args.path.as_deref()) {
             crate::tools::RefTarget::Unique(n) => Some(n),
-            crate::tools::RefTarget::Ambiguous(list) => {
+            // A selector family is listed like an ambiguity here rather than
+            // merged: a graph has one root, and the arities of a selector are
+            // distinct nodes with distinct neighbourhoods. Naming the full
+            // selector picks one. (`find_references` unions them instead, since
+            // a reference list has no root to conflict over.)
+            crate::tools::RefTarget::Ambiguous(list) | crate::tools::RefTarget::Family(list) => {
                 let candidates_entries: Vec<NodeEntry> =
                     list.iter().map(|n| node_entry(n, 0)).collect();
                 candidates = Some(candidates_entries);
@@ -962,6 +997,7 @@ pub fn graph_query(store: &SqliteStore, args: &GraphQueryArgs) -> anyhow::Result
             } else {
                 (current_id, next_id)
             };
+            let heuristic = is_heuristic_edge(edge_kind.as_str(), &edge_provenance);
             edges_raw.push((src, dst, edge_kind.as_str().to_string(), edge_provenance));
 
             if !visited.contains(&next_id) {
@@ -977,6 +1013,7 @@ pub fn graph_query(store: &SqliteStore, args: &GraphQueryArgs) -> anyhow::Result
                     edge_kind: edge_kind.as_str().to_string(),
                     child: next_id.0,
                     incoming: edge_incoming,
+                    heuristic,
                 });
                 queue.push_back((next_id, depth + 1, child_expand));
             }
@@ -1048,6 +1085,7 @@ fn resolve_edge_sigs(
         edges.push(EdgeEntry {
             src: src.0,
             dst: dst.0,
+            heuristic: is_heuristic_edge(&kind, &provenance),
             kind,
             provenance,
             src_sig: sig_lookup.get(&src.0).cloned().unwrap_or_default(),
@@ -1729,6 +1767,45 @@ mod tests {
             payload.total_tokens <= DEFAULT_TOKEN_BUDGET,
             "total {} exceeded budget {DEFAULT_TOKEN_BUDGET}",
             payload.total_tokens
+        );
+    }
+
+    /// #870: the two surfaces must agree on doc *presence*. `ask` returns
+    /// `docs` as its own field on every return path, so a doc entry is always
+    /// findable; `get_context` renders the same entries into its body, where
+    /// the section header is the only thing that marks them as prose. That
+    /// header used to be dropped whenever the code lane selected four nodes or
+    /// fewer (`group_output`), which is the normal shape of a result on a
+    /// sparse graph: a repo indexed without Phase B, where PPR has almost no
+    /// edges to expand along. The doc lines then reached the model as bare
+    /// lines among the code rows, and every consumer that finds the section by
+    /// its header (the docs-lane gate, the VS Code Context Explorer) read the
+    /// response as carrying no docs at all.
+    #[test]
+    fn ask_and_context_agree_on_doc_presence_when_few_nodes_are_selected() {
+        let _guard = crate::seed::DOCS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        docs_env_on();
+        let (mut store, ..) = seeded_store();
+        with_doc_chunk(
+            &mut store,
+            "docs/adrs/ADR-001-coding-standards.md",
+            "doc:coding-standards/consequences",
+        );
+
+        let ask = ask_query(&store, "PaymentService", None).unwrap();
+        let ctx = crate::tools::get_context_raw(&store, "PaymentService", 4000, false, None);
+        docs_env_off();
+
+        assert_eq!(ask.docs.len(), 1, "docs: {:?}", ask.docs);
+        assert!(
+            ctx.contains("docs/adrs/ADR-001-coding-standards.md"),
+            "get_context must render the same doc entry: {ctx}"
+        );
+        assert!(
+            ctx.contains("## docs"),
+            "the doc entry must carry its section header on both surfaces: {ctx}"
         );
     }
 

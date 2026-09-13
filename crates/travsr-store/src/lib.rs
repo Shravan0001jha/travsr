@@ -321,6 +321,7 @@ pub type EmbedScoreHook =
 /// "embeddings off" — so the opening query of a session silently runs lexical-only.
 pub struct EmbedReadiness {
     armed: std::sync::atomic::AtomicBool,
+    disabled: std::sync::atomic::AtomicBool,
     waiters: (std::sync::Mutex<()>, std::sync::Condvar),
 }
 
@@ -329,6 +330,7 @@ impl EmbedReadiness {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
             armed: std::sync::atomic::AtomicBool::new(false),
+            disabled: std::sync::atomic::AtomicBool::new(false),
             waiters: (std::sync::Mutex::new(()), std::sync::Condvar::new()),
         })
     }
@@ -341,9 +343,29 @@ impl EmbedReadiness {
         self.waiters.1.notify_all();
     }
 
+    /// Record that arming finished with no hook installed, so semantic search
+    /// is off for the life of this process (sidecar failed to start, or the
+    /// index was built with a different embedding model).
+    ///
+    /// Distinct from "not ready": the injector still calls `mark_ready` after
+    /// this, because readiness means "arming has settled" and a readiness that
+    /// never flips makes every query block for the full arm-wait. Without this
+    /// third state the query path sees a ready handle behind an installed
+    /// meta-hook and reports `embeddings: on` while nothing semantic can run.
+    /// Call before `mark_ready` so a woken waiter observes both.
+    pub fn mark_disabled(&self) {
+        self.disabled
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
     /// True once `mark_ready` has fired.
     pub fn is_ready(&self) -> bool {
         self.armed.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// True once `mark_disabled` has fired.
+    pub fn is_disabled(&self) -> bool {
+        self.disabled.load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Block up to `timeout` for arming; returns the final ready state.
@@ -921,6 +943,55 @@ pub struct RefResolution {
     pub resolved_dst: Option<NodeId>,
 }
 
+/// #811: what one [`SqliteStore::reconcile_ref_resolution_states`] pass removed.
+///
+/// Two counters rather than one because they answer different questions: a
+/// large `cleared_resolved` after a full rebuild is the stale-marker backlog
+/// #811 is about, while `purged_orphans` tracks renames. Both zero means the
+/// table was already consistent with the graph, which is what a second run must
+/// always report.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RefReconcileReport {
+    /// `pending` rows deleted because `edge_sites` now holds a call site at the
+    /// same `(src, line)`.
+    pub cleared_resolved: usize,
+    /// Rows deleted because their `src` node no longer exists.
+    pub purged_orphans: usize,
+}
+
+impl RefReconcileReport {
+    /// Rows removed in total.
+    pub fn total(&self) -> usize {
+        self.cleared_resolved + self.purged_orphans
+    }
+}
+
+/// RFC-027 section 8.3: the `DELETE` behind
+/// [`SqliteStore::clear_resolved_pending_refs`], on any connection or open
+/// transaction, so the standalone method and the transactional
+/// [`SqliteStore::reconcile_ref_resolution_states`] share one statement.
+fn clear_resolved_pending_refs_on(conn: &rusqlite::Connection) -> rusqlite::Result<usize> {
+    conn.execute(
+        "DELETE FROM ref_resolution_state \
+         WHERE state = 'pending' \
+           AND EXISTS (SELECT 1 FROM edge_sites s \
+                       WHERE s.src = ref_resolution_state.src \
+                         AND s.line = ref_resolution_state.ref_line)",
+        [],
+    )
+}
+
+/// RFC-027 section 9.2: the `DELETE` behind
+/// [`SqliteStore::purge_orphan_ref_resolution_states`]; see
+/// [`clear_resolved_pending_refs_on`] for why it is factored out.
+fn purge_orphan_ref_resolution_states_on(conn: &rusqlite::Connection) -> rusqlite::Result<usize> {
+    conn.execute(
+        "DELETE FROM ref_resolution_state \
+         WHERE NOT EXISTS (SELECT 1 FROM nodes n WHERE n.id = ref_resolution_state.src)",
+        [],
+    )
+}
+
 /// RFC-027 section 12: how the live lane scored against Phase B.
 ///
 /// Deliberately three buckets, not two. `unverifiable` is the honest home for a
@@ -1119,6 +1190,72 @@ fn backfill_counts(node_count: i64, map_count: i64) -> (i64, i64) {
     )
 }
 
+/// #509: what makes a file at a path *that* file, rather than merely a file
+/// with that name. Compared for equality only; the members have no meaning
+/// beyond "these two stats came from the same file or they did not". One shape
+/// for both platforms so the rest of the code needs no `cfg`: unix fills two
+/// members and leaves the third zero, windows fills all three.
+type FileIdentity = (u64, u64, u64);
+
+/// Identity of the file currently at `path`, or `None` when it cannot be
+/// stat-ed (absent, or unreadable), which callers treat the same as gone.
+///
+/// The repository has no portable file-identity helper to reuse: the only
+/// prior stat-based identity work is `travsr-ipc`'s `owner_uid`, which is
+/// `#[cfg(unix)]` with no Windows counterpart. So this is gated per platform.
+///
+/// unix: `(st_dev, st_ino)` is the kernel's own identity for a file and is
+/// exact here. A file that is unlinked while a descriptor is still open on it
+/// keeps its inode allocated until the last descriptor closes, so as long as
+/// [`SqliteStore::embed_meta_conn`] holds the old embed.db open, its inode
+/// number cannot be handed to the replacement. Different file, different
+/// identity, always.
+///
+/// windows: `std::os::windows::fs::MetadataExt::file_index`, the direct
+/// analogue named in #509, is still unstable behind `windows_by_handle`
+/// (rust-lang/rust#63010) and cannot be called on stable Rust. This uses the
+/// stable triple `(creation_time, last_write_time, file_size)` instead. That
+/// is a strong heuristic rather than an identity: NTFS tunneling can carry a
+/// deleted file's creation time onto a same-named replacement created within
+/// ~15 s, so in that window the other two members carry the comparison. It
+/// errs toward *extra* reopens (any write moves `last_write_time`), never
+/// toward keeping a dead handle, which is the safe direction: a spurious
+/// reopen costs one cache miss, a missed one serves stale answers forever.
+/// Note too that SQLite opens database files on Windows without
+/// `FILE_SHARE_DELETE`, so unlinking embed.db out from under a live connection
+/// fails there outright; this branch covers the rename-over case and the case
+/// where the connection was already dropped and reopened.
+fn file_identity(path: &Path) -> Option<FileIdentity> {
+    let md = std::fs::metadata(path).ok()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        Some((md.dev(), md.ino(), 0))
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt as _;
+        Some((md.creation_time(), md.last_write_time(), md.file_size()))
+    }
+}
+
+/// #509: fold a file identity and a `PRAGMA data_version` reading into the one
+/// opaque `u64` that [`SqliteStore::embed_data_version`] hands back.
+///
+/// Hashing rather than, say, packing the two into halves of the `u64`, because
+/// neither input has a bounded range to pack into. The consumer is the daemon's
+/// query cache, which only ever compares this for equality (`CacheKey` derives
+/// `PartialEq`/`Hash` and nothing orders it), so an unordered token is all the
+/// contract needs. Determinism is only required within a single process: the
+/// cache is in memory and does not outlive the daemon.
+fn embed_version_token(identity: FileIdentity, version: u64) -> u64 {
+    use std::hash::{Hash as _, Hasher as _};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    identity.hash(&mut h);
+    version.hash(&mut h);
+    h.finish()
+}
+
 /// SQLite-backed store. The MVP target — zero setup, single file on disk.
 pub struct SqliteStore {
     conn: Connection,
@@ -1154,7 +1291,13 @@ pub struct SqliteStore {
     /// SAME connection — a fresh connection per call would never observe a
     /// change. `RefCell` keeps the lazy open behind `&self`; the store is not
     /// `Sync` anyway (callers wrap it in a `Mutex`).
-    embed_meta_conn: std::cell::RefCell<Option<Connection>>,
+    ///
+    /// #509: the [`FileIdentity`] the connection was opened against is stored
+    /// alongside it, in the same slot so the two can never drift apart. A
+    /// connection outlives the file it was opened on when embed.db is unlinked,
+    /// so the identity is the only way to notice that the path has come to name
+    /// a different file.
+    embed_meta_conn: std::cell::RefCell<Option<(Connection, FileIdentity)>>,
     /// #376 Phase 2: optional doc-space semantic hook, injected beside
     /// `embed_knn_hook` by the same injector. Same shape as `EmbedKnnHook`
     /// (reused, not a distinct type — both are `Fn(&str, u32) -> Result<Vec<(NodeId, f32)>, StoreError>`)
@@ -1352,6 +1495,17 @@ impl SqliteStore {
                 current == latest,
                 "schema v{current} ≠ expected v{latest}, pending migrations; reopen writable"
             );
+            // C1 (#893): the recorded version does not describe the table shape.
+            // `nodes.body_hash` is added by an open-time step rather than by a
+            // numbered migration (see [`Self::ensure_body_hash_column`]), so a
+            // database an older build stamped at `latest` can still carry the
+            // pre-#813 narrow table, and the number-only check above admits it.
+            // Fail here instead of hitting `no such column` at query time: every
+            // caller falls back to a writable `open()`, which adds the column.
+            anyhow::ensure!(
+                store.column_exists("nodes", "body_hash")?,
+                "schema v{current} but nodes.body_hash is missing; reopen writable"
+            );
             Ok(store)
         })()
         .map_err(|e| StoreError::Database(e.to_string()))
@@ -1430,6 +1584,22 @@ impl SqliteStore {
         match &self.embed_readiness {
             Some(r) => r.is_ready(),
             None => true,
+        }
+    }
+
+    /// Whether arming finished without installing a KNN hook, so the injected
+    /// meta-hook can only ever return an empty result.
+    ///
+    /// `has_embed` is true whenever a hook is present, and the MCP injector
+    /// installs its meta-hooks unconditionally so `initialize` never blocks on
+    /// the sidecar. That makes hook presence a poor proxy for "semantic search
+    /// works": this reports the difference. `false` for callers that registered
+    /// no readiness (daemon, `travsr ask`, tests), which is correct there -
+    /// those paths install a hook only once it is real.
+    pub fn embed_disabled(&self) -> bool {
+        match &self.embed_readiness {
+            Some(r) => r.is_disabled(),
+            None => false,
         }
     }
 
@@ -1712,16 +1882,48 @@ impl SqliteStore {
     /// The pragma is read on a persistent, lazily-opened read-only connection:
     /// `data_version` only moves relative to prior reads on the SAME
     /// connection. If embed.db disappears after the connection was opened, the
-    /// connection is dropped and `Ok(None)` is returned, so a later re-created
-    /// embed.db is picked up with a fresh connection.
+    /// connection is dropped and `Ok(None)` is returned.
+    ///
+    /// # What the returned number is (#509)
+    ///
+    /// It is a freshness token, not the raw pragma. Callers must compare it for
+    /// equality only: it carries no ordering, and a larger value does not mean
+    /// newer. The token mixes the pragma with the [`file_identity`] of the file
+    /// the connection is open on, because the pragma alone cannot see a
+    /// delete-and-recreate at the same path, in two separate ways:
+    ///
+    /// 1. The old code kept the cached connection whenever `path.exists()` was
+    ///    true. Deleting embed.db and letting the sidecar rebuild it (a natural
+    ///    user recovery from a bad embedding state) leaves the path present at
+    ///    every poll, so the connection stayed pinned to the unlinked inode and
+    ///    its `data_version` was frozen for the daemon's lifetime. Identity, not
+    ///    existence, is what decides whether to reopen.
+    /// 2. Reopening alone is still not enough. `data_version` counts writes
+    ///    observed by one connection, so a fresh connection to the rebuilt file
+    ///    begins its own count from a low value rather than continuing the old
+    ///    one, and the two readings routinely collide: the regression test's
+    ///    swap reads 2 on both sides. Mixing the identity in makes the token
+    ///    move across the swap even when both pragmas read the same.
+    ///
+    /// So the token changes when embed.db's contents change *or* when the path
+    /// comes to name a different file, which is exactly the condition under
+    /// which a cached `ask` answer stops being valid.
     pub fn embed_data_version(&self) -> Result<Option<u64>, StoreError> {
         let Some(path) = self.embed_db_path.as_deref() else {
             return Ok(None); // in-memory store — no embed sidecar
         };
         let mut slot = self.embed_meta_conn.borrow_mut();
-        if !path.exists() {
+        let Some(identity) = file_identity(path) else {
             *slot = None;
             return Ok(None);
+        };
+        // #509: the path resolving to a different file than the one the cached
+        // connection was opened on means that connection is reading a corpse.
+        if slot
+            .as_ref()
+            .is_some_and(|(_, opened_on)| *opened_on != identity)
+        {
+            *slot = None;
         }
         if slot.is_none() {
             let conn = Connection::open_with_flags(
@@ -1731,14 +1933,16 @@ impl SqliteStore {
             )
             .with_context(|| format!("opening embed.db read-only at {}", path.display()))
             .map_err(|e| StoreError::Database(e.to_string()))?;
-            *slot = Some(conn);
+            *slot = Some((conn, identity));
         }
-        slot.as_ref()
+        let version = slot
+            .as_ref()
             .expect("embed_meta_conn initialized above")
+            .0
             .query_row("PRAGMA data_version", [], |row| row.get::<_, i64>(0))
             .context("querying embed.db data_version")
-            .map(|v| Some(v as u64))
-            .map_err(|e| StoreError::Database(e.to_string()))
+            .map_err(|e| StoreError::Database(e.to_string()))? as u64;
+        Ok(Some(embed_version_token(identity, version)))
     }
 
     /// Return the live journal mode reported by SQLite. Useful in tests.
@@ -1864,6 +2068,11 @@ impl SqliteStore {
     /// phase1 = embeddable nodes with `shell_number >= threshold` (high-centrality core).
     /// Phase2 totals can be derived: `phase2_total = total_symbols - phase1_total`.
     ///
+    /// Every count is over embeddable nodes, `embedded` included (#862), so
+    /// `embedded <= total_symbols` and `phase1_done <= phase1_total` hold for
+    /// one model and one graph snapshot, and `total_symbols - embedded` is the
+    /// same pending set the sidecar computes for itself.
+    ///
     /// RFC-019: embedded counts are read from embed.db (sibling of graph.db) via
     /// ATTACH. Returns (total, 0, phase1_total, 0) when embed.db does not yet
     /// exist (first run before any reindex completes).
@@ -1875,9 +2084,19 @@ impl SqliteStore {
         // #391: must match travsr-embed sidecar's NODE_ELIGIBLE predicate exactly —
         // a node is embeddable if it's a normal symbol kind OR the daemon opted it
         // in via embed_text (admits data-format file nodes: yaml/toml/json/xml).
-        // If this drifts from the sidecar, `embedded` (which counts every row in
-        // node_embeddings) can exceed `total_symbols`, showing >100% progress and
-        // suppressing the auto-reindex trigger for pending file nodes.
+        //
+        // #862: all four counts apply this predicate, `embedded` included. A
+        // vector's presence is not evidence that its node is embeddable *now*:
+        // eligibility is a property of the node's current row, and it moves.
+        // `clear_all_embed_texts` on a model switch drops every `embed_text`
+        // and the regeneration at the new tier does not necessarily restore it,
+        // so a `field` node embedded while it had text becomes ineligible while
+        // its vector stays. Counting that vector made `embedded` exceed
+        // `total_symbols` (10,009 / 9,996 in the report) and, through the
+        // daemon's `phase2_remaining` arithmetic, masked exactly that many
+        // genuinely pending nodes. The vectors themselves are left alone: they
+        // are valid data for the sidecar's own use, they are simply not
+        // progress against the denominator they were being compared to.
         //
         // #376 W1: the trailing clause mirrors the sidecar's exclusion of
         // doc-chunks with no prose. Without it those nodes count as pending
@@ -1940,10 +2159,18 @@ impl SqliteStore {
                         .execute_batch(&format!("ATTACH DATABASE '{embed_path_str}' AS edb"))
                         .context("attaching embed.db")?;
                     let _guard = EdbGuard(&self.conn); // DETACH on any early return
+                                                       // #862: same join and predicate as `phase1_done` below, minus
+                                                       // the shell clause. The join also drops an orphan row whose
+                                                       // node is gone: embed.db is a separate file, so the schema's
+                                                       // `ON DELETE CASCADE` cannot reach across to it.
                     let embedded: i64 = self
                         .conn
                         .query_row(
-                            "SELECT COUNT(*) FROM edb.node_embeddings WHERE model_id = ?1",
+                            &format!(
+                                "SELECT COUNT(*) FROM edb.node_embeddings ne \
+                                 JOIN nodes n ON ne.node_id = n.id \
+                                 WHERE ne.model_id = ?1 AND {KIND_FILTER_N}"
+                            ),
                             rusqlite::params![model_id],
                             |r| r.get(0),
                         )
@@ -2101,9 +2328,13 @@ impl SqliteStore {
     ///
     /// For each `FileGraph` in `batch`:
     /// 1. Retract old FTS rows + decrement vocab refcounts for the path.
-    /// 2. Delete old edges and nodes for the path.
-    /// 3. Insert new nodes and edges.
+    /// 2. Delete old edges, their occurrence rows, and nodes for the (corpus, path).
+    /// 3. Insert new nodes.
     /// 4. Upsert the file hash.
+    ///
+    /// Edges are inserted once, after every file in the batch has written its
+    /// nodes, so the endpoint-existence guard cannot drop a cross-file edge
+    /// whose target file happens to be written later in the same batch.
     ///
     /// When `bulk=true` (init path), step 3 writes only `nodes_fts_map` rows
     /// instead of the full FTS5 + vocab update per node.  Call
@@ -2138,6 +2369,16 @@ impl SqliteStore {
                 .transaction()
                 .context("starting batch write transaction")?;
             let mut counts = BatchWriteCounts::default();
+            // Incremental-path edges are held until every file in the batch has
+            // written its nodes. The endpoint guard below drops an edge whose
+            // `dst` node does not exist yet, and a cross-file edge names a node
+            // another file in this same batch owns (a TypeScript
+            // `import:./billing --resolves-to--> file:src/billing.ts`, whose
+            // target `file:` node only `src/billing.ts` writes). Inserting per
+            // file made that depend on the order the parallel parse workers
+            // happened to deliver the two files in. The staging path is already
+            // immune, since it promotes all nodes before filtering edges.
+            let mut pending_edges: Vec<&travsr_core::Edge> = Vec::new();
 
             for file in batch {
                 // RFC-027 #813: body hash per definition, from this file's own
@@ -2202,17 +2443,40 @@ impl SqliteStore {
                     }
                 } else {
                     // ── incremental path: delete existing rows, then upsert ───
+                    // Every delete below is scoped by (corpus, path), the key
+                    // [`Self::reindex_replace`] uses: a path is unique within a
+                    // corpus, not across them (ARCH-102: one corpus per repo,
+                    // derived from its git remote, plus the external-package
+                    // corpora). This API takes no `corpus` argument, so it
+                    // comes from the file's own nodes; a parse
+                    // that produced none leaves it NULL, which matches the whole
+                    // path exactly as these statements did before.
+                    //
+                    // Scoping is safe because only `init` can change a repo's
+                    // corpus: `travsr-daemon`'s `detect_corpus` has exactly one
+                    // call site, in `init_repo_with_progress`, and every other
+                    // write path (the commit hook, the watcher, the delete
+                    // paths) takes the corpus from `meta`. So outside init the
+                    // value derived here already equals the corpus of the rows
+                    // it deletes, and the scoping is a no-op. An init that does
+                    // change it purges the old corpus outright first, before any
+                    // batch reaches this branch.
+                    let corpus: Option<&str> =
+                        file.nodes.first().map(|n| n.vname.corpus.as_str());
                     // Load old FTS tokens BEFORE removing map rows so vocab can
                     // be decremented correctly.
                     let old_token_strings: Vec<String> = {
                         let mut stmt = tx
                             .prepare(
                                 "SELECT m.tokens FROM nodes_fts_map m \
-                                 JOIN nodes n ON n.id = m.node_id WHERE n.path = ?1",
+                                 JOIN nodes n ON n.id = m.node_id \
+                                 WHERE n.path = ?1 AND (?2 IS NULL OR n.corpus = ?2)",
                             )
                             .context("preparing old-token load")?;
                         let mapped = stmt
-                            .query_map(params![file.vname_path], |row| row.get::<_, String>(0))
+                            .query_map(params![file.vname_path, corpus], |row| {
+                                row.get::<_, String>(0)
+                            })
                             .context("querying old tokens")?;
                         let owned: rusqlite::Result<Vec<String>> = mapped.collect();
                         owned.context("collecting old tokens")?
@@ -2221,14 +2485,15 @@ impl SqliteStore {
                         "INSERT INTO nodes_fts(nodes_fts, rowid, tokens) \
                          SELECT 'delete', m.node_id, m.tokens \
                          FROM nodes_fts_map m JOIN nodes n ON n.id = m.node_id \
-                         WHERE n.path = ?1",
-                        params![file.vname_path],
+                         WHERE n.path = ?1 AND (?2 IS NULL OR n.corpus = ?2)",
+                        params![file.vname_path, corpus],
                     )
                     .context("retracting FTS rows")?;
                     tx.execute(
                         "DELETE FROM nodes_fts_map \
-                         WHERE node_id IN (SELECT id FROM nodes WHERE path = ?1)",
-                        params![file.vname_path],
+                         WHERE node_id IN (SELECT id FROM nodes \
+                           WHERE path = ?1 AND (?2 IS NULL OR corpus = ?2))",
+                        params![file.vname_path, corpus],
                     )
                     .context("removing FTS map rows")?;
                     for ts in &old_token_strings {
@@ -2240,25 +2505,100 @@ impl SqliteStore {
                         "INSERT INTO nodes_fts_words(nodes_fts_words, rowid, sig, path) \
                          SELECT 'delete', m.node_id, m.sig_words, m.path_words \
                          FROM nodes_fts_words_map m JOIN nodes n ON n.id = m.node_id \
-                         WHERE n.path = ?1",
-                        params![file.vname_path],
+                         WHERE n.path = ?1 AND (?2 IS NULL OR n.corpus = ?2)",
+                        params![file.vname_path, corpus],
                     )
                     .context("retracting FTS word rows")?;
                     tx.execute(
                         "DELETE FROM nodes_fts_words_map \
-                         WHERE node_id IN (SELECT id FROM nodes WHERE path = ?1)",
-                        params![file.vname_path],
+                         WHERE node_id IN (SELECT id FROM nodes \
+                           WHERE path = ?1 AND (?2 IS NULL OR corpus = ?2))",
+                        params![file.vname_path, corpus],
                     )
                     .context("removing FTS word map rows")?;
+                    // Owned-edge-only delete, the same ownership rule
+                    // [`Self::reindex_replace`] states: this file owns its
+                    // outbound edges, and inbound edges belong to whoever wrote
+                    // them. The blunt `OR dst IN (…)` this replaced also deleted
+                    // inbound edges to symbols that *survive* the re-parse, and
+                    // nothing re-derives those, because the file that owns them
+                    // is not being re-parsed here. A relative TypeScript import is
+                    // exactly that shape (`import:./billing --resolves-to-->
+                    // file:src/billing.ts`: `src` in the importer, `dst` in the
+                    // target), so re-indexing the target erased the importer's
+                    // edge. Whether it did depended on the order the parallel
+                    // parse workers happened to deliver the two files in, which
+                    // is why `travsr init --force` dropped a random subset of
+                    // `resolves-to` edges with no error while a fresh index (the
+                    // staging path, which has no delete pass) stayed stable.
+                    let removed_ids: Vec<i64> = {
+                        let new_ids: std::collections::HashSet<i64> =
+                            file.nodes.iter().map(|n| node_id_to_i64(n.id)).collect();
+                        let mut stmt = tx
+                            .prepare(
+                                "SELECT id FROM nodes \
+                                 WHERE path = ?1 AND (?2 IS NULL OR corpus = ?2)",
+                            )
+                            .context("preparing old-id snapshot")?;
+                        let rows = stmt
+                            .query_map(params![file.vname_path, corpus], |r| r.get::<_, i64>(0))
+                            .context("querying old ids")?
+                            .collect::<rusqlite::Result<Vec<i64>>>()
+                            .context("collecting old ids")?;
+                        rows.into_iter()
+                            .filter(|id| !new_ids.contains(id))
+                            .collect()
+                    };
                     tx.execute(
-                        "DELETE FROM edges \
-                         WHERE src IN (SELECT id FROM nodes WHERE path = ?1) \
-                            OR dst IN (SELECT id FROM nodes WHERE path = ?1)",
-                        params![file.vname_path],
+                        "DELETE FROM edges WHERE src IN (SELECT id FROM nodes \
+                           WHERE path = ?1 AND (?2 IS NULL OR corpus = ?2))",
+                        params![file.vname_path, corpus],
                     )
-                    .context("deleting edges for path")?;
-                    tx.execute("DELETE FROM nodes WHERE path = ?1", params![file.vname_path])
-                        .context("deleting nodes for path")?;
+                    .context("deleting owned edges for path")?;
+                    // The occurrence rows follow the edges they describe.
+                    // `edge_sites` has no FK cascade (#299 F7), so a row used to
+                    // survive the delete above and then find no `edges` row in
+                    // `reference_sites`'s LEFT JOIN, which reads a missing join as
+                    // `heuristic = false` and so serves a stale line as resolved
+                    // fact. Owned rows only, the same ownership rule the edge
+                    // delete above uses and the one [`Self::reindex_replace`]
+                    // states: an occurrence's `src` is the enclosing node in this
+                    // same file, and inbound sites belong to the files that wrote
+                    // them. An inbound site can only have gone stale if the file
+                    // holding it changed, and that file's own re-parse purges it
+                    // here. Deleting them from this side would also be a full
+                    // scan per id: `edge_sites` is WITHOUT ROWID on
+                    // (src, dst, kind, line), so unlike `edges` it has no index
+                    // a `dst =` probe can seek on.
+                    tx.execute(
+                        "DELETE FROM edge_sites WHERE src IN (SELECT id FROM nodes \
+                           WHERE path = ?1 AND (?2 IS NULL OR corpus = ?2))",
+                        params![file.vname_path, corpus],
+                    )
+                    .context("deleting owned edge_sites for path")?;
+                    // A symbol the re-parse dropped still takes its inbound
+                    // edges with it, so the narrower delete above never trades a
+                    // lost edge for a dangling one.
+                    // `prepare_cached` once, not `tx.execute` per id: on a
+                    // `--force` re-parse `removed_ids` is the whole repo's node
+                    // set, and an uncached execute re-prepares the statement for
+                    // every one of them.
+                    if !removed_ids.is_empty() {
+                        let mut del_inbound = tx
+                            .prepare_cached("DELETE FROM edges WHERE dst = ?1")
+                            .context("preparing inbound-edge delete")?;
+                        for removed_id in &removed_ids {
+                            del_inbound
+                                .execute(params![removed_id])
+                                .context("deleting inbound edges for a removed symbol")?;
+                        }
+                    }
+                    tx.execute(
+                        "DELETE FROM nodes \
+                         WHERE path = ?1 AND (?2 IS NULL OR corpus = ?2)",
+                        params![file.vname_path, corpus],
+                    )
+                    .context("deleting nodes for path")?;
 
                     for node in &file.nodes {
                         let id_i64 = node_id_to_i64(node.id);
@@ -2301,31 +2641,7 @@ impl SqliteStore {
                         }
                         counts.nodes_upserted += 1;
                     }
-                    for edge in &file.edges {
-                        // UX-9: this file's nodes are inserted just above and every
-                        // other file's nodes already live in `nodes` (incremental
-                        // path runs against a populated store), so guard both
-                        // endpoints here too — a parser edge to an un-emitted node
-                        // (e.g. Ruby `class ::Hash` reopening) must not persist a
-                        // dangling half-edge. `execute` returns 0 when the guard
-                        // rejects it, keeping `edges_upserted` honest.
-                        let inserted = tx
-                            .execute(
-                                "INSERT INTO edges(src,dst,kind,provenance,confidence) \
-                                 SELECT ?1,?2,?3,'tree-sitter',?4 \
-                                 WHERE EXISTS(SELECT 1 FROM nodes n WHERE n.id = ?1) \
-                                   AND EXISTS(SELECT 1 FROM nodes n WHERE n.id = ?2) \
-                                 ON CONFLICT(src,dst,kind) DO NOTHING",
-                                params![
-                                    node_id_to_i64(edge.src),
-                                    node_id_to_i64(edge.dst),
-                                    edge.kind.as_str(),
-                                    edge.confidence.map(|c| c as i64),
-                                ],
-                            )
-                            .context("inserting edge in batch")?;
-                        counts.edges_upserted += inserted as u64;
-                    }
+                    pending_edges.extend(&file.edges);
                 }
 
                 // File hash goes to production in both paths — one row per
@@ -2340,6 +2656,36 @@ impl SqliteStore {
                 )
                 .context("writing file hash in batch")?;
                 counts.files_written += 1;
+            }
+
+            // UX-9: every batch node now exists, and every other file's nodes
+            // already live in `nodes` (the incremental path runs against a
+            // populated store), so guard both endpoints here: a parser edge to
+            // an un-emitted node (e.g. Ruby `class ::Hash` reopening, or a
+            // speculative import candidate whose file does not exist) must not
+            // persist a dangling half-edge. `execute` returns 0 when the guard
+            // rejects it, keeping `edges_upserted` honest.
+            if !pending_edges.is_empty() {
+                let mut ins_edge = tx
+                    .prepare_cached(
+                        "INSERT INTO edges(src,dst,kind,provenance,confidence) \
+                         SELECT ?1,?2,?3,'tree-sitter',?4 \
+                         WHERE EXISTS(SELECT 1 FROM nodes n WHERE n.id = ?1) \
+                           AND EXISTS(SELECT 1 FROM nodes n WHERE n.id = ?2) \
+                         ON CONFLICT(src,dst,kind) DO NOTHING",
+                    )
+                    .context("preparing batch edge insert")?;
+                for edge in pending_edges {
+                    let inserted = ins_edge
+                        .execute(params![
+                            node_id_to_i64(edge.src),
+                            node_id_to_i64(edge.dst),
+                            edge.kind.as_str(),
+                            edge.confidence.map(|c| c as i64),
+                        ])
+                        .context("inserting edge in batch")?;
+                    counts.edges_upserted += inserted as u64;
+                }
             }
 
             tx.commit().context("committing batch write transaction")?;
@@ -3170,6 +3516,12 @@ impl SqliteStore {
 
             let mut callers = DirtySet::default();
             if !removed_ids.is_empty() {
+                // Prepared once for the whole loop, same reason as the batch
+                // writer's loop: an uncached execute re-prepares once per
+                // removed id, and on a `--force` re-parse that is every node.
+                let mut del_inbound = tx
+                    .prepare_cached("DELETE FROM edges WHERE dst = ?1")
+                    .context("preparing inbound orphan delete")?;
                 for &removed_id in &removed_ids {
                     // Find callers before deleting their inbound edge.
                     let mut stmt = tx
@@ -3185,7 +3537,8 @@ impl SqliteStore {
                         callers.insert(row.context("reading caller path")?);
                     }
                     // Eagerly delete inbound orphan edges for this removed symbol.
-                    tx.execute("DELETE FROM edges WHERE dst = ?1", params![removed_id])
+                    del_inbound
+                        .execute(params![removed_id])
                         .context("deleting inbound orphan edges for removed symbol")?;
                 }
             }
@@ -3417,15 +3770,41 @@ impl SqliteStore {
             .take(languages.len())
             .collect::<Vec<_>>()
             .join(",");
+        // #895: the occurrence rows go first, while their `edges` row still
+        // says 'live' and can still be joined. Afterwards the provenance is
+        // unrecoverable, and an orphaned `edge_sites` row is worse than no row
+        // at all: `reference_sites`' LEFT JOIN yields NULL for both flags, so a
+        // guess this very sweep decided to discard would render as ratified
+        // fact with no caveat. Both deletes run in one transaction so they
+        // cannot half-apply.
+        //
+        // Rows Phase B re-derived are NOT lost here: ratification relabels that
+        // `(src, dst, kind)` row's provenance in place, so it no longer matches
+        // `provenance = 'live'` and its sites are kept.
+        let sites_sql = format!(
+            "DELETE FROM edge_sites WHERE (src, dst, kind) IN \
+             (SELECT src, dst, kind FROM edges WHERE provenance = 'live' \
+              AND src IN (SELECT id FROM nodes WHERE language IN ({placeholders})))"
+        );
         let sql = format!(
             "DELETE FROM edges WHERE provenance = 'live' \
              AND src IN (SELECT id FROM nodes WHERE language IN ({placeholders}))"
         );
-        self.conn
-            .execute(&sql, params_from_iter(languages.iter()))
-            .map(|n| n as u64)
-            .context("sweeping live edges for ratified languages")
-            .map_err(|e| StoreError::Database(e.to_string()))
+        (|| -> AnyResult<u64> {
+            let tx = self
+                .conn
+                .transaction()
+                .context("sweep_live_edges_for_languages: begin")?;
+            tx.execute(&sites_sql, params_from_iter(languages.iter()))
+                .context("sweeping live edge_sites for ratified languages")?;
+            let n = tx
+                .execute(&sql, params_from_iter(languages.iter()))
+                .context("sweeping live edges for ratified languages")?;
+            tx.commit()
+                .context("sweep_live_edges_for_languages: commit")?;
+            Ok(n as u64)
+        })()
+        .map_err(|e| StoreError::Database(e.to_string()))
     }
 
     /// Scoped orphan sweep for the incremental path: drop edges *owned by*
@@ -4784,16 +5163,18 @@ LIMIT ?4",
         // this INSERT deliberately omits the column — a fresh Phase-B-only node
         // takes the schema default (`None`) and the ON CONFLICT leaves any
         // existing Phase-A role intact rather than clobbering it to `None`.
+        let mut stale_vname_skips = 0usize;
         for node in nodes {
             let id_i64 = node_id_to_i64(node.id);
-            tx.execute(
+            let written = tx.execute(
                 "INSERT INTO nodes(id, corpus, root, path, language, signature, kind, package, line, end_line, is_noise) \
                  VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11) \
                  ON CONFLICT(id) DO UPDATE SET kind = excluded.kind, \
                  package = excluded.package, \
                  line = COALESCE(excluded.line, nodes.line), \
                  end_line = COALESCE(excluded.end_line, nodes.end_line), \
-                 is_noise = excluded.is_noise",
+                 is_noise = excluded.is_noise \
+                 ON CONFLICT(corpus, root, path, language, signature) DO NOTHING",
                 params![
                     id_i64,
                     node.vname.corpus,
@@ -4809,9 +5190,27 @@ LIMIT ?4",
                 ],
             )
             .context("write_phase_b_batch: insert node")?;
+            // 0 rows means the vname target fired: this node's tuple is already
+            // held under a different id (a row written under an older
+            // SIGNATURE_FORMAT_VERSION, whose id hashes the version byte). It
+            // was not written, so its FTS rows would key on an id `nodes` does
+            // not hold. Skipping costs one node; letting the statement error
+            // would roll the transaction back and cost the whole Phase B run,
+            // which is what it did in `write_scip_attributed_batch`.
+            if written == 0 {
+                stale_vname_skips += 1;
+                continue;
+            }
             Self::put_node_fts(&tx, node).context("write_phase_b_batch: put_node_fts")?;
             Self::put_node_fts_words(&tx, node)
                 .context("write_phase_b_batch: put_node_fts_words")?;
+        }
+        if stale_vname_skips > 0 {
+            tracing::warn!(
+                skipped = stale_vname_skips,
+                "write_phase_b_batch: skipped nodes whose vname is already held under a \
+                 different id (stale signature format); run `travsr init` to rebuild"
+            );
         }
         // #712: never write a half-edge. An incomplete or partial sidecar result
         // can reference a node it never emitted (or one that a crashed language
@@ -4945,16 +5344,40 @@ LIMIT ?4",
 
         // #479: see write_phase_b_batch — this Phase-B INSERT omits `test_role`
         // on purpose so it never clobbers a Phase-A role to `None`.
+        //
+        // TWO conflict targets, not one. `nodes` carries the `id` primary key
+        // AND `idx_nodes_vname` UNIQUE(corpus, root, path, language, signature),
+        // and a NodeId is `blake3(SIGNATURE_FORMAT_VERSION || …vname fields…)`
+        // (RFC-002), so a row written under an older format version holds THIS
+        // vname tuple under a DIFFERENT id. `ON CONFLICT(id)` cannot see that
+        // row, the vname index rejects the insert, and with a bare `?` the
+        // error took the whole transaction with it: every node, edge and
+        // occurrence Phase B produced for EVERY language, discarded over one
+        // stale row, while the run still reported success.
+        //
+        // Measured on this repo: 42 nodes of 16342, all under a `.claude/
+        // worktrees/…` directory indexed by a pre-v3 binary and never purged,
+        // silently cost 946k lines of rust-analyzer LSIF on every Phase B run
+        // (`lsif_edges: 0`), so no Rust semantic edge was ever re-derived.
+        //
+        // `DO NOTHING` on the vname target, not `DO UPDATE`: the conflicting
+        // row's id is its primary key and cannot be rewritten in place, and
+        // other rows already reference it. Skipping leaves the stale row for
+        // the format guard to purge at the next `travsr init` and lets the rest
+        // of the batch land, which is the difference between losing one symbol
+        // and losing the repo.
+        let mut stale_vname_skips = 0usize;
         for node in nodes {
             let id_i64 = node_id_to_i64(node.id);
-            tx.execute(
+            let written = tx.execute(
                 "INSERT INTO nodes(id, corpus, root, path, language, signature, kind, package, line, end_line, is_noise) \
                  VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11) \
                  ON CONFLICT(id) DO UPDATE SET kind = excluded.kind, \
                  package = excluded.package, \
                  line = COALESCE(excluded.line, nodes.line), \
                  end_line = COALESCE(excluded.end_line, nodes.end_line), \
-                 is_noise = excluded.is_noise",
+                 is_noise = excluded.is_noise \
+                 ON CONFLICT(corpus, root, path, language, signature) DO NOTHING",
                 params![
                     id_i64,
                     node.vname.corpus,
@@ -4970,9 +5393,22 @@ LIMIT ?4",
                 ],
             )
             .context("write_scip_attributed_batch: insert node")?;
+            // 0 rows means the vname target fired: this node was not written, so
+            // its FTS rows would key on an id `nodes` does not hold.
+            if written == 0 {
+                stale_vname_skips += 1;
+                continue;
+            }
             Self::put_node_fts(&tx, node).context("write_scip_attributed_batch: put_node_fts")?;
             Self::put_node_fts_words(&tx, node)
                 .context("write_scip_attributed_batch: put_node_fts_words")?;
+        }
+        if stale_vname_skips > 0 {
+            tracing::warn!(
+                skipped = stale_vname_skips,
+                "write_scip_attributed_batch: skipped nodes whose vname is already held \
+                 under a different id (stale signature format); run `travsr init` to rebuild"
+            );
         }
 
         // P4: build span cache — one SELECT per unique caller_path instead of one per ref.
@@ -5261,9 +5697,48 @@ LIMIT ?4",
                 // `find_references <field>` returns real occurrences while
                 // `get_callers` (which reads the ref/call *edge* set, not
                 // edge_sites) stays free of field reads.
-                "SELECT DISTINCT n.path AS path, es.line AS line \
+                // The occurrence row itself carries no provenance - only
+                // `edges` does - so LEFT JOIN it back to recover how the edge
+                // behind each site was resolved. LEFT, not inner: a resolved
+                // SCIP occurrence that is not a call (a type reference, #650)
+                // has no edge row at all and must still be returned.
+                // `MAX(...)` over the group keeps the old `DISTINCT (path,
+                // line)` row set exactly while answering "was ANY contributing
+                // edge name-matched", so two edges landing on one line cannot
+                // hide a heuristic one behind a resolved one.
+                //
+                // The two disjuncts mirror `travsr-mcp::provenance_marker`
+                // exactly, so `find_references` and `get_callers` cannot
+                // describe the same edge differently: 'live' is an un-ratified
+                // overlay edge whatever its kind, and 'tree-sitter' is a name
+                // guess only for a call ('tree-sitter' is also the ordinary
+                // provenance of a structural field reference, which is why the
+                // second disjunct stays restricted to 'ref/call').
+                //
+                // Coverage limit, measured on this repo's own index
+                // (16158 nodes): 11703 of 29566 'ref/call' occurrence rows,
+                // 39.6%, find no edge row in the LEFT JOIN at all, and 11637 of
+                // those have both endpoints alive in `nodes`, so they are real
+                // servable sites rather than dangling rows. Every one comes back
+                // `heuristic = NULL -> false` and is therefore presented as
+                // resolved fact. The MAX only decides the 60% that do join;
+                // the fail-open default for the rest is documented on
+                // `travsr_core::RefSite::heuristic`.
+                // `live` is flagged separately, never folded into `heuristic`
+                // (#895). The two caveats are opposites: a heuristic site was
+                // matched by leaf name and may be fabricated, while a live site
+                // WAS resolved and is only un-ratified. `RefSite` carries one
+                // flag each so a renderer can say which applies. This reads the
+                // `LEFT JOIN edges` already present for `heuristic`, so it costs
+                // no extra join and no new column.
+                "SELECT n.path AS path, es.line AS line, \
+                 MAX(es.kind = 'ref/call' AND e.provenance = 'tree-sitter') AS heuristic, \
+                 MAX(e.provenance = 'live') AS live \
                  FROM edge_sites es JOIN nodes n ON n.id = es.src \
+                 LEFT JOIN edges e \
+                   ON e.src = es.src AND e.dst = es.dst AND e.kind = es.kind \
                  WHERE es.dst = ?1 AND es.kind IN ('ref/call', 'ref/field') \
+                 GROUP BY n.path, es.line \
                  ORDER BY n.path, es.line",
             )
             .context("preparing reference_sites query")?;
@@ -5271,19 +5746,66 @@ LIMIT ?4",
             .query_map(params![node_id_to_i64(dst)], |row| {
                 let path: String = row.get(0)?;
                 let line: i64 = row.get(1)?;
-                Ok((path, line))
+                // NULL when no contributing row had an edge to read.
+                let heuristic: Option<i64> = row.get(2)?;
+                let live: Option<i64> = row.get(3)?;
+                Ok((path, line, heuristic, live))
             })
             .context("executing reference_sites query")?;
         let mut out = Vec::new();
         for row in rows {
-            let (path, line) = row.context("decoding reference_sites row")?;
+            let (path, line, heuristic, live) = row.context("decoding reference_sites row")?;
             out.push(travsr_core::RefSite {
                 path,
                 // Clamp defensively — stored lines are already 1-based u32.
                 line: u32::try_from(line).unwrap_or(0),
+                heuristic: heuristic.unwrap_or(0) != 0,
+                live: live.unwrap_or(0) != 0,
             });
         }
         tracing::debug!(sites_returned = out.len());
+        Ok(out)
+    }
+
+    /// Recorded `ref/call` occurrence lines of ONE edge (`src` -> `dst`), in
+    /// ascending order, capped at `max`.
+    ///
+    /// `get_callers` expands a `(src, dst, kind)`-deduplicated call edge into
+    /// its individual sites. It used to do that by re-scanning the caller's
+    /// source for the callee's name, which counts anything spelled the same:
+    /// a comment, a string, and the callee's own declaration. This reads the
+    /// occurrence store instead - the same rows `reference_sites` serves - so
+    /// the two tools cannot disagree about where a symbol is called. An empty
+    /// result means no occurrence rows exist for this edge (a language not yet
+    /// feeding `edge_sites`), and the caller falls back to the textual scan.
+    pub fn edge_call_site_lines(
+        &self,
+        src: NodeId,
+        dst: NodeId,
+        max: usize,
+    ) -> anyhow::Result<Vec<u32>> {
+        let mut stmt = self
+            .conn
+            .prepare_cached(
+                "SELECT line FROM edge_sites \
+                 WHERE src = ?1 AND dst = ?2 AND kind = 'ref/call' \
+                 ORDER BY line LIMIT ?3",
+            )
+            .context("preparing edge_call_site_lines query")?;
+        let rows = stmt
+            .query_map(
+                params![
+                    node_id_to_i64(src),
+                    node_id_to_i64(dst),
+                    i64::try_from(max).unwrap_or(i64::MAX)
+                ],
+                |row| row.get::<_, i64>(0),
+            )
+            .context("executing edge_call_site_lines query")?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(u32::try_from(row.context("decoding edge_call_site_lines row")?).unwrap_or(0));
+        }
         Ok(out)
     }
 
@@ -5581,9 +6103,11 @@ LIMIT ?4",
     /// proximity threshold.
     ///
     /// `signatures` is ordered most → least specific by the caller (e.g.
-    /// `method:Server.Serve`, `fn:Server.Serve`, `fn:Serve`); ties are broken
-    /// by candidate priority **first**, then line distance, so a less-specific
-    /// same-named node one line closer cannot shadow a more specific match.
+    /// `method:Server.Serve`, `fn:Server.Serve`, `fn:Serve`). Ties break by
+    /// span containment first, then narrowest containing span, then candidate
+    /// priority, then line distance (see the E6 note on the SQL below), so a
+    /// less-specific same-named node one line closer cannot shadow a more
+    /// specific match unless the SCIP line actually falls inside its span.
     ///
     /// The SQL string varies only by candidate count, so `prepare_cached`
     /// hits its statement cache across the millions of calls a monorepo
@@ -5655,6 +6179,65 @@ LIMIT ?4",
             .optional()
             .context("find_ts_node_for_unification")?;
         Ok(id.map(i64_to_node_id))
+    }
+
+    /// G1 overload-collapse rung: the tree-sitter node at `(corpus, path)`
+    /// matching one of `signatures`, but ONLY when the whole candidate set
+    /// matches exactly one node in that file.
+    ///
+    /// Unlike [`Self::find_ts_node_for_unification`] this ignores the SCIP
+    /// definition line entirely. It exists for the case where line proximity is
+    /// the wrong question: Phase A signatures carry no parameter list, so an
+    /// overload set `C.n(...)` collapses into one node anchored at the first
+    /// overload, while SCIP emits a separate def per overload at its own line.
+    /// The later overloads are the same method group, just not near that anchor.
+    ///
+    /// The uniqueness requirement is the safety property, and the caller must
+    /// pass container-qualified candidates only (see
+    /// `travsr_indexer::scip_unifier::overload_collapse_signatures`). With those,
+    /// "the only match in this file" and "the right match" are the same thing.
+    /// Two or more matches mean the assumption does not hold here, so it returns
+    /// `None` rather than guessing.
+    pub fn find_unique_ts_node_in_file(
+        &self,
+        corpus: &str,
+        path: &str,
+        signatures: &[String],
+    ) -> anyhow::Result<Option<NodeId>> {
+        if signatures.is_empty() {
+            return Ok(None);
+        }
+        let placeholders = (3..signatures.len() + 3)
+            .map(|i| format!("?{i}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        // LIMIT 2 so "exactly one" is decidable without counting the whole file.
+        let sql = format!(
+            "SELECT id FROM nodes \
+             WHERE corpus = ?1 AND path = ?2 \
+               AND signature IN ({placeholders}) \
+               AND line IS NOT NULL \
+             LIMIT 2"
+        );
+        let mut bind: Vec<&dyn rusqlite::types::ToSql> = Vec::with_capacity(signatures.len() + 2);
+        bind.push(&corpus);
+        bind.push(&path);
+        for sig in signatures {
+            bind.push(sig);
+        }
+        let mut stmt = self
+            .conn
+            .prepare_cached(&sql)
+            .context("find_unique_ts_node_in_file: prepare")?;
+        let ids: Vec<i64> = stmt
+            .query_map(bind.as_slice(), |row| row.get(0))
+            .context("find_unique_ts_node_in_file: query")?
+            .collect::<Result<Vec<_>, _>>()
+            .context("find_unique_ts_node_in_file: rows")?;
+        Ok(match ids.as_slice() {
+            [only] => Some(i64_to_node_id(*only)),
+            _ => None,
+        })
     }
 
     /// The set of paths in `corpus` that carry at least one Phase A definition —
@@ -6338,16 +6921,7 @@ LIMIT ?4",
     ///
     /// Returns the number of rows cleared.
     pub fn clear_resolved_pending_refs(&mut self) -> Result<usize, StoreError> {
-        self.conn
-            .execute(
-                "DELETE FROM ref_resolution_state \
-                 WHERE state = 'pending' \
-                   AND EXISTS (SELECT 1 FROM edge_sites s \
-                               WHERE s.src = ref_resolution_state.src \
-                                 AND s.line = ref_resolution_state.ref_line)",
-                [],
-            )
-            .map_err(|e| StoreError::Database(e.to_string()))
+        clear_resolved_pending_refs_on(&self.conn).map_err(|e| StoreError::Database(e.to_string()))
     }
 
     /// RFC-027 section 9.2: drop reference rows whose `src` node is gone.
@@ -6367,13 +6941,69 @@ LIMIT ?4",
     ///
     /// Returns the number of rows purged.
     pub fn purge_orphan_ref_resolution_states(&mut self) -> Result<usize, StoreError> {
-        self.conn
-            .execute(
-                "DELETE FROM ref_resolution_state \
-                 WHERE NOT EXISTS (SELECT 1 FROM nodes n WHERE n.id = ref_resolution_state.src)",
-                [],
-            )
+        purge_orphan_ref_resolution_states_on(&self.conn)
             .map_err(|e| StoreError::Database(e.to_string()))
+    }
+
+    /// #811: reconcile `ref_resolution_state` against the graph as it stands.
+    ///
+    /// The two hygiene deletes above, [`Self::clear_resolved_pending_refs`] and
+    /// [`Self::purge_orphan_ref_resolution_states`], used to run only from the
+    /// daemon's live-overlay ratification, so a `pending` row that a full CLI
+    /// Phase B rebuild (`travsr init --semantic --force`) had since resolved
+    /// survived it, and a daemon restarted on an already-current index never
+    /// reached ratification at all. `pending_ref_count` then over-reported
+    /// references the rebuilt graph resolves, which is the misleading abstention
+    /// the freshness note exists to prevent.
+    ///
+    /// This is the one entry point every Phase B completion path calls. It is
+    /// keyed purely on evidence in the store, so it is safe to run whenever the
+    /// graph is at rest and needs no knowledge of *which* Phase B produced it:
+    ///
+    /// - a `pending` row with a matching `edge_sites(src, line)` is treated as
+    ///   resolved and goes;
+    /// - a row whose `src` node no longer exists describes a reference that no
+    ///   longer exists and goes;
+    /// - everything else stays. Wiping the table would be the easy fix and the
+    ///   wrong one: the surviving rows are the honest record of what is still
+    ///   unresolved.
+    ///
+    /// Granularity is `(src, ref_line)`, not `(src, ref_line, name)`, because
+    /// `edge_sites` records where a call was resolved and not which name it
+    /// resolved. A line holding several references, `a(b(), c())` or a chained
+    /// call, therefore has every `pending` row on it cleared as soon as Phase B
+    /// records any site there, including abstentions on the other names. That is
+    /// the pre-existing [`Self::clear_resolved_pending_refs`] contract (RFC-027
+    /// section 8.3, finding 3 chose this over `src` alone), not something #811
+    /// introduced, and it errs towards under-reporting on multi-reference lines:
+    /// on this repository roughly a third of pending rows share a line with a
+    /// differently named reference. Scoping by name needs `edge_sites` to carry
+    /// one, which is a schema change and out of scope here. A row on a line with
+    /// no site at all, and a live `src` node, is never touched.
+    ///
+    /// Both deletes run in one transaction so a failure leaves the table exactly
+    /// as it was rather than half reconciled, and both are idempotent: a second
+    /// run over the same graph finds nothing to delete and returns zeros.
+    pub fn reconcile_ref_resolution_states(&mut self) -> Result<RefReconcileReport, StoreError> {
+        (|| -> AnyResult<RefReconcileReport> {
+            let tx = self
+                .conn
+                .transaction()
+                .context("reconcile_ref_resolution_states: begin")?;
+            let cleared_resolved =
+                clear_resolved_pending_refs_on(&tx).context("clearing resolved pending refs")?;
+            let purged_orphans = purge_orphan_ref_resolution_states_on(&tx)
+                .context("purging orphan ref_resolution_state rows")?;
+            tx.commit()
+                .context("reconcile_ref_resolution_states: commit")?;
+            Ok(RefReconcileReport {
+                cleared_resolved,
+                purged_orphans,
+            })
+        })()
+        // `{:#}` keeps the SQLite cause behind the context, so a daemon log line
+        // says *why* the reconcile failed rather than only which step did.
+        .map_err(|e| StoreError::Database(format!("{e:#}")))
     }
 
     /// RFC-027 section 7.5: map a `(path, line)` position to the graph node
@@ -9848,6 +10478,463 @@ mod tests {
         );
     }
 
+    // ── #862: `embedded` is over embeddable nodes, like the other three ────────
+    //
+    // File-backed stores throughout, because `open_in_memory` has no sibling
+    // `embed.db` and `embed_progress` reads `embedded` from there. The embed.db
+    // is written with the sidecar's own DDL (`travsr-embed::freshness::
+    // ensure_schema`), rows and all, so what these tests count is what the
+    // daemon and `travsr embed status` count in the field.
+
+    const M: &str = "arctic-embed-m-v1.5";
+
+    fn node_kind(kind: &str, sig: &str) -> Node {
+        Node::new(
+            VName::new("test-corpus", "main", "src/foo.ts", "typescript", sig),
+            kind,
+        )
+    }
+
+    /// Create `<dir>/embed.db` as the sidecar does and insert one vector per
+    /// `(node_id, model_id)`. `node_id` is raw so a test can point a row at a
+    /// node that does not exist.
+    fn seed_embed_db(dir: &std::path::Path, rows: &[(i64, &str)]) -> std::path::PathBuf {
+        let path = dir.join("embed.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS node_embeddings (
+                 node_id   INTEGER NOT NULL,
+                 model_id  TEXT    NOT NULL,
+                 embedding BLOB    NOT NULL,
+                 text_hash TEXT,
+                 PRIMARY KEY (node_id, model_id)
+             ) WITHOUT ROWID;
+             CREATE INDEX IF NOT EXISTS idx_node_embeddings_model
+                 ON node_embeddings(model_id);",
+        )
+        .unwrap();
+        for (node_id, model_id) in rows {
+            conn.execute(
+                "INSERT OR REPLACE INTO node_embeddings (node_id, model_id, embedding, text_hash) \
+                 VALUES (?1, ?2, X'00', 'h')",
+                params![node_id, model_id],
+            )
+            .unwrap();
+        }
+        path
+    }
+
+    fn raw_vector_count(embed_db: &std::path::Path, model_id: &str) -> i64 {
+        Connection::open(embed_db)
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM node_embeddings WHERE model_id = ?1",
+                params![model_id],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+
+    fn ids(nodes: &[Node]) -> Vec<i64> {
+        nodes.iter().map(|n| node_id_to_i64(n.id)).collect()
+    }
+
+    /// `n` eligible function nodes, written to the store.
+    fn put_functions(store: &mut SqliteStore, n: usize) -> Vec<Node> {
+        (0..n)
+            .map(|i| {
+                let node = node_kind("function", &format!("fn:f{i}"));
+                store.put_node(&node).unwrap();
+                node
+            })
+            .collect()
+    }
+
+    /// The daemon's Phase 2 arithmetic (`crates/travsr-daemon`, `phase2_remaining`),
+    /// replicated so the store tests can state what the tick would conclude.
+    fn daemon_phase2_remaining(p: (u64, u64, u64, u64)) -> u64 {
+        let (total, embedded, p1_total, p1_done) = p;
+        total
+            .saturating_sub(p1_total)
+            .saturating_sub(embedded.saturating_sub(p1_done))
+    }
+
+    /// Positive 1: every eligible node has a vector, and nothing else does.
+    #[test]
+    fn embed_progress_is_complete_when_every_eligible_node_has_a_vector() {
+        let (mut store, dir) = file_backed_store();
+        let nodes = put_functions(&mut store, 12);
+        let rows: Vec<(i64, &str)> = ids(&nodes).into_iter().map(|id| (id, M)).collect();
+        seed_embed_db(dir.path(), &rows);
+
+        let p = store.embed_progress(M, 1000).unwrap();
+        assert_eq!(p, (12, 12, 0, 0));
+        assert_eq!(daemon_phase2_remaining(p), 0, "nothing left to embed");
+    }
+
+    /// Positive 2: 100 eligible, 75 embedded. The 25 missing vectors are the
+    /// pending work, and Phase 2 must see exactly them.
+    #[test]
+    fn embed_progress_reports_missing_eligible_vectors_as_pending() {
+        let (mut store, dir) = file_backed_store();
+        let nodes = put_functions(&mut store, 100);
+        let rows: Vec<(i64, &str)> = ids(&nodes[..75]).into_iter().map(|id| (id, M)).collect();
+        seed_embed_db(dir.path(), &rows);
+
+        let p = store.embed_progress(M, 1000).unwrap();
+        assert_eq!(p, (100, 75, 0, 0));
+        assert_eq!(daemon_phase2_remaining(p), 25);
+    }
+
+    /// Positive 3, the core #862 regression: one ineligible node with a vector
+    /// must not lift `embedded` above the eligible count.
+    #[test]
+    fn embed_progress_does_not_count_a_vector_on_an_ineligible_node() {
+        let (mut store, dir) = file_backed_store();
+        let eligible = put_functions(&mut store, 10);
+        let field = node_kind("field", "field:Foo.bar");
+        store.put_node(&field).unwrap();
+        let mut rows: Vec<(i64, &str)> = ids(&eligible).into_iter().map(|id| (id, M)).collect();
+        rows.push((node_id_to_i64(field.id), M));
+        let embed_db = seed_embed_db(dir.path(), &rows);
+        assert_eq!(
+            raw_vector_count(&embed_db, M),
+            11,
+            "precondition: the unfiltered count is the inflated 11"
+        );
+
+        let (total, embedded, _, _) = store.embed_progress(M, 1000).unwrap();
+        assert_eq!(total, 10);
+        assert_eq!(embedded, 10, "not 11: the field node is not embeddable");
+        assert!(embedded <= total);
+        assert_eq!(
+            raw_vector_count(&embed_db, M),
+            11,
+            "the ineligible node's vector is left in place, only not counted"
+        );
+    }
+
+    /// Positive 4: many ineligible vectors, none of them count.
+    #[test]
+    fn embed_progress_ignores_every_ineligible_vector() {
+        let (mut store, dir) = file_backed_store();
+        let eligible = put_functions(&mut store, 5);
+        let mut rows: Vec<(i64, &str)> = ids(&eligible).into_iter().map(|id| (id, M)).collect();
+        for i in 0..40 {
+            let n = node_kind("field", &format!("field:T.f{i}"));
+            store.put_node(&n).unwrap();
+            rows.push((node_id_to_i64(n.id), M));
+        }
+        let embed_db = seed_embed_db(dir.path(), &rows);
+        assert_eq!(raw_vector_count(&embed_db, M), 45, "precondition");
+
+        assert_eq!(store.embed_progress(M, 1000).unwrap(), (5, 5, 0, 0));
+    }
+
+    /// Positive 5: the realistic mixture. Only eligible nodes that have a vector
+    /// count towards `embedded`; only eligible nodes count towards `total`.
+    #[test]
+    fn embed_progress_counts_only_eligible_nodes_with_vectors_in_a_mixed_graph() {
+        let (mut store, dir) = file_backed_store();
+        let eligible_embedded = put_functions(&mut store, 30);
+        let eligible_pending: Vec<Node> = (0..20)
+            .map(|i| {
+                let n = node_kind("method", &format!("method:C.m{i}"));
+                store.put_node(&n).unwrap();
+                n
+            })
+            .collect();
+        let mut rows: Vec<(i64, &str)> = ids(&eligible_embedded)
+            .into_iter()
+            .map(|id| (id, M))
+            .collect();
+        for i in 0..7 {
+            let n = node_kind("variable", &format!("var:v{i}"));
+            store.put_node(&n).unwrap();
+            rows.push((node_id_to_i64(n.id), M)); // ineligible + embedded
+        }
+        for i in 0..9 {
+            let n = node_kind("import", &format!("import:./i{i}"));
+            store.put_node(&n).unwrap(); // ineligible + not embedded
+        }
+        seed_embed_db(dir.path(), &rows);
+
+        let p = store.embed_progress(M, 1000).unwrap();
+        assert_eq!(
+            p,
+            (50, 30, 0, 0),
+            "total = 30 embedded + 20 pending functions and methods; embedded = 30"
+        );
+        assert_eq!(daemon_phase2_remaining(p), eligible_pending.len() as u64);
+    }
+
+    /// Positive 6: vectors for another model are not this model's progress.
+    #[test]
+    fn embed_progress_is_scoped_to_the_requested_model() {
+        let (mut store, dir) = file_backed_store();
+        let nodes = put_functions(&mut store, 10);
+        let all = ids(&nodes);
+        let mut rows: Vec<(i64, &str)> = all[..4].iter().map(|&id| (id, M)).collect();
+        rows.extend(all.iter().map(|&id| (id, "bge-large-en-v1.5")));
+        seed_embed_db(dir.path(), &rows);
+
+        assert_eq!(store.embed_progress(M, 1000).unwrap(), (10, 4, 0, 0));
+        assert_eq!(
+            store.embed_progress("bge-large-en-v1.5", 1000).unwrap(),
+            (10, 10, 0, 0)
+        );
+        assert_eq!(
+            store.embed_progress("never-installed", 1000).unwrap(),
+            (10, 0, 0, 0)
+        );
+    }
+
+    /// Positive 7: eligible nodes, no vectors at all: everything is pending.
+    #[test]
+    fn embed_progress_reports_zero_embedded_when_nothing_is_embedded_yet() {
+        let (mut store, dir) = file_backed_store();
+        put_functions(&mut store, 8);
+        // embed.db exists (the sidecar created the schema) but holds no rows.
+        seed_embed_db(dir.path(), &[]);
+
+        let p = store.embed_progress(M, 1000).unwrap();
+        assert_eq!(p, (8, 0, 0, 0));
+        assert_eq!(daemon_phase2_remaining(p), 8);
+    }
+
+    /// Positive 8: an empty index, with and without an embed.db, and with an
+    /// embed.db that only holds rows for nodes that do not exist.
+    #[test]
+    fn embed_progress_on_an_empty_index_is_all_zero() {
+        let (store, dir) = file_backed_store();
+        assert_eq!(
+            store.embed_progress(M, 3).unwrap(),
+            (0, 0, 0, 0),
+            "no embed.db"
+        );
+
+        seed_embed_db(dir.path(), &[]);
+        assert_eq!(
+            store.embed_progress(M, 3).unwrap(),
+            (0, 0, 0, 0),
+            "empty embed.db"
+        );
+
+        seed_embed_db(dir.path(), &[(1, M), (2, M), (3, M)]);
+        assert_eq!(
+            store.embed_progress(M, 3).unwrap(),
+            (0, 0, 0, 0),
+            "vectors with no nodes are not progress on an empty graph"
+        );
+    }
+
+    /// Negative 9: an orphan row (its node was deleted; embed.db is a separate
+    /// file, so no cascade reaches it) does not count and is not deleted.
+    #[test]
+    fn embed_progress_excludes_an_orphan_vector_without_deleting_it() {
+        let (mut store, dir) = file_backed_store();
+        let nodes = put_functions(&mut store, 3);
+        let mut rows: Vec<(i64, &str)> = ids(&nodes).into_iter().map(|id| (id, M)).collect();
+        rows.push((987_654_321, M)); // no such node
+        let embed_db = seed_embed_db(dir.path(), &rows);
+
+        assert_eq!(store.embed_progress(M, 1000).unwrap(), (3, 3, 0, 0));
+        assert_eq!(
+            raw_vector_count(&embed_db, M),
+            4,
+            "the orphan is still there: progress reporting is read-only"
+        );
+
+        // The realistic route to an orphan: the node's file is deleted.
+        store.delete_nodes_for_path("src/foo.ts").unwrap();
+        assert_eq!(store.embed_progress(M, 1000).unwrap(), (0, 0, 0, 0));
+        assert_eq!(raw_vector_count(&embed_db, M), 4);
+    }
+
+    /// Negative 10: the exact #862 row. `kind = 'field'`, `embed_text IS NULL`,
+    /// vector present: excluded. The same kind *with* text is opted in by the
+    /// daemon and counts, which is what shows the predicate decides, not the kind.
+    #[test]
+    fn embed_progress_excludes_a_field_whose_embed_text_is_null_but_counts_one_with_text() {
+        let (mut store, dir) = file_backed_store();
+        let without_text = node_kind("field", "field:Config.timeout");
+        let with_text = node_kind("field", "field:Config.retries");
+        store.put_node(&without_text).unwrap();
+        store.put_node(&with_text).unwrap();
+        store
+            .write_embed_texts_batch(&[(with_text.id, "field retries: u32".to_string())])
+            .unwrap();
+        seed_embed_db(
+            dir.path(),
+            &[
+                (node_id_to_i64(without_text.id), M),
+                (node_id_to_i64(with_text.id), M),
+            ],
+        );
+
+        assert_eq!(
+            store.embed_progress(M, 1000).unwrap(),
+            (1, 1, 0, 0),
+            "one embeddable field (it has text), one vector that counts"
+        );
+
+        // The model-switch path that produced the report: every text is cleared
+        // and the regeneration never restores this one. The vector stays, the
+        // node is no longer embeddable, and the count must follow the node.
+        store.clear_all_embed_texts().unwrap();
+        assert_eq!(store.embed_progress(M, 1000).unwrap(), (0, 0, 0, 0));
+    }
+
+    /// Negative 11: every kind the predicate excludes, each with a vector, plus a
+    /// prose-less doc-chunk. One eligible node beside them so the counts are 1/1.
+    #[test]
+    fn embed_progress_excludes_each_ineligible_kind_even_with_a_vector() {
+        let (mut store, dir) = file_backed_store();
+        let ok = node_kind("function", "fn:ok");
+        store.put_node(&ok).unwrap();
+        let mut rows = vec![(node_id_to_i64(ok.id), M)];
+        for kind in [
+            "file",
+            "file-module",
+            "import",
+            "module",
+            "field",
+            "variable",
+        ] {
+            let n = node_kind(kind, &format!("{kind}:x"));
+            store.put_node(&n).unwrap();
+            rows.push((node_id_to_i64(n.id), M));
+        }
+        let chunk = doc_chunk("docs/a.md", "doc:intro"); // no prose
+        store.put_node(&chunk).unwrap();
+        rows.push((node_id_to_i64(chunk.id), M));
+        let embed_db = seed_embed_db(dir.path(), &rows);
+        assert_eq!(raw_vector_count(&embed_db, M), 8, "precondition");
+
+        assert_eq!(store.embed_progress(M, 1000).unwrap(), (1, 1, 0, 0));
+    }
+
+    /// Negative 12: one node, vectors for several models. Only the requested
+    /// model's row counts, and it counts once.
+    #[test]
+    fn embed_progress_counts_a_node_once_per_requested_model() {
+        let (mut store, dir) = file_backed_store();
+        let n = node_kind("function", "fn:one");
+        store.put_node(&n).unwrap();
+        let id = node_id_to_i64(n.id);
+        seed_embed_db(
+            dir.path(),
+            &[(id, M), (id, "bge-small-en-v1.5"), (id, "third")],
+        );
+
+        assert_eq!(store.embed_progress(M, 1000).unwrap(), (1, 1, 0, 0));
+        assert_eq!(store.embed_progress("third", 1000).unwrap(), (1, 1, 0, 0));
+        assert_eq!(store.embed_progress("fourth", 1000).unwrap(), (1, 0, 0, 0));
+    }
+
+    /// Negative 13: repeated calls are deterministic and change nothing, in
+    /// either database. The ATTACH/DETACH cycle must also survive being repeated.
+    #[test]
+    fn embed_progress_is_deterministic_and_read_only_across_repeated_calls() {
+        let (mut store, dir) = file_backed_store();
+        let eligible = put_functions(&mut store, 6);
+        let field = node_kind("field", "field:T.f");
+        store.put_node(&field).unwrap();
+        let mut rows: Vec<(i64, &str)> =
+            ids(&eligible[..4]).into_iter().map(|id| (id, M)).collect();
+        rows.push((node_id_to_i64(field.id), M));
+        rows.push((42, M)); // orphan
+        let embed_db = seed_embed_db(dir.path(), &rows);
+        let nodes_before = store.node_count().unwrap();
+        let vectors_before = raw_vector_count(&embed_db, M);
+
+        let first = store.embed_progress(M, 1000).unwrap();
+        assert_eq!(first, (6, 4, 0, 0));
+        for _ in 0..5 {
+            assert_eq!(store.embed_progress(M, 1000).unwrap(), first);
+        }
+        assert_eq!(store.node_count().unwrap(), nodes_before);
+        assert_eq!(raw_vector_count(&embed_db, M), vectors_before);
+    }
+
+    /// Negative 14: Phase 1 partially done, with ineligible vectors present.
+    /// `phase1_done` was already filtered; the fix must leave it alone and make
+    /// `embedded` agree with it, so the derived Phase 2 figure is the truth.
+    #[test]
+    fn embed_progress_with_partial_phase1_is_not_skewed_by_ineligible_vectors() {
+        let (mut store, dir) = file_backed_store();
+        let core = put_functions(&mut store, 20);
+        let rest: Vec<Node> = (0..80)
+            .map(|i| {
+                let n = node_kind("method", &format!("method:R.m{i}"));
+                store.put_node(&n).unwrap();
+                n
+            })
+            .collect();
+        let mut shells: Vec<(NodeId, u32)> = core.iter().map(|n| (n.id, 5)).collect();
+        shells.extend(rest.iter().map(|n| (n.id, 0)));
+        store.write_shell_numbers(&shells).unwrap();
+        // Half the core is embedded, none of the rest, plus five ineligible vectors.
+        let mut rows: Vec<(i64, &str)> = ids(&core[..10]).into_iter().map(|id| (id, M)).collect();
+        for i in 0..5 {
+            let n = node_kind("variable", &format!("var:v{i}"));
+            store.put_node(&n).unwrap();
+            rows.push((node_id_to_i64(n.id), M));
+        }
+        seed_embed_db(dir.path(), &rows);
+
+        let p = store.embed_progress(M, 5).unwrap();
+        assert_eq!(p, (100, 10, 20, 10));
+        let (total, embedded, p1_total, p1_done) = p;
+        assert!(p1_done < p1_total, "Phase 1 is genuinely incomplete");
+        assert!(p1_done <= p1_total);
+        assert!(embedded <= total);
+        assert_eq!(
+            daemon_phase2_remaining(p),
+            80,
+            "all 80 Phase 2 nodes are pending; with the unfiltered 15 this read 75"
+        );
+    }
+
+    /// The invariant the report states, over a graph that has every shape at
+    /// once: eligible embedded, eligible pending, ineligible embedded, ineligible
+    /// pending, an orphan vector, and another model's vectors.
+    #[test]
+    fn embed_progress_embedded_never_exceeds_total_symbols() {
+        let (mut store, dir) = file_backed_store();
+        let eligible = put_functions(&mut store, 9);
+        let mut rows: Vec<(i64, &str)> =
+            ids(&eligible[..6]).into_iter().map(|id| (id, M)).collect();
+        for kind in [
+            "field",
+            "variable",
+            "module",
+            "import",
+            "file",
+            "file-module",
+        ] {
+            for i in 0..3 {
+                let n = node_kind(kind, &format!("{kind}:{i}"));
+                store.put_node(&n).unwrap();
+                if i < 2 {
+                    rows.push((node_id_to_i64(n.id), M));
+                }
+            }
+        }
+        rows.push((7_777, M));
+        rows.extend(ids(&eligible).into_iter().map(|id| (id, "other-model")));
+        let embed_db = seed_embed_db(dir.path(), &rows);
+        assert!(
+            raw_vector_count(&embed_db, M) > 9,
+            "precondition: unfiltered, this model has more vectors than eligible nodes"
+        );
+
+        let (total, embedded, p1_total, p1_done) = store.embed_progress(M, 1000).unwrap();
+        assert_eq!((total, embedded), (9, 6));
+        assert!(embedded <= total);
+        assert!(p1_done <= p1_total);
+    }
+
     /// #376 W2: the count the daemon's embed tick uses to notice that content
     /// changed. Coverage alone cannot see this — the changed nodes still have
     /// their (now wrong) embedding rows.
@@ -10013,6 +11100,153 @@ mod tests {
             Some(v2),
             "stable when unchanged"
         );
+    }
+
+    /// #509: embed.db deleted and recreated at the same path between two polls
+    /// is a *different file*, and the cached read-only connection is left
+    /// reading the unlinked inode with a permanently frozen `data_version`.
+    /// `path.exists()` is true on both sides of the swap, so existence cannot
+    /// see it. The reported version must move, or every `ask` answer cached
+    /// before the swap keeps hitting until the daemon restarts.
+    /// #509: `file_identity` must change when a path is replaced by a different
+    /// file, on every platform.
+    ///
+    /// Runs on Windows too, unlike the store-level test below, because it never
+    /// holds the file open: it swaps the file first and reads identity after, so
+    /// nothing is blocking the unlink. That makes this the coverage for the
+    /// Windows `(creation_time, last_write_time, file_size)` arm, which is
+    /// otherwise reachable by no test on this platform.
+    ///
+    /// Deliberately asserts inequality of two identities rather than any
+    /// particular member. On unix the inode carries it; on Windows creation time
+    /// can be tunneled onto a same-named replacement within ~15s (NTFS
+    /// tunneling), and the other two members carry it instead. Asserting the
+    /// tuple differs is the property both platforms actually promise.
+    #[test]
+    fn file_identity_changes_when_the_file_is_replaced() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("swapme.db");
+
+        std::fs::write(&p, b"first").unwrap();
+
+        // The open handle is load-bearing, not incidental setup. It mirrors the
+        // cached read-only `Connection` production holds across exactly this
+        // swap, and it is what makes the assertion below true on every platform:
+        // POSIX cannot free an unlinked inode while a descriptor still refers to
+        // it, so its number cannot be reallocated to the replacement.
+        //
+        // Without it this failed on Linux CI and passed on macOS: ext4 handed the
+        // recreated file the inode just released, so `(dev, ino)` was unchanged
+        // and the replacement looked like the original. That is a real property
+        // of the filesystem. The reason it cannot bite production is the pin, so
+        // the test has to hold one too, or it is asserting against a situation
+        // the code never meets.
+        let pin = std::fs::File::open(&p).expect("pin the inode as the cached connection does");
+        let first = super::file_identity(&p).expect("identity of an existing file");
+
+        std::fs::remove_file(&p).unwrap();
+        std::fs::write(&p, b"second file, different length").unwrap();
+        let second = super::file_identity(&p).expect("identity of the replacement");
+        drop(pin);
+
+        assert_ne!(
+            first, second,
+            "a replaced file must not keep the identity of the one it replaced,              or a cached connection to the old file reads as current"
+        );
+
+        // Same file, read twice: identity is stable, so it does not spuriously
+        // invalidate the cache on every poll.
+        assert_eq!(
+            second,
+            super::file_identity(&p).unwrap(),
+            "identity must be stable for an unchanged file"
+        );
+
+        // A missing path has no identity, which is what makes the caller fall
+        // back to "no embed.db" rather than to a stale reading.
+        std::fs::remove_file(&p).unwrap();
+        assert!(super::file_identity(&p).is_none());
+    }
+
+    ///
+    /// Unix only, and not for convenience: the failure mode cannot occur on
+    /// Windows. SQLite opens db files there without `FILE_SHARE_DELETE`, so
+    /// unlinking embed.db under the live read-only connection is refused
+    /// outright (`os error 32`, the file is in use) rather than succeeding and
+    /// leaving the connection on an unlinked inode. A `#[cfg(windows)]` variant
+    /// would have to fake the swap in a way the platform cannot actually
+    /// produce, which would assert against a scenario no user can reach. The
+    /// Windows arm of `file_identity` is defensive, for the rename-over and
+    /// already-reopened paths, and is covered by
+    /// `file_identity_changes_when_the_file_is_replaced` above, which runs on
+    /// every platform because it never holds the file open.
+    #[cfg(unix)]
+    #[test]
+    fn embed_data_version_detects_delete_and_recreate() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = SqliteStore::open(&tmp.path().join("graph.db")).unwrap();
+        let embed_db = tmp.path().join("embed.db");
+
+        // The sidecar creates embed.db; reading it pins the store's persistent
+        // read-only connection to that file.
+        write_embed_db(&embed_db, 1);
+        let before = store
+            .embed_data_version()
+            .unwrap()
+            .expect("embed.db exists");
+
+        // The user deletes .travsr/embed.db to force a rebuild and the sidecar
+        // recreates it, both between two polls. WAL sidecars are deleted too,
+        // which is what a real `rm .travsr/embed.db*` does.
+        for sidecar in ["", "-wal", "-shm"] {
+            let p = tmp.path().join(format!("embed.db{sidecar}"));
+            if p.exists() {
+                std::fs::remove_file(&p).unwrap();
+            }
+        }
+        write_embed_db(&embed_db, 2);
+        assert!(
+            embed_db.exists(),
+            "the path is present on both sides of the swap, which is why \
+             exists() cannot detect it"
+        );
+
+        let after = store
+            .embed_data_version()
+            .unwrap()
+            .expect("recreated embed.db");
+        assert_ne!(
+            before, after,
+            "delete-and-recreate must move the embed version, otherwise warm \
+             ask entries keep hitting against a rebuilt embed.db"
+        );
+
+        // And the reopened connection is live, not another corpse: a further
+        // out-of-band write to the new file is still observed.
+        let writer = Connection::open(&embed_db).unwrap();
+        writer
+            .execute("INSERT INTO node_embeddings VALUES (99)", [])
+            .unwrap();
+        assert_ne!(
+            after,
+            store.embed_data_version().unwrap().unwrap(),
+            "the reopened connection must track writes to the new file"
+        );
+    }
+
+    /// Create (or recreate) an embed.db at `path` holding a single row, the way
+    /// the embed sidecar would. Used by the #509 regression test.
+    fn write_embed_db(path: &Path, row: i64) {
+        let writer = Connection::open(path).unwrap();
+        writer
+            .execute_batch(
+                "PRAGMA journal_mode=WAL;
+                 CREATE TABLE node_embeddings (node_id INTEGER PRIMARY KEY);",
+            )
+            .unwrap();
+        writer
+            .execute("INSERT INTO node_embeddings VALUES (?1)", [row])
+            .unwrap();
     }
 
     #[test]
@@ -10508,15 +11742,21 @@ mod tests {
             vec![
                 travsr_core::RefSite {
                     path: "a.rs".into(),
-                    line: 2
+                    line: 2,
+                    heuristic: false,
+                    live: false
                 },
                 travsr_core::RefSite {
                     path: "a.rs".into(),
-                    line: 10
+                    line: 10,
+                    heuristic: false,
+                    live: false
                 },
                 travsr_core::RefSite {
                     path: "b.rs".into(),
-                    line: 3
+                    line: 3,
+                    heuristic: false,
+                    live: false
                 },
             ]
         );
@@ -10627,7 +11867,9 @@ mod tests {
             sites,
             vec![travsr_core::RefSite {
                 path: "user.rs".into(),
-                line: 14
+                line: 14,
+                heuristic: false,
+                live: false
             }]
         );
     }
@@ -10865,7 +12107,9 @@ mod tests {
             sites,
             vec![travsr_core::RefSite {
                 path: "a.rs".into(),
-                line: 5
+                line: 5,
+                heuristic: false,
+                live: false
             }]
         );
     }
@@ -11008,8 +12252,61 @@ mod tests {
             sites,
             vec![travsr_core::RefSite {
                 path: "b.rs".into(),
-                line: 9
+                line: 9,
+                heuristic: false,
+                live: false
             }]
+        );
+    }
+
+    #[test]
+    fn write_file_graphs_batch_purges_owned_edge_sites() {
+        // The incremental write path deletes a re-parsed file's owned edges but
+        // used to leave its occurrence rows behind. `reference_sites` LEFT JOINs
+        // `edges`, so an orphaned row came back `heuristic = false`, i.e. a stale
+        // line served as resolved fact. Same ownership rule as
+        // `reindex_replace_purges_owned_edge_sites`: owned rows go, inbound rows
+        // stay.
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let mk = |path: &str, sig: &str| {
+            travsr_core::Node::new(
+                travsr_core::VName::new("c", "", path, "rust", sig),
+                "function",
+            )
+        };
+        let owned_src = mk("a.rs", "fn:caller");
+        let callee = mk("a.rs", "fn:target");
+        let external = mk("b.rs", "fn:ext");
+        for node in [&owned_src, &callee, &external] {
+            store.put_node(node).unwrap();
+        }
+        store
+            .record_edge_sites(&[
+                // Owned: src lives in the file being re-parsed.
+                (owned_src.id, callee.id, 3, None),
+                // Inbound: src lives in another file, dst in this one.
+                (external.id, callee.id, 9, None),
+            ])
+            .unwrap();
+
+        let batch = vec![FileGraph {
+            vname_path: "a.rs".into(),
+            new_hash: "hash1".into(),
+            nodes: vec![owned_src.clone(), callee.clone()],
+            edges: vec![],
+            source: None,
+        }];
+        store.write_file_graphs_batch(&batch, false).unwrap();
+
+        assert_eq!(
+            store.reference_sites(callee.id).unwrap(),
+            vec![travsr_core::RefSite {
+                path: "b.rs".into(),
+                line: 9,
+                heuristic: false,
+                live: false
+            }],
+            "owned a.rs:3 site must be purged, inbound b.rs:9 site must survive"
         );
     }
 
@@ -11100,7 +12397,9 @@ mod tests {
             store.reference_sites(y.id).unwrap(),
             vec![travsr_core::RefSite {
                 path: "a.rs".into(),
-                line: 5
+                line: 5,
+                heuristic: false,
+                live: false
             }],
             "a preserved definition's occurrence is remapped onto its current line"
         );
@@ -11288,7 +12587,9 @@ mod tests {
             store.reference_sites(y).unwrap(),
             vec![travsr_core::RefSite {
                 path: "a.rs".into(),
-                line: 8
+                line: 8,
+                heuristic: false,
+                live: false
             }],
             "the preserved definition's occurrence must be remapped to its current line"
         );
@@ -12098,6 +13399,593 @@ mod tests {
         );
         assert_eq!(store.purge_orphan_ref_resolution_states().unwrap(), 1);
         assert_eq!(store.pending_ref_count().unwrap(), 1);
+    }
+
+    // ── #811 reconcile_ref_resolution_states ─────────────────────────────────
+    //
+    // The store half of #811. Every test below inspects the table directly with
+    // the SQL the issue measured with, `SELECT COUNT(*) FROM ref_resolution_state
+    // WHERE state = 'pending'`, rather than through `pending_ref_count`, whose
+    // `JOIN nodes` would hide an orphan row and so pass over a table that still
+    // held it.
+
+    /// The issue's own measurement, verbatim.
+    fn raw_pending_count(store: &SqliteStore) -> i64 {
+        store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM ref_resolution_state WHERE state = 'pending'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+
+    fn raw_row_count(store: &SqliteStore) -> i64 {
+        store
+            .conn
+            .query_row("SELECT COUNT(*) FROM ref_resolution_state", [], |r| {
+                r.get(0)
+            })
+            .unwrap()
+    }
+
+    fn raw_edge_sites_count(store: &SqliteStore) -> i64 {
+        store
+            .conn
+            .query_row("SELECT COUNT(*) FROM edge_sites", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    /// Whether a `(src, ref_line, name)` row is still present, in any state.
+    fn has_row(store: &SqliteStore, src: NodeId, line: u32, name: &str) -> bool {
+        store
+            .conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM ref_resolution_state \
+                 WHERE src = ?1 AND ref_line = ?2 AND name = ?3)",
+                params![node_id_to_i64(src), line as i64, name],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap()
+            != 0
+    }
+
+    fn resolved(src: NodeId, line: u32, name: &str, dst: NodeId) -> RefResolution {
+        RefResolution {
+            src,
+            ref_line: line,
+            ref_col: 0,
+            name: name.to_string(),
+            state: "resolved",
+            resolved_dst: Some(dst),
+        }
+    }
+
+    /// A caller and a callee in two files, with a `ref/call` edge between them
+    /// and nothing in `ref_resolution_state` yet.
+    fn caller_and_callee(store: &mut SqliteStore) -> (Node, Node) {
+        let caller = live_node("c", "src/a.ts", "fn:caller", "function", 1);
+        let callee = live_node("c", "src/b.ts", "fn:callee", "function", 1);
+        store.put_node(&caller).unwrap();
+        store.put_node(&callee).unwrap();
+        store
+            .put_edge(&Edge::new(caller.id, callee.id, EdgeKind::RefCall))
+            .unwrap();
+        (caller, callee)
+    }
+
+    /// Positive 1: a `pending` row whose `(src, line)` Phase B has since recorded
+    /// a call site for is resolved by definition and must go.
+    #[test]
+    fn reconcile_removes_a_pending_row_phase_b_resolved() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let (caller, callee) = caller_and_callee(&mut store);
+        store
+            .replace_ref_resolution_states("c", "src/a.ts", &[pending(caller.id, 3, "callee")])
+            .unwrap();
+        assert_eq!(raw_pending_count(&store), 1, "precondition");
+
+        // The rebuild's Phase B: the site now exists.
+        store
+            .record_edge_sites(&[(caller.id, callee.id, 3, None)])
+            .unwrap();
+        let edges_before = store.edge_count().unwrap();
+
+        let report = store.reconcile_ref_resolution_states().unwrap();
+
+        assert_eq!(
+            report,
+            RefReconcileReport {
+                cleared_resolved: 1,
+                purged_orphans: 0,
+            }
+        );
+        assert_eq!(raw_pending_count(&store), 0);
+        assert!(!has_row(&store, caller.id, 3, "callee"));
+        assert_eq!(
+            raw_edge_sites_count(&store),
+            1,
+            "the evidence the reconcile keyed on must itself be untouched"
+        );
+        assert_eq!(
+            store.edge_count().unwrap(),
+            edges_before,
+            "reconciling the state table must not touch the graph"
+        );
+    }
+
+    /// Positive 2: the #811 shape is thousands of rows across many files. Every
+    /// one with a site goes, in one pass, whatever file or node it belongs to.
+    #[test]
+    fn reconcile_removes_every_resolved_pending_row_across_files() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let callee = live_node("c", "src/lib.ts", "fn:target", "function", 1);
+        store.put_node(&callee).unwrap();
+
+        let mut callers = Vec::new();
+        let mut sites = Vec::new();
+        for f in 0..6 {
+            let path = format!("src/f{f}.ts");
+            let a = live_node("c", &path, &format!("fn:a{f}"), "function", 1);
+            let b = live_node("c", &path, &format!("fn:b{f}"), "function", 40);
+            store.put_node(&a).unwrap();
+            store.put_node(&b).unwrap();
+            store
+                .replace_ref_resolution_states(
+                    "c",
+                    &path,
+                    &[
+                        pending(a.id, 3, "target"),
+                        pending(a.id, 7, "target"),
+                        pending(b.id, 42, "target"),
+                    ],
+                )
+                .unwrap();
+            sites.push((a.id, callee.id, 3, None));
+            sites.push((a.id, callee.id, 7, None));
+            sites.push((b.id, callee.id, 42, None));
+            callers.push((a, b));
+        }
+        assert_eq!(raw_pending_count(&store), 18, "precondition");
+        store.record_edge_sites(&sites).unwrap();
+
+        let report = store.reconcile_ref_resolution_states().unwrap();
+
+        assert_eq!(report.cleared_resolved, 18);
+        assert_eq!(report.purged_orphans, 0);
+        assert_eq!(raw_pending_count(&store), 0);
+        assert_eq!(raw_row_count(&store), 0);
+        for (a, b) in &callers {
+            assert!(
+                store.iter_edges_from(a.id).is_ok() && store.iter_edges_from(b.id).is_ok(),
+                "graph reads must still work; the nodes are untouched"
+            );
+        }
+    }
+
+    /// Positive 3: a row whose `src` node no longer exists describes a reference
+    /// that no longer exists. `replace_ref_resolution_states` cannot reach it
+    /// (it resolves `src` through `nodes`), so the reconcile must.
+    #[test]
+    fn reconcile_purges_a_row_whose_source_node_is_gone() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let old = live_node("c", "src/a.ts", "fn:old", "function", 1);
+        store.put_node(&old).unwrap();
+        store
+            .replace_ref_resolution_states("c", "src/a.ts", &[pending(old.id, 4, "x")])
+            .unwrap();
+        // The file is rewritten with the symbol gone: its id is retired.
+        store
+            .reindex_replace("c", "src/a.ts", &[], &[], "h", None)
+            .unwrap();
+        assert!(
+            store.get_node(old.id).unwrap().is_none(),
+            "precondition: the source node must be gone"
+        );
+        assert_eq!(
+            raw_pending_count(&store),
+            1,
+            "precondition: the row outlived it"
+        );
+
+        let report = store.reconcile_ref_resolution_states().unwrap();
+
+        assert_eq!(
+            report,
+            RefReconcileReport {
+                cleared_resolved: 0,
+                purged_orphans: 1,
+            }
+        );
+        assert_eq!(raw_pending_count(&store), 0);
+        assert_eq!(raw_row_count(&store), 0);
+    }
+
+    /// Positive 4: a realistic mixture. Only the rows the graph disproves go;
+    /// the honest abstentions and the unrelated valid rows all stay, and the
+    /// graph itself is untouched.
+    #[test]
+    fn reconcile_over_a_mixed_table_removes_only_what_the_graph_disproves() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let (caller, callee) = caller_and_callee(&mut store);
+        let other = live_node("c", "src/c.ts", "fn:other", "function", 1);
+        store.put_node(&other).unwrap();
+        // A symbol that will be renamed away, taking its id with it.
+        let doomed = live_node("c", "src/d.ts", "fn:doomed", "function", 1);
+        store.put_node(&doomed).unwrap();
+
+        store
+            .replace_ref_resolution_states(
+                "c",
+                "src/a.ts",
+                &[
+                    // Resolved by the rebuild: a site lands on line 3.
+                    pending(caller.id, 3, "callee"),
+                    // Genuine abstention: nothing ever resolves line 9.
+                    pending(caller.id, 9, "nothing"),
+                    // Unrelated valid row: the live lane's own answer, which
+                    // `clear` never touches (it is keyed on `pending`).
+                    resolved(caller.id, 5, "callee", callee.id),
+                ],
+            )
+            .unwrap();
+        store
+            .replace_ref_resolution_states("c", "src/c.ts", &[pending(other.id, 2, "ghost")])
+            .unwrap();
+        store
+            .replace_ref_resolution_states(
+                "c",
+                "src/d.ts",
+                &[
+                    pending(doomed.id, 4, "a"),
+                    resolved(doomed.id, 6, "b", callee.id),
+                ],
+            )
+            .unwrap();
+        // The rename: `src/d.ts` no longer defines `doomed`.
+        store
+            .reindex_replace("c", "src/d.ts", &[], &[], "h", None)
+            .unwrap();
+        // Phase B's evidence.
+        store
+            .record_edge_sites(&[
+                (caller.id, callee.id, 3, None),
+                (caller.id, callee.id, 5, None),
+            ])
+            .unwrap();
+
+        let rows_before = raw_row_count(&store);
+        let pending_before = raw_pending_count(&store);
+        let sites_before = raw_edge_sites_count(&store);
+        let edges_before = store.edge_count().unwrap();
+        let nodes_before = store.node_count().unwrap();
+        assert_eq!((rows_before, pending_before), (6, 4), "precondition");
+
+        let report = store.reconcile_ref_resolution_states().unwrap();
+
+        assert_eq!(
+            report,
+            RefReconcileReport {
+                cleared_resolved: 1,
+                purged_orphans: 2,
+            },
+            "one resolved pending row, and both rows of the renamed symbol"
+        );
+        // Gone.
+        assert!(!has_row(&store, caller.id, 3, "callee"), "resolved pending");
+        assert!(!has_row(&store, doomed.id, 4, "a"), "orphan pending");
+        assert!(!has_row(&store, doomed.id, 6, "b"), "orphan resolved");
+        // Kept.
+        assert!(
+            has_row(&store, caller.id, 9, "nothing"),
+            "genuine abstention"
+        );
+        assert!(
+            has_row(&store, other.id, 2, "ghost"),
+            "genuine abstention, other file"
+        );
+        assert!(
+            has_row(&store, caller.id, 5, "callee"),
+            "valid resolved row"
+        );
+        assert_eq!(raw_pending_count(&store), 2);
+        assert_eq!(raw_row_count(&store), rows_before - 3);
+        // Before/after: the graph and its evidence are exactly as they were.
+        assert_eq!(raw_edge_sites_count(&store), sites_before);
+        assert_eq!(store.edge_count().unwrap(), edges_before);
+        assert_eq!(store.node_count().unwrap(), nodes_before);
+        // The two readers agree with the raw count once orphans are gone.
+        assert_eq!(store.pending_ref_count().unwrap(), 2);
+    }
+
+    /// Negative 9: a reference nothing resolved has no site and a live node. It
+    /// is the honest abstention RFC-027 exists to preserve, and must stay.
+    #[test]
+    fn reconcile_keeps_a_genuine_unresolved_reference() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let (caller, _callee) = caller_and_callee(&mut store);
+        store
+            .replace_ref_resolution_states("c", "src/a.ts", &[pending(caller.id, 3, "mystery")])
+            .unwrap();
+        assert_eq!(raw_edge_sites_count(&store), 0, "precondition: no evidence");
+
+        let report = store.reconcile_ref_resolution_states().unwrap();
+
+        assert_eq!(report, RefReconcileReport::default());
+        assert_eq!(raw_pending_count(&store), 1);
+        assert!(has_row(&store, caller.id, 3, "mystery"));
+        assert_eq!(
+            store.pending_refs_in_file("c", "src/a.ts").unwrap(),
+            vec![("mystery".to_string(), 3)],
+            "the freshness note must still be able to report it"
+        );
+    }
+
+    /// Negative 10: a site on the neighbouring line is not evidence for this
+    /// one. `(src, line)` is the predicate, and an off-by-one must not match.
+    #[test]
+    fn reconcile_ignores_a_site_on_the_neighbouring_line() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let (caller, callee) = caller_and_callee(&mut store);
+        store
+            .replace_ref_resolution_states("c", "src/a.ts", &[pending(caller.id, 10, "callee")])
+            .unwrap();
+        store
+            .record_edge_sites(&[(caller.id, callee.id, 11, None)])
+            .unwrap();
+
+        let report = store.reconcile_ref_resolution_states().unwrap();
+
+        assert_eq!(report, RefReconcileReport::default());
+        assert!(has_row(&store, caller.id, 10, "callee"));
+        assert_eq!(raw_pending_count(&store), 1);
+    }
+
+    /// Negative 11: the same line in a *different* enclosing definition is a
+    /// different call site. A row for `A` must not be cleared by `B`'s site.
+    #[test]
+    fn reconcile_ignores_a_matching_line_on_a_different_source() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let (a, callee) = caller_and_callee(&mut store);
+        let b = live_node("c", "src/a.ts", "fn:b", "function", 30);
+        store.put_node(&b).unwrap();
+        store
+            .replace_ref_resolution_states("c", "src/a.ts", &[pending(a.id, 10, "callee")])
+            .unwrap();
+        // B resolved something on its own line 10, which has nothing to do with A.
+        store
+            .record_edge_sites(&[(b.id, callee.id, 10, None)])
+            .unwrap();
+
+        let report = store.reconcile_ref_resolution_states().unwrap();
+
+        assert_eq!(report, RefReconcileReport::default());
+        assert!(has_row(&store, a.id, 10, "callee"));
+        assert_eq!(raw_pending_count(&store), 1);
+    }
+
+    /// Negative 12: several sites on *other* lines of the same source are not
+    /// evidence either. Keyed on `src` alone this row would go (the finding-3
+    /// regression); keyed on `(src, line)` it stays.
+    #[test]
+    fn reconcile_ignores_sites_on_other_lines_of_the_same_source() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let (caller, callee) = caller_and_callee(&mut store);
+        store
+            .replace_ref_resolution_states("c", "src/a.ts", &[pending(caller.id, 10, "callee")])
+            .unwrap();
+        store
+            .record_edge_sites(&[
+                (caller.id, callee.id, 9, None),
+                (caller.id, callee.id, 11, None),
+                (caller.id, callee.id, 12, None),
+            ])
+            .unwrap();
+
+        let report = store.reconcile_ref_resolution_states().unwrap();
+
+        assert_eq!(report, RefReconcileReport::default());
+        assert!(has_row(&store, caller.id, 10, "callee"));
+        assert_eq!(raw_pending_count(&store), 1);
+        assert_eq!(raw_edge_sites_count(&store), 3);
+    }
+
+    /// Negative 13: a table that is already consistent with the graph, holding
+    /// both a genuine abstention and a valid resolved row, is left exactly as it
+    /// is, and the pass reports that it did nothing.
+    #[test]
+    fn reconcile_on_a_consistent_table_changes_nothing() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let (caller, callee) = caller_and_callee(&mut store);
+        store
+            .replace_ref_resolution_states(
+                "c",
+                "src/a.ts",
+                &[
+                    pending(caller.id, 3, "nothing"),
+                    resolved(caller.id, 5, "callee", callee.id),
+                ],
+            )
+            .unwrap();
+        store
+            .record_edge_sites(&[(caller.id, callee.id, 5, None)])
+            .unwrap();
+        let rows_before = raw_row_count(&store);
+
+        let report = store.reconcile_ref_resolution_states().unwrap();
+
+        assert_eq!(report, RefReconcileReport::default());
+        assert_eq!(report.total(), 0);
+        assert_eq!(raw_row_count(&store), rows_before);
+        assert_eq!(raw_pending_count(&store), 1);
+
+        // And on a completely empty table.
+        let mut empty = SqliteStore::open_in_memory().unwrap();
+        assert_eq!(
+            empty.reconcile_ref_resolution_states().unwrap(),
+            RefReconcileReport::default()
+        );
+    }
+
+    /// Negative 15: idempotent. The first pass does the work; a second pass over
+    /// the same graph finds nothing, errors on nothing, and changes nothing.
+    #[test]
+    fn reconcile_is_idempotent() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let (caller, callee) = caller_and_callee(&mut store);
+        let doomed = live_node("c", "src/d.ts", "fn:doomed", "function", 1);
+        store.put_node(&doomed).unwrap();
+        store
+            .replace_ref_resolution_states(
+                "c",
+                "src/a.ts",
+                &[
+                    pending(caller.id, 3, "callee"),
+                    pending(caller.id, 9, "nothing"),
+                ],
+            )
+            .unwrap();
+        store
+            .replace_ref_resolution_states("c", "src/d.ts", &[pending(doomed.id, 4, "a")])
+            .unwrap();
+        store
+            .reindex_replace("c", "src/d.ts", &[], &[], "h", None)
+            .unwrap();
+        store
+            .record_edge_sites(&[(caller.id, callee.id, 3, None)])
+            .unwrap();
+
+        let first = store.reconcile_ref_resolution_states().unwrap();
+        assert_eq!(
+            first,
+            RefReconcileReport {
+                cleared_resolved: 1,
+                purged_orphans: 1,
+            }
+        );
+        let rows_after_first = raw_row_count(&store);
+        let pending_after_first = raw_pending_count(&store);
+        assert_eq!(pending_after_first, 1);
+
+        for _ in 0..3 {
+            let again = store.reconcile_ref_resolution_states().unwrap();
+            assert_eq!(
+                again,
+                RefReconcileReport::default(),
+                "a repeat must be a no-op"
+            );
+            assert_eq!(raw_row_count(&store), rows_after_first);
+            assert_eq!(raw_pending_count(&store), pending_after_first);
+        }
+        assert!(has_row(&store, caller.id, 9, "nothing"));
+    }
+
+    /// Negative 16: the two deletes are one transaction. Inject a failure into
+    /// the second (a trigger that aborts the orphan purge) and the first must be
+    /// rolled back with it: the table is either fully reconciled or untouched,
+    /// never half-way.
+    #[test]
+    fn a_failed_reconcile_leaves_the_table_untouched() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let (caller, callee) = caller_and_callee(&mut store);
+        let doomed = live_node("c", "src/d.ts", "fn:doomed", "function", 1);
+        store.put_node(&doomed).unwrap();
+        store
+            .replace_ref_resolution_states("c", "src/a.ts", &[pending(caller.id, 3, "callee")])
+            .unwrap();
+        store
+            .replace_ref_resolution_states("c", "src/d.ts", &[pending(doomed.id, 4, "a")])
+            .unwrap();
+        store
+            .reindex_replace("c", "src/d.ts", &[], &[], "h", None)
+            .unwrap();
+        store
+            .record_edge_sites(&[(caller.id, callee.id, 3, None)])
+            .unwrap();
+        assert_eq!(raw_pending_count(&store), 2, "precondition");
+
+        // The orphan purge is the second statement. Make it fail.
+        store
+            .conn
+            .execute_batch(
+                "CREATE TRIGGER injected_failure BEFORE DELETE ON ref_resolution_state \
+                 WHEN NOT EXISTS (SELECT 1 FROM nodes WHERE id = OLD.src) \
+                 BEGIN SELECT RAISE(ABORT, 'injected'); END;",
+            )
+            .unwrap();
+
+        let err = store
+            .reconcile_ref_resolution_states()
+            .expect_err("the injected failure must surface");
+        assert!(
+            err.to_string().contains("injected"),
+            "the error must be the injected one, got: {err}"
+        );
+        assert_eq!(
+            raw_pending_count(&store),
+            2,
+            "the first delete (the resolved pending row) must have been rolled back"
+        );
+        assert!(has_row(&store, caller.id, 3, "callee"));
+        assert!(has_row(&store, doomed.id, 4, "a"));
+
+        // Remove the fault and the same pass completes in full.
+        store
+            .conn
+            .execute_batch("DROP TRIGGER injected_failure;")
+            .unwrap();
+        assert_eq!(
+            store.reconcile_ref_resolution_states().unwrap(),
+            RefReconcileReport {
+                cleared_resolved: 1,
+                purged_orphans: 1,
+            }
+        );
+        assert_eq!(raw_row_count(&store), 0);
+    }
+
+    /// Negative 17: a backlog the size #811 measured (thousands of rows) is
+    /// reconciled in one pass to exactly the right remainder.
+    #[test]
+    fn reconcile_handles_a_large_backlog() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let callee = live_node("c", "src/lib.ts", "fn:target", "function", 1);
+        store.put_node(&callee).unwrap();
+
+        const FILES: u32 = 40;
+        const LINES_PER_FILE: u32 = 100;
+        let mut sites = Vec::new();
+        for f in 0..FILES {
+            let path = format!("src/f{f}.ts");
+            let caller = live_node("c", &path, &format!("fn:caller{f}"), "function", 1);
+            store.put_node(&caller).unwrap();
+            let rows: Vec<RefResolution> = (1..=LINES_PER_FILE)
+                .map(|line| pending(caller.id, line, "target"))
+                .collect();
+            store
+                .replace_ref_resolution_states("c", &path, &rows)
+                .unwrap();
+            // Phase B resolves the even lines only.
+            for line in (2..=LINES_PER_FILE).step_by(2) {
+                sites.push((caller.id, callee.id, line, None));
+            }
+        }
+        let total = (FILES * LINES_PER_FILE) as i64;
+        assert_eq!(raw_pending_count(&store), total, "precondition");
+        store.record_edge_sites(&sites).unwrap();
+
+        let report = store.reconcile_ref_resolution_states().unwrap();
+
+        assert_eq!(report.cleared_resolved as i64, total / 2);
+        assert_eq!(report.purged_orphans, 0);
+        assert_eq!(raw_pending_count(&store), total / 2);
+        assert_eq!(store.pending_ref_count().unwrap() as i64, total / 2);
+        assert_eq!(
+            store.reconcile_ref_resolution_states().unwrap(),
+            RefReconcileReport::default(),
+            "and the remainder is stable"
+        );
     }
 
     /// Finding 7: `_` is LIKE's single-character wildcard and identifiers are
@@ -13992,6 +15880,54 @@ mod tests {
     }
 
     #[test]
+    fn read_only_open_rejects_current_version_database_missing_body_hash() {
+        // C1 (#893): `nodes.body_hash` is added by an open-time step rather than
+        // by a numbered migration, so a database a pre-RFC-027-#813 build stamped
+        // at the current schema version still carries the narrow `nodes` table.
+        // A read-only open that compares only the version number admits it, and
+        // any query touching `body_hash` then fails with `no such column`.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("graph.db");
+        drop(SqliteStore::open(&db).unwrap());
+
+        // Reproduce the older table shape on an otherwise current database.
+        {
+            let conn = Connection::open(&db).unwrap();
+            conn.execute_batch("ALTER TABLE nodes DROP COLUMN body_hash")
+                .unwrap();
+        }
+        let probe = SqliteStore::open_read_only(&db);
+        // Guard the repro itself: the version must still read as current, which
+        // is precisely why a number-only check lets the narrow table through.
+        if let Ok(s) = &probe {
+            assert_eq!(
+                s.schema_version().unwrap(),
+                sqlite_migration_runner().latest_version(),
+                "repro must leave the version stamped at the current value"
+            );
+        }
+        let err = probe
+            .err()
+            .expect("read-only open must reject a database whose nodes table lacks body_hash");
+        assert!(
+            format!("{err}").contains("body_hash"),
+            "the error must name the missing column, got: {err}"
+        );
+
+        // The writable open is the heal path the read-only failure falls back to.
+        let healed = SqliteStore::open(&db).unwrap();
+        assert!(
+            healed.column_exists("nodes", "body_hash").unwrap(),
+            "a writable open must add the missing column"
+        );
+        drop(healed);
+        assert!(
+            SqliteStore::open_read_only(&db).is_ok(),
+            "the healed database must open read-only again"
+        );
+    }
+
+    #[test]
     fn staging_fts_matches_bulk_path_after_flush() {
         let nodes = vec![
             Node::new(
@@ -14850,5 +16786,221 @@ mod tests {
         // Signed saturating_sub saturates at i64::MIN rather than zero, which
         // is what produced the negative in the first place.
         assert_eq!(super::backfill_counts(0, i64::MAX).0, 0);
+    }
+
+    /// A cross-file Phase A edge must not depend on the order the batch writer
+    /// happened to receive the two files in.
+    ///
+    /// `import:./billing --resolves-to--> file:src/billing.ts` has its `src` in
+    /// the importer and its `dst` in the target. Re-writing the target used to
+    /// delete every edge pointing *into* its nodes, so the importer's edge
+    /// survived only when the importer came last in the batch. Batch order on
+    /// the init path is whatever the parallel parse workers deliver, so
+    /// `travsr init --force` dropped a random subset of `resolves-to` edges
+    /// with no error.
+    ///
+    /// Deterministic by construction: it does not race two threads, it pins
+    /// both orders of the same batch and requires them to agree.
+    #[test]
+    fn a_rewritten_batch_keeps_cross_file_edges_in_either_order() {
+        let file_node =
+            |path: &str| Node::new(VName::new("c", "", path, "typescript", "file"), "file");
+        let import_node = Node::new(
+            VName::new("c", "", "src/caller.ts", "typescript", "import:./billing"),
+            "import",
+        );
+        let billing = file_node("src/billing.ts");
+        let caller = file_node("src/caller.ts");
+
+        let caller_graph = || FileGraph {
+            vname_path: "src/caller.ts".into(),
+            new_hash: "h-caller".into(),
+            nodes: vec![caller.clone(), import_node.clone()],
+            edges: vec![
+                Edge::new(caller.id, import_node.id, EdgeKind::Depends),
+                Edge::new(import_node.id, billing.id, EdgeKind::ResolvesTo),
+            ],
+            source: None,
+        };
+        let billing_graph = || FileGraph {
+            vname_path: "src/billing.ts".into(),
+            new_hash: "h-billing".into(),
+            nodes: vec![billing.clone()],
+            edges: vec![],
+            source: None,
+        };
+        let resolves_to = |store: &SqliteStore| -> i64 {
+            store
+                .conn
+                .query_row(
+                    "SELECT count(*) FROM edges WHERE kind = 'resolves-to'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        };
+
+        // Both orders re-write an index that already holds both files, which is
+        // what `--force` does: its graph purge leaves the nodes of on-disk
+        // files in place, so every file takes the incremental branch below.
+        //
+        // The seed uses the SAME order as the rewrite, so `importer_first` also
+        // covers the INSERT half: the import target is a file this batch has
+        // not written yet when the importer is processed, which is what a newly
+        // added file looks like. Seeding target-first would have satisfied its
+        // own precondition either way and never exercised that.
+        for importer_first in [false, true] {
+            let batch = || {
+                if importer_first {
+                    vec![caller_graph(), billing_graph()]
+                } else {
+                    vec![billing_graph(), caller_graph()]
+                }
+            };
+            let mut store = SqliteStore::open_in_memory().unwrap();
+            store.write_file_graphs_batch(&batch(), false).unwrap();
+            assert_eq!(
+                resolves_to(&store),
+                1,
+                "the first index must resolve the import \
+                 (importer_first = {importer_first})"
+            );
+
+            store.write_file_graphs_batch(&batch(), false).unwrap();
+            assert_eq!(
+                resolves_to(&store),
+                1,
+                "re-indexing both files must keep the import edge \
+                 (importer_first = {importer_first})"
+            );
+        }
+    }
+
+    /// The other half of the ownership rule: a symbol the re-parse dropped must
+    /// still take its inbound edges with it, or the narrower delete above would
+    /// trade a lost edge for a dangling one.
+    #[test]
+    fn a_rewritten_batch_drops_inbound_edges_of_a_removed_symbol() {
+        let caller = Node::new(
+            VName::new("c", "", "src/caller.ts", "typescript", "fn:checkout"),
+            "function",
+        );
+        let charge = Node::new(
+            VName::new("c", "", "src/billing.ts", "typescript", "fn:charge"),
+            "function",
+        );
+
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        store
+            .write_file_graphs_batch(
+                &[
+                    FileGraph {
+                        vname_path: "src/billing.ts".into(),
+                        new_hash: "h1".into(),
+                        nodes: vec![charge.clone()],
+                        edges: vec![],
+                        source: None,
+                    },
+                    FileGraph {
+                        vname_path: "src/caller.ts".into(),
+                        new_hash: "h-caller".into(),
+                        nodes: vec![caller.clone()],
+                        edges: vec![Edge::new(caller.id, charge.id, EdgeKind::RefCall)],
+                        source: None,
+                    },
+                ],
+                false,
+            )
+            .unwrap();
+        assert_eq!(store.count_orphans().unwrap(), 0);
+
+        // `charge` is renamed away; nothing re-derives the caller's edge.
+        store
+            .write_file_graphs_batch(
+                &[FileGraph {
+                    vname_path: "src/billing.ts".into(),
+                    new_hash: "h2".into(),
+                    nodes: vec![Node::new(
+                        VName::new("c", "", "src/billing.ts", "typescript", "fn:bill"),
+                        "function",
+                    )],
+                    edges: vec![],
+                    source: None,
+                }],
+                false,
+            )
+            .unwrap();
+
+        assert_eq!(
+            store.count_orphans().unwrap(),
+            0,
+            "a removed symbol must take its inbound edges with it"
+        );
+    }
+
+    /// RFC-002: a `NodeId` is `blake3(SIGNATURE_FORMAT_VERSION || …vname…)`, so a
+    /// row written under an older format version holds its vname tuple under a
+    /// DIFFERENT id. `write_scip_attributed_batch` upserts `ON CONFLICT(id)`,
+    /// which cannot see that row, so `idx_nodes_vname` rejected the insert and
+    /// the bare `?` rolled the whole transaction back: every node, edge and
+    /// occurrence Phase B produced, for EVERY language, discarded over one stale
+    /// row, while the run still logged `outcome: Success`.
+    ///
+    /// Measured on the travsr repo itself: 42 stale rows out of 16342, all under
+    /// a `.claude/worktrees/…` directory left behind by a pre-v3 binary, threw
+    /// away 946k lines of rust-analyzer LSIF on every Phase B run
+    /// (`lsif_edges: 0`), so no Rust semantic edge was ever re-derived.
+    #[test]
+    fn a_stale_format_row_does_not_discard_the_whole_batch() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let mk = |path: &str, sig: &str| {
+            travsr_core::Node::new(
+                travsr_core::VName::new("c", "", path, "rust", sig),
+                "function",
+            )
+            .with_line(1)
+            .with_end_line(9)
+        };
+
+        // A row as an older SIGNATURE_FORMAT_VERSION wrote it: this exact vname
+        // tuple, under an id that is not its current hash.
+        let stale = mk("old.rs", "fn:stale");
+        let stale_id = node_id_to_i64(stale.id) ^ 0x5555_5555_5555_5555u64 as i64;
+        store
+            .conn
+            .execute(
+                "INSERT INTO nodes(id, corpus, root, path, language, signature, kind, is_noise) \
+                 VALUES(?1, 'c', '', 'old.rs', 'rust', 'fn:stale', 'function', 0)",
+                params![stale_id],
+            )
+            .unwrap();
+
+        // Phase B re-emits that symbol under its current id, alongside an
+        // unrelated one.
+        let fresh = mk("new.rs", "fn:fresh");
+        store
+            .write_scip_attributed_batch("c", &[stale, fresh], &[])
+            .expect("one stale row must not fail the whole batch");
+
+        let survived: i64 = store
+            .conn
+            .query_row(
+                "SELECT count(*) FROM nodes WHERE signature = 'fn:fresh'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(survived, 1, "the rest of the batch must still be written");
+
+        // The stale row is left for the format guard to purge, never duplicated.
+        let stale_rows: i64 = store
+            .conn
+            .query_row(
+                "SELECT count(*) FROM nodes WHERE signature = 'fn:stale'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(stale_rows, 1, "the vname must not be duplicated");
     }
 }

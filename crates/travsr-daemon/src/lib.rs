@@ -29,7 +29,8 @@ use travsr_retrieval::compute_kcore;
 use travsr_store::{BatchWriteCounts, FileGraph, SqliteStore, Store};
 
 pub use hook::{
-    changed_files_from_git, install_hook, tracked_files_from_git, try_dispatch_to_daemon,
+    changed_files_from_git, commit_is_ancestor_of_head, install_hook, tracked_files_from_git,
+    try_dispatch_to_daemon,
 };
 
 /// Set the process-level opt-in flag that allows `rust-analyzer` to run
@@ -91,6 +92,12 @@ pub struct InitStats {
     pub files_skipped_ignored: u64,
     /// Whether `.travsrignore` was freshly created on this run (first `travsr init`).
     pub travsrignore_scaffolded: bool,
+    /// #893: whether a `/.travsr/` entry was appended to `.gitignore` on this run.
+    pub gitignore_scaffolded: bool,
+    /// #893: git already tracks files under `.travsr/`, so the `.gitignore`
+    /// entry is inert and the user needs `git rm -r --cached .travsr` before
+    /// `git revert`/`git merge` will run again. Surfaced, never auto-fixed.
+    pub travsr_dir_tracked: bool,
     /// Net change in node count. `i64` to allow negative values if nodes are
     /// removed in the future (e.g. delete-by-file support); currently always >= 0.
     pub nodes_written: i64,
@@ -121,6 +128,18 @@ pub struct PhaseBReport {
     pub corpus: String,
     /// Languages for which semantic analysis ran successfully.
     pub ran: Vec<String>,
+    /// Phase B write calls that returned an error this run.
+    ///
+    /// A sidecar crash is per-language and `crashed` carries it, but a write
+    /// failure is per-RUN and takes every language's results with it: the batch
+    /// writers are one transaction each, so one bad row rolls back the whole
+    /// thing. That was invisible in the outcome. `write_phase_b_results` logged
+    /// a `warn!` at the call site and returned nothing, so a run that stored
+    /// none of what it computed still reported `outcome: Success` with
+    /// `lsif_edges: 0`, and `travsr status` read "semantic: complete" over a
+    /// gutted index. Folded into the run outcome so the completion event cannot
+    /// claim a clean run it did not have.
+    pub write_failures: usize,
     /// Languages P1-gated because no source files of that type exist in the
     /// repo. Not shown to the user — irrelevant when the language is absent.
     pub skipped_not_in_repo: Vec<String>,
@@ -158,6 +177,54 @@ pub struct PhaseBReport {
     /// Shown to the user with a `travsr lang install <lang>` call-to-action.
     /// Tuple: (language, expected_version, got_version).
     pub version_mismatch: Vec<(String, u32, u32)>,
+    /// #878: the TypeScript LSIF pass was requested (a `tsconfig.json` is at the
+    /// repo root) but produced nothing, because `travsr-lsif-ts` could not be
+    /// started or failed. `typescript` still appears in `ran` (the native
+    /// tree-sitter pass did run), so without this the run read as a clean
+    /// success while the language was missing most of its `ref/call` edges.
+    pub lsif_skipped: Option<LsifSkip>,
+}
+
+/// #878: why the TypeScript LSIF pass produced no edges for a repo that asked
+/// for it (a `tsconfig.json` at the repo root).
+///
+/// Two classes, because they call for different fixes. `EmitterMissing` is a
+/// failure to *start* `travsr-lsif-ts` at all (discovery fell through, or an
+/// explicit `TRAVSR_LSIF_TS` names a missing file): the remedy is the install
+/// layout or the override. `EmitterFailed` is an emitter that ran and broke
+/// (non-zero exit, timeout, oversized output) or whose dump could not be
+/// ingested: the remedy is in its own stderr. Persisted to `phase_b_warnings`
+/// as `emitter_missing:typescript` / `emitter_failed:typescript` so `travsr
+/// status` and the MCP freshness notes disclose it the way a crashed sidecar
+/// is disclosed today.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LsifSkip {
+    pub reason: LsifSkipReason,
+    /// The underlying error, for the `init` summary. Not persisted: the meta
+    /// entry carries only the class, so free text (which may contain the `,`
+    /// and `:` the warning format is split on) never reaches it.
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LsifSkipReason {
+    /// `travsr-lsif-ts` could not be spawned (see `travsr_indexer::EmitterNotFound`).
+    EmitterMissing,
+    /// The emitter started but did not yield a usable dump.
+    EmitterFailed,
+}
+
+impl LsifSkip {
+    /// The `phase_b_warnings` class this skip is recorded under. Must stay in
+    /// step with the arms in `travsr-cli/src/status.rs` and
+    /// `travsr-mcp/src/observability.rs` (`phase_b_warning_classes_match_the_cli`
+    /// pins the set on the MCP side).
+    pub fn warning_class(&self) -> &'static str {
+        match self.reason {
+            LsifSkipReason::EmitterMissing => "emitter_missing",
+            LsifSkipReason::EmitterFailed => "emitter_failed",
+        }
+    }
 }
 
 /// Progress events emitted during [`init_repo_with_progress`] so a caller (the
@@ -476,23 +543,38 @@ fn index_paths_parallel(
 ///
 /// Precedence: SKIP_DIRS (hard, non-overridable) < these defaults (soft, user can
 /// negate with `!pattern` in `.travsrignore`) < any additional user rules.
+///
+/// Only list a directory here if SKIP_DIRS does NOT already cover it: a name in
+/// SKIP_DIRS (`target`, `node_modules`, `dist`, `.next`, …) is dropped at every
+/// path component before `.travsrignore` is consulted, so repeating it here adds
+/// nothing and misrepresents it as negatable with `!`.
 const DEFAULT_TRAVSRIGNORE: &str = "\
 # .travsrignore: gitignore-syntax exclusions for Travsr graph indexing.
 # Patterns here are additive to .gitignore. Negate with ! to re-include.
 # Generated by `travsr init`, safe to edit.
 
-# Third-party vendored dependencies
+# Third-party vendored dependencies (Go/PHP, CocoaPods, Carthage)
 vendor/
-# Common build output directories
+Pods/
+Carthage/
+# Common build output directories (generic/Gradle, SwiftPM)
 build/
+.build/
 # Generated code
 **/generated/
 **/*.pb.go
 **/testdata/
 ";
 
-/// Number of default rules in [`DEFAULT_TRAVSRIGNORE`] (for the summary line).
-const DEFAULT_TRAVSRIGNORE_RULE_COUNT: usize = 5;
+/// Number of default rules in [`DEFAULT_TRAVSRIGNORE`].
+///
+/// Diagnostic only: the sole consumer is the `tracing::info!` that `init_repo`
+/// emits after scaffolding. The user-facing init summary deliberately prints no
+/// count (it points at the file instead), so do not read this as something a
+/// user sees.
+///
+/// Pinned to the string above by `travsrignore_scaffold_matches_its_rule_count`.
+const DEFAULT_TRAVSRIGNORE_RULE_COUNT: usize = 8;
 
 /// Write `.travsrignore` with commented defaults if it does not already exist.
 ///
@@ -506,6 +588,82 @@ fn scaffold_travsrignore(repo_root: &Path) -> anyhow::Result<bool> {
     std::fs::write(&path, DEFAULT_TRAVSRIGNORE)
         .with_context(|| format!("writing {}", path.display()))?;
     Ok(true)
+}
+
+/// Appended to `.gitignore` by [`scaffold_gitignore`].
+///
+/// Leading `/` anchors the rule to the repo root, the same reason `connect.rs`
+/// anchors every entry it generates: a slash-less pattern would also ignore a
+/// `.travsr` directory vendored at any depth. Trailing `/` matches the
+/// directory only.
+///
+/// The comment deliberately does not carry a `# travsr:` prefix: `connect.rs`
+/// finds its own managed block in this same file by substring-counting
+/// `# travsr:begin` / `# travsr:end`, and a sibling comment sharing that prefix
+/// is one careless edit to those markers away from being miscounted.
+const GITIGNORE_TRAVSR_ENTRY: &str =
+    "\n# travsr local code graph. Never commit it, the WAL file changes on every read.\n/.travsr/\n";
+
+/// Ensure git ignores `.travsr/`.
+///
+/// `init_repo` creates `.travsr/graph.db` plus its `-wal`/`-shm` sidecars and
+/// `init.lock` inside the repository. Untracked but un-ignored, the next
+/// `git add -A` commits them; the WAL then changes on every read, so the
+/// working tree is permanently dirty and `git revert` / `git merge` / `git
+/// rebase` refuse to run at all (#893). `travsr init` already takes
+/// responsibility for scaffolding `.travsrignore`, so the `.gitignore` entry
+/// belongs beside it rather than in a second owner.
+///
+/// Idempotency goes through `git check-ignore --no-index`, which answers "is a
+/// rule in effect" for every mechanism at once (repo `.gitignore`, nested
+/// `.gitignore`s, `.git/info/exclude`, the user's global excludes) instead of
+/// pattern-matching the file's text. `--no-index` is load-bearing: without it
+/// git reports an *already tracked* `.travsr/` as not-ignored no matter what
+/// rules exist, so every re-init on the repos this fix most needs to help would
+/// append a duplicate entry.
+///
+/// A git that cannot answer is treated as already-ignored, so init never
+/// appends blind to a user's `.gitignore`.
+///
+/// Returns whether an entry was appended.
+fn scaffold_gitignore(repo_root: &Path) -> anyhow::Result<bool> {
+    let ignored = std::process::Command::new("git")
+        .args(["check-ignore", "--no-index", "-q", ".travsr/"])
+        .current_dir(repo_root)
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(true);
+    if ignored {
+        return Ok(false);
+    }
+    let path = repo_root.join(".gitignore");
+    let mut text = std::fs::read_to_string(&path).unwrap_or_default();
+    // The entry leads with a blank line, so an existing file whose last line has
+    // no terminator would otherwise gain the comment on the end of that line.
+    if !text.is_empty() && !text.ends_with('\n') {
+        text.push('\n');
+    }
+    text.push_str(GITIGNORE_TRAVSR_ENTRY);
+    std::fs::write(&path, text).with_context(|| format!("writing {}", path.display()))?;
+    Ok(true)
+}
+
+/// Whether git already tracks anything under `.travsr/`.
+///
+/// A `.gitignore` entry has no effect on a path that is already in the index,
+/// so for a repo that committed `.travsr/` before this scaffold existed the
+/// entry alone changes nothing and the revert/merge deadlock survives. The
+/// caller reports that instead of claiming the problem is solved; untracking is
+/// left to the user because it rewrites their index, which `travsr init` has no
+/// mandate to do. Same call the `connect.rs` generated-file path makes for the
+/// same reason.
+fn travsr_dir_tracked(repo_root: &Path) -> bool {
+    std::process::Command::new("git")
+        .args(["ls-files", "--", ".travsr"])
+        .current_dir(repo_root)
+        .output()
+        .map(|o| o.status.success() && !o.stdout.is_empty())
+        .unwrap_or(false)
 }
 
 /// Top-level directory names that are well-known source roots, never dep/vendor dirs.
@@ -1265,11 +1423,21 @@ pub fn init_repo_with_progress(
 
     let nodes_before = store.node_count().context("counting nodes before init")? as i64;
 
-    // Stamp the format version BEFORE indexing so that the reindex_files calls
-    // below see version == SIGNATURE_FORMAT_VERSION and don't skip files.
-    store
-        .set_signature_format_version(SIGNATURE_FORMAT_VERSION)
-        .context("writing signature_format_version")?;
+    // RFC-002: an index stamped with an older signature format cannot be
+    // repaired incrementally. The hash delta below only re-parses files whose
+    // bytes changed, so untouched files would keep their old-format signatures
+    // inside a database the stamp now calls current, and nothing downstream
+    // could tell the two halves apart. Read the stored version BEFORE the stamp
+    // overwrites it and drive the same full-rebuild path `--force` uses.
+    // A read failure counts as skew: rebuilding is the recoverable direction.
+    let stored_sig_version = store.get_signature_format_version().unwrap_or(0);
+    let format_skew = nodes_before > 0 && stored_sig_version != SIGNATURE_FORMAT_VERSION;
+    if format_skew {
+        eprintln!(
+            "index format changed (v{stored_sig_version} -> v{SIGNATURE_FORMAT_VERSION}), \
+             rebuilding from scratch"
+        );
+    }
 
     // ARCH-102: detect canonical corpus from the git remote and persist it so
     // every VName in this graph uses the same corpus identifier.
@@ -1289,6 +1457,15 @@ pub fn init_repo_with_progress(
         let empty_walked = std::collections::HashSet::<String>::new();
         let purge_policy = travsr_core::SafetyPolicy {
             mass_delete_ceiling_pct: 1.0,
+            // The TOCTOU re-check (§6.5 S3) exists for the ghost sweep, where a
+            // file reappearing on disk means it is not a ghost after all. Here
+            // the delete criterion is not absence but identity: the files still
+            // on disk are exactly the ones whose old-corpus nodes must go. Left
+            // on, the purge skipped every present file and deleted nothing, so
+            // the old node set survived a corpus change and the next re-parse
+            // added a second set under the new corpus for the same path (the
+            // per-path delete in `write_file_graphs_batch` is corpus-scoped).
+            toctou_recheck: false,
             ..Default::default()
         };
         store
@@ -1304,14 +1481,17 @@ pub fn init_repo_with_progress(
     tracing::debug!("corpus for {}: {corpus}", repo_root.display());
 
     // UX-004: `--force` bypasses the incremental up-to-date short-circuit by
-    // purging the existing graph so every file is re-parsed below (node_count then
-    // reads 0, which also re-activates the fast staging path). Config that changes
+    // purging the existing graph so every file is re-parsed below. Config that changes
     // *semantic* output but not file content — e.g. `--allow-unsandboxed-lsif` —
     // is not part of the per-file hash delta, so without this a re-run would say
     // "up to date" while never rebuilding those edges. Uses a 100%-ceiling policy
     // because wiping the whole graph is the explicit, user-requested intent here.
-    if force && store.node_count().unwrap_or(0) > 0 {
-        tracing::info!("--force: purging graph for a full rebuild");
+    //
+    // `format_skew` takes the same path for the same reason: every NodeId in the
+    // stored graph was hashed under a different signature format, so re-parsing
+    // only the changed files would leave the two formats mixed.
+    if (force || format_skew) && store.node_count().unwrap_or(0) > 0 {
+        tracing::info!(force, format_skew, "purging graph for a full rebuild");
         let empty_walked = std::collections::HashSet::<String>::new();
         let purge_policy = travsr_core::SafetyPolicy {
             mass_delete_ceiling_pct: 1.0,
@@ -1320,23 +1500,35 @@ pub fn init_repo_with_progress(
         store
             .reconcile(&empty_walked, &purge_policy, repo_root, &corpus)
             .map_err(|e| anyhow::anyhow!("{e}"))
-            .context("--force full-graph purge")?;
+            .context("full-graph purge before rebuild")?;
         // #757 audit: `reconcile` only prunes nodes for files absent from disk,
         // so on-disk files keep their nodes AND their `files` content-hash rows.
         // The hash-delta below would then skip every unchanged file, leaving the
-        // whole point of `--force` (re-parse with the current analyzer, even
+        // whole point of the rebuild (re-parse with the current analyzer, even
         // when file bytes are unchanged) unmet — it reported "up to date" over an
         // index an older binary built. Clearing the hash cache makes every file
-        // look new, so `--force` genuinely re-parses the repo.
+        // look new, so the rebuild genuinely re-parses the repo.
         let cleared = store
             .clear_file_hashes()
             .map_err(|e| anyhow::anyhow!("{e}"))
-            .context("--force clearing file hash cache")?;
-        tracing::info!(
-            cleared,
-            "--force: cleared file hash cache for full re-parse"
-        );
+            .context("clearing file hash cache before rebuild")?;
+        tracing::info!(cleared, "cleared file hash cache for full re-parse");
     }
+
+    // RFC-002: the stamp must come AFTER the purge above, because a rebuild
+    // that fails or that the user interrupts would otherwise leave the new
+    // version stamped over old-format nodes: `format_skew` would read false on
+    // every later run, the hash delta would skip every unchanged file, and the
+    // `reindex_files` guard would stop firing, so the skew would become
+    // permanently undetectable.
+    //
+    // Nothing below reads the stamp back. Init's own indexing does not route
+    // through `reindex_files` (see the note on that at the Phase B step), so
+    // the older "stamp early or reindex_files skips every file" reasoning did
+    // not apply to this path and is not what holds the position here.
+    store
+        .set_signature_format_version(SIGNATURE_FORMAT_VERSION)
+        .context("writing signature_format_version")?;
 
     // Persist repo_root so MCP snippet tools can resolve vname.path → absolute
     // path at query time without threading repo_root through function signatures.
@@ -1372,6 +1564,15 @@ pub fn init_repo_with_progress(
     if scaffolded {
         tracing::info!("wrote .travsrignore ({DEFAULT_TRAVSRIGNORE_RULE_COUNT} default rules)");
     }
+
+    // #893: and ensure git ignores the graph itself, for the same reason the
+    // walker reads `.travsrignore` before it starts — this is the run that
+    // created the files in question, so it is the run that must fence them off.
+    let gitignore_scaffolded = scaffold_gitignore(repo_root).unwrap_or(false);
+    if gitignore_scaffolded {
+        tracing::info!("added /.travsr/ to .gitignore");
+    }
+    let travsr_dir_tracked = travsr_dir_tracked(repo_root);
 
     let walker = WalkBuilder::new(repo_root)
         .hidden(false)
@@ -1722,8 +1923,10 @@ pub fn init_repo_with_progress(
 
         // LSIF semantic pass — adds RefCall edges on top of structural edges.
         // DEBT(travsr-25): whole-project re-emit; file-level delta is Phase 3.
+        // #878: a skipped pass is carried into `write_phase_b_results` below,
+        // not just logged, so the summary and `travsr status` disclose it.
         let t_lsif = std::time::Instant::now();
-        run_lsif_pass(repo_root, &corpus, &mut store);
+        let lsif_skip = run_lsif_pass(repo_root, &corpus, &mut store);
         tracing::info!(
             elapsed_ms = t_lsif.elapsed().as_millis(),
             "TIMING: run_lsif_pass done"
@@ -1837,6 +2040,7 @@ pub fn init_repo_with_progress(
                 pb_refs,
                 pb_outcome,
                 (lsif_parsed, lsif_resolved),
+                lsif_skip.as_ref(),
             );
             // WS-2: flag Dart packages indexed without resolved dependencies.
             record_dart_resolution_state(&mut store, repo_root, present_languages.contains("dart"));
@@ -1866,6 +2070,16 @@ pub fn init_repo_with_progress(
             if let Err(e) = store.reconcile_edge_languages() {
                 tracing::warn!("reconciling edge languages: {e:#}");
             }
+            // #811: the call sites are all recorded, so reconcile the
+            // reference-resolution table against them now, exactly as the
+            // daemon's ratification does. Without this a `pending` row the
+            // live lane wrote before this rebuild survived `--force` even
+            // though `edge_sites` now proves the reference resolved, and
+            // `pending_ref_count` kept reporting it. Not gated on which
+            // languages ran: the reconcile is keyed on the evidence in the
+            // store, so a crashed sidecar's files simply have no new sites and
+            // keep their rows.
+            reconcile_ref_resolution_states(&mut store);
             report
         };
         tracing::info!(
@@ -2000,6 +2214,8 @@ pub fn init_repo_with_progress(
         files_skipped_unchanged,
         files_skipped_ignored,
         travsrignore_scaffolded: scaffolded,
+        gitignore_scaffolded,
+        travsr_dir_tracked,
         nodes_written: nodes_after - nodes_before,
         edges_written,
         total_nodes: nodes_after as u64,
@@ -2403,11 +2619,16 @@ fn resolve_unresolved_calls(
                 // `class:T`, not Rust's `struct:`/`enum:`/`trait:`. Without it a
                 // real graph class was treated as an external type (#529 branch
                 // 2), dropping legitimate cross-file method edges.
+                // `interface:` belongs here for the same reason `class:` did:
+                // Go/Java/Kotlin/C#/TypeScript all emit it as a distinct Phase A
+                // prefix, so an interface-typed receiver was read as an external
+                // type and its calls dropped at #529 branch 2.
                 [
                     format!("struct:{t}"),
                     format!("enum:{t}"),
                     format!("trait:{t}"),
                     format!("class:{t}"),
+                    format!("interface:{t}"),
                 ]
             })
             .collect()
@@ -2857,6 +3078,37 @@ fn cross_link_manifest_deps(store: &mut SqliteStore) -> usize {
     linked
 }
 
+/// The run outcome reported by `phase_b.complete`, from what the run actually
+/// achieved.
+///
+/// A write failure is not a crash and no language reports it, but it costs the
+/// WHOLE run: each batch writer is one transaction, so a single failing row
+/// rolls back everything Phase B computed for every language. Before this it
+/// reached nothing, so a run that stored none of its results still reported
+/// `Success` with `lsif_edges: 0`, and `travsr status` read "semantic:
+/// complete" over a gutted index.
+///
+/// `Partial`, not `AllCrashed`, on a write failure. `AllCrashed` re-arms the
+/// scheduler on the next tick, and a retry cannot change the cause (a stale row
+/// is still stale on the next run), which is the persistent-retry loop #712
+/// exists to avoid. `Partial` is honest and settles.
+fn run_outcome(report: &PhaseBReport, made_progress: bool) -> phase_b_sched::RunOutcome {
+    if report.write_failures > 0 {
+        phase_b_sched::RunOutcome::Partial
+    } else if report.crashed.is_empty() {
+        phase_b_sched::RunOutcome::Success
+    } else if made_progress {
+        // Healthy languages advanced to HEAD, so the next scheduler tick early-
+        // returns (last_commit == phase_b_commit) instead of re-running: the
+        // loop settles after one back-off cycle rather than retrying a
+        // persistently broken sidecar forever (#464 follow-up, #712).
+        phase_b_sched::RunOutcome::Partial
+    } else {
+        phase_b_sched::RunOutcome::AllCrashed
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn write_phase_b_results(
     store: &mut SqliteStore,
     corpus: &str,
@@ -2869,6 +3121,10 @@ fn write_phase_b_results(
     // Windows path bug where every ref parsed but none matched a Phase A node —
     // so `rust_lsif_degraded` reflects surviving edges, not just "did ra run".
     lsif_stats: (usize, usize),
+    // #878: `Some` when the TypeScript LSIF pass was due (tsconfig.json present)
+    // but `travsr-lsif-ts` could not run. Recorded in `phase_b_warnings` and on
+    // the report so the language is never reported as cleanly complete.
+    lsif_skip: Option<&LsifSkip>,
 ) -> (
     PhaseBReport,
     std::collections::HashMap<travsr_core::NodeId, travsr_core::NodeId>,
@@ -2876,6 +3132,9 @@ fn write_phase_b_results(
 ) {
     let pb_node_count = pb_nodes.len();
     let pb_edge_count = pb_edges.len();
+    // Each batch writer below is one transaction, so a single failing row loses
+    // every language's results for this run. Counted rather than only logged.
+    let mut write_failures = 0usize;
     // B: gate the C1 manifest cross-link (two unindexed full `nodes` scans) on
     // whether this cycle actually wrote any `crate` node. Computed before
     // `pb_nodes` is consumed below. C1 only creates value when `crate:*` nodes
@@ -2904,10 +3163,14 @@ fn write_phase_b_results(
     // channel below so silent non-unification (orphaned SCIP twins) is visible.
     let mut scip_unify_attempted: usize = 0;
     let mut scip_unify_missed: usize = 0;
+    // #825: the actual unreconciled symbols behind the miss count, persisted so
+    // `travsr status` can name them instead of only reporting a rate.
+    let mut scip_unify_misses: Vec<crate::scip_unifier::UnifyMiss> = Vec::new();
     if pb_refs.is_empty() {
         // Old-style sidecar: no G2 attribution data — write nodes+edges directly.
         // These are analyzer/SCIP-derived structural edges (E1: provenance 'scip').
         if let Err(e) = store.write_phase_b_batch(&pb_nodes, &pb_edges, "scip") {
+            write_failures += 1;
             tracing::warn!("semantic analysis batch write error: {e:#}");
         }
     } else {
@@ -2918,6 +3181,7 @@ fn write_phase_b_results(
         let unify = crate::scip_unifier::unify_all(store, corpus, &pb_nodes, &mut pb_refs_mut);
         scip_unify_attempted = unify.attempted;
         scip_unify_missed = unify.attempted.saturating_sub(unify.unified);
+        scip_unify_misses = unify.misses;
         alias_map = unify.alias_map;
         // #780: synthetic DSL meta-scope def nodes (RSpec blocks) with no twin.
         // Dropped outright — node, inbound refs, and edges — so they stop
@@ -2968,12 +3232,14 @@ fn write_phase_b_results(
 
         // G2 path: span-attributed ref/call edges.
         if let Err(e) = store.write_scip_attributed_batch(corpus, &pb_nodes, &pb_refs) {
+            write_failures += 1;
             tracing::warn!("semantic analysis attributed write error: {e:#}");
         }
         // Structural edges from SCIP relationships (Pass 2 in scip-reader) still
         // need to be written — they are not represented in ScipRef records.
         if !pb_edges.is_empty() {
             if let Err(e) = store.write_phase_b_batch(&[], &pb_edges, "scip") {
+                write_failures += 1;
                 tracing::warn!("semantic analysis structural edges write error: {e:#}");
             }
         }
@@ -3051,6 +3317,13 @@ fn write_phase_b_results(
     for lang in &pb_outcome.skipped_no_compdb {
         warnings.push(format!("skipped_no_compdb:{lang}"));
     }
+    // #878: the TypeScript LSIF pass was due but `travsr-lsif-ts` never ran (or
+    // ran and failed). The native pass still ran, so `typescript` is in `ran`
+    // and the marker advances; this is what keeps `travsr status` from reading
+    // `complete` over an index missing most of the language's call edges.
+    if let Some(skip) = lsif_skip {
+        warnings.push(format!("{}:typescript", skip.warning_class()));
+    }
     // E6: surface SCIP def-unification misses (orphaned twins). Positional
     // span-containment makes this near-zero; a non-zero rate means Phase A
     // nodes the compiler defined were not matched, so their ref/call edges
@@ -3059,6 +3332,28 @@ fn write_phase_b_results(
         warnings.push(format!(
             "scip_unification_misses:{scip_unify_missed}/{scip_unify_attempted}"
         ));
+    }
+    // #825: persist the unreconciled symbols themselves so `travsr status` can
+    // name them (the miss set is deterministic, so "re-run init" never helps —
+    // seeing WHICH defs miss is what actually moves the work forward). Capped so
+    // a pathological repo cannot bloat the meta table; the count already carries
+    // the true total. One row per line: `lang\tkind\tsymbol\tpath:line`.
+    const MAX_MISS_ROWS: usize = 100;
+    if scip_unify_misses.is_empty() {
+        let _ = store.set_meta("scip_unification_miss_list", "");
+    } else {
+        let list = scip_unify_misses
+            .iter()
+            .take(MAX_MISS_ROWS)
+            .map(|m| {
+                format!(
+                    "{}\t{}\t{}\t{}:{}",
+                    m.language, m.kind, m.symbol, m.path, m.line
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let _ = store.set_meta("scip_unification_miss_list", &list);
     }
     if !warnings.is_empty() {
         let _ = store.set_meta("phase_b_warnings", &warnings.join(","));
@@ -3098,9 +3393,11 @@ fn write_phase_b_results(
         skipped_needs_approval: pb_outcome.skipped_needs_approval,
         skipped_needs_consent: pb_outcome.skipped_needs_consent,
         crashed: pb_outcome.crashed,
+        write_failures,
         produced_no_nodes: pb_outcome.produced_no_nodes,
         produced_no_references: pb_outcome.produced_no_references,
         version_mismatch: pb_outcome.version_mismatch,
+        lsif_skipped: lsif_skip.cloned(),
     };
     (report, alias_map, dropped)
 }
@@ -3513,8 +3810,7 @@ fn maybe_spawn_embed(
         return;
     }
 
-    let phase2_total = total.saturating_sub(phase1_total);
-    let phase2_remaining = phase2_total.saturating_sub(embedded.saturating_sub(phase1_done));
+    let phase2_remaining = phase2_remaining(total, embedded, phase1_total, phase1_done);
 
     if phase2_remaining == 0 {
         phase2_spawned.store(true, Ordering::Relaxed);
@@ -3535,6 +3831,24 @@ fn maybe_spawn_embed(
     if travsr_plugin_host::spawn_background_reindex_phase2(&db_path) {
         phase2_spawned.store(true, Ordering::Relaxed);
     }
+}
+
+/// Phase 2 nodes still to embed, from one `embed_progress` reading.
+///
+/// `phase2_total = total - phase1_total` and `phase2_done = embedded -
+/// phase1_done`, both saturating because the four counts are read in separate
+/// statements and a node can change tier between them.
+///
+/// The arithmetic is only right when `embedded` is over the same embeddable
+/// set as `total` (#862). With an unfiltered `embedded`, every vector on an
+/// ineligible node inflated `phase2_done` by one, and once the inflation
+/// reached the genuine remainder the outer `saturating_sub` returned 0: the
+/// tick concluded Phase 2 was complete and never spawned it. The saturation
+/// stays; the store's count is what was wrong, and `embed_progress` now
+/// applies its predicate to `embedded` too.
+fn phase2_remaining(total: u64, embedded: u64, phase1_total: u64, phase1_done: u64) -> u64 {
+    let phase2_total = total.saturating_sub(phase1_total);
+    phase2_total.saturating_sub(embedded.saturating_sub(phase1_done))
 }
 
 /// Pending-tombstone count observed at the last invalidation-driven spawn.
@@ -4508,21 +4822,92 @@ fn ratify_live_overlay(store: &mut SqliteStore, ratified: &[String]) {
         Err(e) => tracing::warn!("live overlay sweep failed: {e:#}"),
     }
     // A reference Phase B recorded a call site for is no longer pending, whoever
-    // resolved it.
-    if let Err(e) = store.clear_resolved_pending_refs() {
-        tracing::debug!("clearing resolved pending refs failed: {e:#}");
-    }
-    // Rows whose `src` node was renamed away are unreachable by every other
-    // delete path, so they would otherwise accumulate for the life of the repo.
-    match store.purge_orphan_ref_resolution_states() {
-        Ok(0) => {}
-        Ok(n) => tracing::debug!(
-            event = "live.pending.purged",
-            rows = n,
-            "purged reference rows whose enclosing symbol no longer exists"
+    // resolved it, and rows whose `src` node was renamed away are unreachable by
+    // every other delete path. Same reconcile every Phase B completion runs
+    // (#811); see `reconcile_ref_resolution_states`.
+    reconcile_ref_resolution_states(store);
+}
+
+/// #811: reconcile `ref_resolution_state` with the graph after Phase B lands.
+///
+/// The single call site shared by every path that completes a Phase B pass:
+/// the daemon's live-overlay ratification ([`ratify_live_overlay`]), the CLI's
+/// inline full rebuild (`travsr init --semantic`, in
+/// [`init_repo_with_progress`]), and daemon startup
+/// ([`reconcile_ref_resolution_states_on_startup`]). Before this, only the
+/// first of those ran the reconcile, so `pending` rows a full rebuild had
+/// resolved survived `travsr init --semantic --force` and a restart on a
+/// current index alike, and `pending_ref_count` over-reported references the
+/// rebuilt graph resolves.
+///
+/// The work itself lives in the store
+/// ([`SqliteStore::reconcile_ref_resolution_states`]): one transaction, keyed on
+/// evidence only (a matching `edge_sites(src, line)` row, a missing `src`
+/// node), and a second run is a no-op. The site match is per line, not per
+/// name, so a line with several references loses all its pending rows once any
+/// of them resolves; see the store method's doc for that limitation.
+///
+/// Fail-open, like the rest of ratification: a reconcile that errors leaves
+/// stale-but-honest rows behind and never costs the graph anything, so it is
+/// logged and not propagated.
+fn reconcile_ref_resolution_states(store: &mut SqliteStore) {
+    match store.reconcile_ref_resolution_states() {
+        Ok(r) if r.total() == 0 => {}
+        Ok(r) => tracing::debug!(
+            event = "live.pending.reconciled",
+            cleared_resolved = r.cleared_resolved,
+            purged_orphans = r.purged_orphans,
+            "reconciled ref_resolution_state against the ratified graph"
         ),
-        Err(e) => tracing::debug!("purging orphan ref_resolution_state rows failed: {e:#}"),
+        Err(e) => tracing::debug!("reconciling ref_resolution_state failed: {e:#}"),
     }
+}
+
+/// #811: the daemon-startup half of the reconcile.
+///
+/// A daemon restarted on an index that is already current never runs Phase B:
+/// `arm_phase_b_if_pending` only arms when `last_commit != phase_b_commit`, and
+/// `run_background_phase_b_inner` returns before ratification when they match.
+/// So whatever `pending` rows the previous daemon (or a CLI rebuild made before
+/// this fix) left behind would stay for the life of the index. Reconciling once
+/// at startup closes that gap without any graph work: it is two evidence-keyed
+/// `DELETE`s under a brief lock, never a rebuild, and on a clean table it
+/// deletes nothing.
+///
+/// Logged at `info` when it removed something, because a non-zero count here
+/// is exactly the backlog #811 reported and worth seeing in `travsr daemon logs`.
+fn reconcile_ref_resolution_states_on_startup(store: &std::sync::Mutex<SqliteStore>) {
+    let mut s = store.lock().unwrap_or_else(|e| e.into_inner());
+    match s.reconcile_ref_resolution_states() {
+        Ok(r) if r.total() == 0 => {}
+        Ok(r) => tracing::info!(
+            event = "live.pending.reconciled",
+            cleared_resolved = r.cleared_resolved,
+            purged_orphans = r.purged_orphans,
+            "startup: reconciled stale ref_resolution_state rows left by a previous session"
+        ),
+        Err(e) => tracing::warn!("startup ref_resolution_state reconcile failed: {e:#}"),
+    }
+}
+
+/// Open the daemon's writable store and run the startup hygiene it owes the
+/// index.
+///
+/// This is the only way `run` obtains its store, and the #811 startup reconcile
+/// ([`reconcile_ref_resolution_states_on_startup`]) lives inside it rather than
+/// as a separate statement after the open, so the daemon cannot come up with a
+/// store that skipped it. A restart on a current index never reaches Phase B
+/// ratification, which makes this the one place stale `pending` rows a previous
+/// session left behind can be retired; a test opens a store through here and
+/// checks they are gone.
+fn open_daemon_store(
+    db_path: &Path,
+) -> anyhow::Result<std::sync::Arc<std::sync::Mutex<SqliteStore>>> {
+    let store = std::sync::Arc::new(std::sync::Mutex::new(
+        SqliteStore::open(db_path).context("opening graph.db")?,
+    ));
+    reconcile_ref_resolution_states_on_startup(&store);
+    Ok(store)
 }
 
 /// The `nodes.language` values whose live overlay this Phase B run may retire.
@@ -4592,7 +4977,8 @@ fn run_background_phase_b_inner(
     // ── LSIF pass (TypeScript compiler — expensive, runs lock-free) ───────────
     // Collect edges into a Vec first; write them under the store lock below.
     // This mirrors the SCIP sidecar pattern and keeps queries warm throughout.
-    let lsif_edges = run_lsif_pass_collect(repo_root, &corpus);
+    // #878: a skipped pass is recorded, not just logged (see the inline path).
+    let (lsif_edges, lsif_skip) = run_lsif_pass_collect(repo_root, &corpus);
 
     // ── SCIP sidecar pass (all languages in parallel, lock-free) ─────────────
     // P6 (#329): single walk yields both present_languages and indexable_paths
@@ -4662,6 +5048,7 @@ fn run_background_phase_b_inner(
         pb_refs,
         pb_outcome,
         (lsif_parsed, lsif_resolved),
+        lsif_skip.as_ref(),
     );
     // WS-2: flag Dart packages indexed without resolved dependencies.
     record_dart_resolution_state(&mut s, repo_root, dart_present);
@@ -4731,17 +5118,7 @@ fn run_background_phase_b_inner(
         let _ = s.set_meta("phase_b_dirty", "0");
     }
 
-    let outcome = if report.crashed.is_empty() {
-        phase_b_sched::RunOutcome::Success
-    } else if made_progress {
-        // Healthy languages advanced to HEAD, so the next scheduler tick early-
-        // returns (last_commit == phase_b_commit) instead of re-running: the
-        // loop settles after one back-off cycle rather than retrying a
-        // persistently broken sidecar forever (#464 follow-up, #712).
-        phase_b_sched::RunOutcome::Partial
-    } else {
-        phase_b_sched::RunOutcome::AllCrashed
-    };
+    let outcome = run_outcome(&report, made_progress);
     let succeeded = outcome != phase_b_sched::RunOutcome::AllCrashed;
 
     tracing::info!(
@@ -4749,7 +5126,11 @@ fn run_background_phase_b_inner(
         event = "phase_b.complete",
         ran = report.ran.len(),
         lsif_edges = lsif_edges.len(),
+        // #878: `lsif_edges = 0` alone cannot distinguish "no tsconfig" from
+        // "the emitter never ran"; the class says which.
+        lsif_skipped = report.lsif_skipped.as_ref().map(LsifSkip::warning_class),
         crashed = report.crashed.len(),
+        write_failures = report.write_failures,
         outcome = ?outcome,
         "semantic call and reference indexing complete"
     );
@@ -5290,46 +5671,72 @@ pub fn reindex_files(
 /// Used by the inline path (`--semantic` or no-commit repos). For the deferred
 /// path use [`run_lsif_pass_collect`] + write under the store lock.
 ///
-/// Failures (binary not on PATH, tsconfig absent, parse errors) are logged as
-/// warnings and silently skipped — they must never fail the overall index.
-fn run_lsif_pass(repo_root: &Path, corpus: &str, store: &mut SqliteStore) {
-    let edges = run_lsif_pass_collect(repo_root, corpus);
+/// Failures never fail the overall index, but they are not silent either:
+/// `Some(skip)` is returned when the pass was due and the emitter could not
+/// run, for the caller to hand to `write_phase_b_results` (#878).
+fn run_lsif_pass(repo_root: &Path, corpus: &str, store: &mut SqliteStore) -> Option<LsifSkip> {
+    let (edges, skip) = run_lsif_pass_collect(repo_root, corpus);
     for edge in &edges {
         if let Err(e) = store.put_edge_lsif(edge) {
             tracing::warn!("lsif edge write error: {e}");
         }
     }
     tracing::debug!("lsif pass: {} RefCall edges persisted", edges.len());
+    skip
 }
 
 /// Collect LSIF RefCall edges without holding the store lock.
 ///
-/// Returns an empty `Vec` when `tsconfig.json` is absent or the emitter fails.
-/// The caller writes the edges under the store lock. This split lets
-/// `run_background_phase_b` hold the lock only for the final write batch while
-/// the expensive TS compiler runs lock-free.
-fn run_lsif_pass_collect(repo_root: &Path, corpus: &str) -> Vec<travsr_core::Edge> {
+/// Returns `(edges, skip)`. `edges` is empty when `tsconfig.json` is absent or
+/// the emitter failed; `skip` is `Some` in the second case only, so a repo
+/// without a tsconfig is not reported as degraded (#878). The caller writes the
+/// edges under the store lock. This split lets `run_background_phase_b` hold
+/// the lock only for the final write batch while the expensive TS compiler
+/// runs lock-free.
+fn run_lsif_pass_collect(
+    repo_root: &Path,
+    corpus: &str,
+) -> (Vec<travsr_core::Edge>, Option<LsifSkip>) {
     let tsconfig = repo_root.join("tsconfig.json");
     if !tsconfig.exists() {
-        return Vec::new();
+        return (Vec::new(), None);
     }
 
     let dump = match run_lsif_emitter(&tsconfig) {
         Ok(d) => d,
         Err(e) => {
-            tracing::warn!("lsif emitter skipped: {e}");
-            return Vec::new();
+            // #878: this used to be the only trace of the skip, and only under
+            // RUST_LOG. The class is what the user-facing surfaces key on.
+            let reason = if travsr_indexer::emitter_missing(&e) {
+                LsifSkipReason::EmitterMissing
+            } else {
+                LsifSkipReason::EmitterFailed
+            };
+            tracing::warn!("lsif emitter skipped: {e:#}");
+            return (
+                Vec::new(),
+                Some(LsifSkip {
+                    reason,
+                    detail: format!("{e:#}"),
+                }),
+            );
         }
     };
 
     match ingest_lsif(&dump, corpus) {
         Ok(out) => {
             tracing::debug!("lsif pass: collected {} RefCall edges", out.edges.len());
-            out.edges
+            (out.edges, None)
         }
         Err(e) => {
-            tracing::warn!("lsif ingest error: {e}");
-            Vec::new()
+            tracing::warn!("lsif ingest error: {e:#}");
+            (
+                Vec::new(),
+                Some(LsifSkip {
+                    reason: LsifSkipReason::EmitterFailed,
+                    detail: format!("travsr-lsif-ts ran but its output could not be read: {e:#}"),
+                }),
+            )
         }
     }
 }
@@ -7495,6 +7902,7 @@ mod tests {
             pb_refs,
             travsr_plugin_host::PhaseBOutcome::default(),
             (0, 0),
+            None,
         );
 
         // Literal repro from issue #449: "ClassA (Swift class instantiated via
@@ -7534,7 +7942,20 @@ mod tests {
     // this lock to prevent races on Windows and Linux multi-threaded test runs.
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
+    /// #893: `init_repo` registers its repo root in `~/.travsr/registry.json`
+    /// unless this is set, so an unguarded test in this module appends its
+    /// `tempfile` tempdir to the developer's real registry and leaves the entry
+    /// there after the directory is deleted. Called from `git_init` — the
+    /// arrangement step every test that reaches `init_repo` already performs —
+    /// so one call covers the whole module. `set_var` is process-global and
+    /// every caller writes the same value, so this is safe under the parallel
+    /// test runner. Same pattern as `tests/semantic_marker.rs::disable_registry`.
+    fn disable_registry() {
+        std::env::set_var("TRAVSR_DISABLE_REGISTRY", "1");
+    }
+
     fn git_init(dir: &std::path::Path) {
+        disable_registry();
         StdCommand::new("git")
             .args(["-c", "init.defaultBranch=main", "init", "-q"])
             .current_dir(dir)
@@ -7905,6 +8326,7 @@ mod tests {
             vec![],
             travsr_plugin_host::PhaseBOutcome::default(),
             (0, 0),
+            None,
         );
         assert!(
             !linked(&store),
@@ -7920,6 +8342,7 @@ mod tests {
             vec![],
             travsr_plugin_host::PhaseBOutcome::default(),
             (0, 0),
+            None,
         );
         assert!(
             linked(&store),
@@ -7961,6 +8384,7 @@ mod tests {
                 vec![],
                 travsr_plugin_host::PhaseBOutcome::default(),
                 stats,
+                None,
             );
         };
 
@@ -8075,6 +8499,198 @@ mod tests {
         );
     }
 
+    /// A Phase B write failure costs the whole run, because each batch writer is
+    /// one transaction: one bad row rolls back every language's results. It
+    /// reached the run outcome nowhere, so a run that stored NONE of what it
+    /// computed still logged `outcome: Success, lsif_edges: 0` and left
+    /// `travsr status` reading "semantic: complete" over a gutted index.
+    ///
+    /// Observed in production on this repo: 42 stale-format rows made
+    /// `write_scip_attributed_batch` fail on every run, discarding 946k lines of
+    /// rust-analyzer LSIF, and every one of those runs reported Success.
+    #[test]
+    fn a_write_failure_is_not_reported_as_a_clean_run() {
+        let clean = PhaseBReport {
+            ran: vec!["rust".into()],
+            ..Default::default()
+        };
+        assert_eq!(
+            run_outcome(&clean, true),
+            phase_b_sched::RunOutcome::Success,
+            "a run with no crashes and no write failures is a clean success"
+        );
+
+        let wrote_nothing = PhaseBReport {
+            ran: vec!["rust".into()],
+            write_failures: 1,
+            ..Default::default()
+        };
+        assert_ne!(
+            run_outcome(&wrote_nothing, true),
+            phase_b_sched::RunOutcome::Success,
+            "a run whose writes failed must not report a clean success"
+        );
+        // Partial, not AllCrashed: AllCrashed re-arms the scheduler every tick
+        // against a cause a retry cannot change.
+        assert_eq!(
+            run_outcome(&wrote_nothing, true),
+            phase_b_sched::RunOutcome::Partial
+        );
+
+        // A write failure outranks a clean crash list either way.
+        let both = PhaseBReport {
+            crashed: vec!["scala".into()],
+            write_failures: 2,
+            ..Default::default()
+        };
+        assert_eq!(
+            run_outcome(&both, false),
+            phase_b_sched::RunOutcome::Partial
+        );
+    }
+
+    #[test]
+    fn init_repo_rebuilds_on_signature_format_skew() {
+        let tmp = tempfile::tempdir().unwrap();
+        git_init(tmp.path());
+        std::fs::write(tmp.path().join("a.ts"), "export class A { go() {} }").unwrap();
+        std::fs::write(tmp.path().join("b.ts"), "export class B { go() {} }").unwrap();
+
+        let first = init_repo(tmp.path()).unwrap();
+        assert_eq!(first.files_indexed, 2);
+
+        // Control: with the stamp current, a re-init takes the incremental path
+        // and re-parses nothing.
+        let unchanged = init_repo(tmp.path()).unwrap();
+        assert_eq!(
+            unchanged.files_indexed, 0,
+            "an unchanged re-init must skip every file"
+        );
+
+        // Simulate a graph built by a binary with an older signature format.
+        let db_path = tmp.path().join(".travsr/graph.db");
+        {
+            let mut store = travsr_store::SqliteStore::open(&db_path).unwrap();
+            store
+                .set_signature_format_version(travsr_core::SIGNATURE_FORMAT_VERSION - 1)
+                .unwrap();
+        }
+
+        let rebuilt = init_repo(tmp.path()).unwrap();
+        assert_eq!(
+            rebuilt.files_indexed, 2,
+            "format skew must re-parse every file, not stamp the current version \
+             over half-migrated signatures"
+        );
+        let store = travsr_store::SqliteStore::open(&db_path).unwrap();
+        assert_eq!(
+            store.get_signature_format_version().unwrap(),
+            travsr_core::SIGNATURE_FORMAT_VERSION
+        );
+    }
+
+    /// RFC-002: the stamp must not be written until the rebuild the skew
+    /// triggered has actually purged the old graph. Stamping first meant a
+    /// rebuild that failed (or that the user interrupted) left the current
+    /// version recorded over old-format nodes, after which `format_skew` read
+    /// false forever, the hash delta skipped every unchanged file and the
+    /// `reindex_files` guard stopped firing: the detector disarmed itself.
+    #[test]
+    fn init_repo_keeps_the_old_stamp_when_the_rebuild_purge_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        git_init(tmp.path());
+        std::fs::write(tmp.path().join("a.ts"), "export class A { go() {} }").unwrap();
+        assert_eq!(init_repo(tmp.path()).unwrap().files_indexed, 1);
+
+        let db_path = tmp.path().join(".travsr/graph.db");
+        let old = travsr_core::SIGNATURE_FORMAT_VERSION - 1;
+        {
+            let mut store = travsr_store::SqliteStore::open(&db_path).unwrap();
+            store.set_signature_format_version(old).unwrap();
+        }
+
+        // Make the purge fail where an interrupted rebuild would stop: the
+        // `reconcile` call reads the `files` table before it deletes anything.
+        // The schema version already matches, so reopening the store runs no
+        // migration and does not put the table back.
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute_batch("DROP TABLE files").unwrap();
+        }
+
+        assert!(
+            init_repo(tmp.path()).is_err(),
+            "a purge that cannot run must fail the init rather than continue"
+        );
+
+        let store = travsr_store::SqliteStore::open(&db_path).unwrap();
+        assert_eq!(
+            store.get_signature_format_version().unwrap(),
+            old,
+            "a failed rebuild must leave the old stamp so the skew stays detectable"
+        );
+    }
+
+    /// ARCH-102: a corpus change rewrites every NodeId, so the old
+    /// node set has to go. `reconcile`'s TOCTOU re-check used to skip every file
+    /// still present on disk, which is all of them here, so the purge deleted
+    /// nothing and the next re-parse wrote a second node set for the same path
+    /// under the new corpus (the per-path delete is corpus-scoped).
+    #[test]
+    fn init_repo_purges_the_old_corpus_when_the_git_remote_appears() {
+        let tmp = tempfile::tempdir().unwrap();
+        git_init(tmp.path());
+        std::fs::write(tmp.path().join("a.ts"), "export class A { go() {} }").unwrap();
+        assert_eq!(init_repo(tmp.path()).unwrap().files_indexed, 1);
+
+        let db_path = tmp.path().join(".travsr/graph.db");
+        let corpora = || -> Vec<(String, i64)> {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            let mut stmt = conn
+                .prepare("SELECT corpus, count(*) FROM nodes GROUP BY corpus ORDER BY corpus")
+                .unwrap();
+            let rows = stmt
+                .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            rows
+        };
+        assert_eq!(corpora().len(), 1, "one repo, one corpus");
+
+        // The repo gains an origin, so `detect_corpus` stops falling back to
+        // `local/<basename>` and every NodeId changes.
+        std::process::Command::new("git")
+            .args([
+                "-C",
+                &tmp.path().to_string_lossy(),
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/acme/foo.git",
+            ])
+            .output()
+            .unwrap();
+
+        init_repo(tmp.path()).unwrap();
+        // Then edit the file, which is what makes the hash delta re-parse it and
+        // write the new-corpus node set.
+        std::fs::write(
+            tmp.path().join("a.ts"),
+            "export class A { go() {} go2() {} }",
+        )
+        .unwrap();
+        init_repo(tmp.path()).unwrap();
+
+        let after = corpora();
+        assert_eq!(
+            after.len(),
+            1,
+            "the old corpus must be purged, not left alongside the new one: {after:?}"
+        );
+        assert_eq!(after[0].0, "github.com/acme/foo");
+    }
+
     #[test]
     fn init_repo_skips_registry_when_env_var_set() {
         let _guard = ENV_LOCK.lock().unwrap();
@@ -8083,19 +8699,29 @@ mod tests {
         std::fs::write(tmp.path().join("app.ts"), "export class App {}").unwrap();
 
         let home_tmp = tempfile::tempdir().unwrap();
+        let old_home = std::env::var_os("HOME");
         std::env::set_var("HOME", home_tmp.path());
         std::env::set_var("TRAVSR_DISABLE_REGISTRY", "1");
 
         let _ = init_repo(tmp.path()).unwrap();
 
         let registry_path = home_tmp.path().join(".travsr").join("registry.json");
+
+        // #893: restore HOME instead of removing it. With HOME unset,
+        // `travsr_store::registry::home_dir` falls back to `.`, so every later
+        // test in this binary that registers writes a `.travsr/registry.json`
+        // into the process's working directory. Leave TRAVSR_DISABLE_REGISTRY
+        // set: `git_init` sets it for the whole module and clearing it here
+        // reopens the leak for tests running in parallel with this one.
+        match old_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+
         assert!(
             !registry_path.exists(),
             "registry.json must not be created when TRAVSR_DISABLE_REGISTRY=1"
         );
-
-        std::env::remove_var("TRAVSR_DISABLE_REGISTRY");
-        std::env::remove_var("HOME");
     }
 
     #[test]
@@ -8114,9 +8740,7 @@ mod tests {
 
         std::fs::write(tmp.path().join("real.ts"), "export class Real {}").unwrap();
 
-        std::env::set_var("TRAVSR_DISABLE_REGISTRY", "1");
         let stats = init_repo(tmp.path()).unwrap();
-        std::env::remove_var("TRAVSR_DISABLE_REGISTRY");
 
         assert_eq!(
             stats.files_indexed, 1,
@@ -9327,6 +9951,572 @@ mod tests {
         );
     }
 
+    // ── #811: ref_resolution_state reconciled on every Phase B completion ──
+    //
+    // The daemon half of #811. The store tests prove the reconcile itself; these
+    // prove it runs from every path that completes a Phase B pass, on a real
+    // repository, and assert on the table with the SQL the issue measured with
+    // rather than through `pending_ref_count` (whose `JOIN nodes` hides orphans).
+
+    /// The issue's own measurement, verbatim, on the on-disk database.
+    fn raw_pending_count(db_path: &std::path::Path) -> i64 {
+        rusqlite::Connection::open(db_path)
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM ref_resolution_state WHERE state = 'pending'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+
+    /// Whether a `(src, ref_line, name)` row is present, in any state.
+    fn raw_has_row(
+        db_path: &std::path::Path,
+        src: travsr_core::NodeId,
+        line: u32,
+        name: &str,
+    ) -> bool {
+        rusqlite::Connection::open(db_path)
+            .unwrap()
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM ref_resolution_state \
+                 WHERE src = ?1 AND ref_line = ?2 AND name = ?3)",
+                rusqlite::params![src.0 as i64, line as i64, name],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap()
+            != 0
+    }
+
+    /// Whether Phase B recorded a call site at `(src, line)`: the evidence the
+    /// reconcile keys on.
+    fn raw_edge_site_exists(
+        db_path: &std::path::Path,
+        src: travsr_core::NodeId,
+        line: u32,
+    ) -> bool {
+        rusqlite::Connection::open(db_path)
+            .unwrap()
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM edge_sites WHERE src = ?1 AND line = ?2)",
+                rusqlite::params![src.0 as i64, line as i64],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap()
+            != 0
+    }
+
+    fn meta(db_path: &std::path::Path, key: &str) -> Option<String> {
+        travsr_store::SqliteStore::open(db_path)
+            .unwrap()
+            .get_meta(key)
+            .unwrap()
+    }
+
+    /// The part of the graph the reconcile is keyed on and must never change:
+    /// every node, every `ref/*` edge with its provenance, and every call site.
+    ///
+    /// Narrower than `graph_fingerprint` on purpose. Repeated `--force` passes
+    /// are not byte-stable on Phase A's speculative import `resolves-to` edges
+    /// (a pre-existing property of the purge-and-restage path, unrelated to
+    /// #811), and comparing those would make this test about that instead.
+    fn semantic_fingerprint(db_path: &std::path::Path) -> (Vec<String>, Vec<String>, i64) {
+        let store = travsr_store::SqliteStore::open(db_path).unwrap();
+        let mut refs: Vec<String> = store
+            .all_edges()
+            .unwrap()
+            .into_iter()
+            .filter(|(_, _, kind, _)| kind.starts_with("ref/"))
+            .map(|(s, d, k, p)| format!("{}|{}|{k}|{p}", s.0, d.0))
+            .collect();
+        refs.sort();
+        let sites: i64 = rusqlite::Connection::open(db_path)
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM edge_sites", [], |r| r.get(0))
+            .unwrap();
+        (store.node_fingerprint().unwrap(), refs, sites)
+    }
+
+    /// `travsr init --semantic [--force]`, exactly as `crates/travsr-cli/src/init.rs`
+    /// drives it. `init_repo` would defer Phase B to the daemon and never reach the
+    /// inline path under test.
+    fn init_semantic(root: &std::path::Path, force: bool) {
+        disable_registry();
+        let r = init_repo_with_progress(root, None, true, force, &mut |_| {});
+        r.expect("init_repo_with_progress(semantic = true)");
+    }
+
+    /// The original `caller.ts`. Line 4's `notify()` is the #811 shape: the two
+    /// lanes disagree about it by design. `notify` is a parameter of `run`, so
+    /// the precision-first live lane refuses the repo-wide lookup (section 7.3
+    /// step 1: a locally bound bare identifier is not a free reference) and
+    /// records `pending`; Phase B's recall-biased resolver has no such gate and,
+    /// finding exactly one `fn:notify` in the repo, records a call site at that
+    /// line. A pending row with a site beside it is exactly what the issue
+    /// sampled. Line 5's `frobnicate()` has no definition anywhere, so nothing
+    /// ever resolves it: the genuine abstention that must survive every pass.
+    const CALLER_TS: &str = "import { Billing } from \"./billing\";\n\
+                             export function run(bill: Billing, notify: () => void): void {\n\
+                             \x20 bill.charge();\n\
+                             \x20 notify();\n\
+                             \x20 frobnicate();\n\
+                             }\n";
+    const NOTIFY_LINE: u32 = 4;
+    const FROBNICATE_LINE: u32 = 5;
+
+    /// A committed TypeScript repo with the fixture above, fully indexed by
+    /// `travsr init --semantic`. Returns the root, the database, the corpus and
+    /// the id of `run`, the enclosing definition every row in the test hangs off.
+    fn repo_with_a_shadowed_call() -> (
+        tempfile::TempDir,
+        std::path::PathBuf,
+        String,
+        travsr_core::NodeId,
+    ) {
+        let tmp = tempfile::tempdir().unwrap();
+        git_init(tmp.path());
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+        std::fs::write(
+            tmp.path().join("src/billing.ts"),
+            "export class Billing {\n  charge(): void {}\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join("src/notify.ts"),
+            "export function notify(): void {}\n",
+        )
+        .unwrap();
+        std::fs::write(tmp.path().join("src/caller.ts"), CALLER_TS).unwrap();
+        git_commit_all(tmp.path(), "seed");
+
+        init_semantic(tmp.path(), false);
+
+        let db_path = tmp.path().join(".travsr/graph.db");
+        let store = travsr_store::SqliteStore::open(&db_path).unwrap();
+        let corpus = store.get_meta("corpus").unwrap().unwrap_or_default();
+        let run = store
+            .enclosing_definition_at(&corpus, "src/caller.ts", NOTIFY_LINE)
+            .unwrap()
+            .expect("`run` must enclose line 4");
+        assert_eq!(
+            meta(&db_path, "phase_b_commit"),
+            meta(&db_path, "last_commit"),
+            "precondition: init --semantic must leave Phase B current"
+        );
+        assert!(
+            raw_edge_site_exists(&db_path, run, NOTIFY_LINE),
+            "precondition: Phase B must record a call site for `notify()`, or there is \
+             nothing for the live lane's abstention to go stale against"
+        );
+        assert!(
+            !raw_edge_site_exists(&db_path, run, FROBNICATE_LINE),
+            "precondition: nothing may resolve `frobnicate`, or the negative case is vacuous"
+        );
+        (tmp, db_path, corpus, run)
+    }
+
+    /// Steps 2 and 3 of the #811 repro. The daemon is up: a save lands, Phase A
+    /// re-indexes the file (dropping its `edge_sites`) and the live lane records
+    /// what it saw, abstaining on `notify` and `frobnicate`. Then the edit is
+    /// reverted on disk with the daemon stopped, so nothing re-processes the
+    /// file. Returns the id of the function the edit added, whose rows are now
+    /// orphans.
+    fn edit_overlay_and_revert(
+        tmp: &tempfile::TempDir,
+        db_path: &std::path::Path,
+        corpus: &str,
+        run: travsr_core::NodeId,
+    ) -> travsr_core::NodeId {
+        let caller = tmp.path().join("src/caller.ts");
+        let mut edited = CALLER_TS.to_string();
+        edited.push_str("\nexport function again(bill: Billing): void {\n  bill.charge();\n}\n");
+        std::fs::write(&caller, &edited).unwrap();
+        let again = {
+            let mut store = travsr_store::SqliteStore::open(db_path).unwrap();
+            reindex_files(std::slice::from_ref(&caller), tmp.path(), &mut store).unwrap();
+            live_resolve_file(&mut store, corpus, tmp.path(), &caller, None);
+            store
+                .enclosing_definition_at(corpus, "src/caller.ts", 9)
+                .unwrap()
+                .expect("`again` must enclose line 9 after the save")
+        };
+        assert!(
+            raw_has_row(db_path, run, NOTIFY_LINE, "notify"),
+            "precondition: the live lane must abstain on the locally bound call"
+        );
+        assert!(
+            raw_has_row(db_path, run, FROBNICATE_LINE, "frobnicate"),
+            "precondition: the live lane must abstain on the undefined call"
+        );
+        assert!(
+            !raw_edge_site_exists(db_path, run, NOTIFY_LINE),
+            "precondition: the save dropped the file's call sites, so at this point \
+             the pending row is honest"
+        );
+
+        // The revert, with the daemon stopped.
+        std::fs::write(&caller, CALLER_TS).unwrap();
+        again
+    }
+
+    /// Positive 5, the #811 reproduction. After `travsr init --semantic --force`
+    /// the rebuilt graph resolves line 4 (a call site is recorded), so the live
+    /// lane's `pending` row for it is stale and must go; the row for line 5,
+    /// which nothing resolves, must stay; and the rows of the function the
+    /// revert removed are orphans and must go too. Before the fix the CLI path
+    /// never reconciled, so the stale row survived with the site beside it.
+    #[test]
+    fn a_full_semantic_rebuild_retires_the_pending_rows_it_resolved() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (tmp, db_path, corpus, run) = repo_with_a_shadowed_call();
+        let again = edit_overlay_and_revert(&tmp, &db_path, &corpus, run);
+        let pending_before = raw_pending_count(&db_path);
+        assert!(pending_before >= 2, "precondition: got {pending_before}");
+
+        // Step 4: the full rebuild.
+        init_semantic(tmp.path(), true);
+
+        // The graph is right: Phase B current, no live overlay, `run` still
+        // there under the same id, `again` gone with the revert.
+        let store = travsr_store::SqliteStore::open(&db_path).unwrap();
+        assert_eq!(
+            meta(&db_path, "phase_b_commit"),
+            meta(&db_path, "last_commit")
+        );
+        assert_ne!(meta(&db_path, "phase_b_dirty").as_deref(), Some("1"));
+        assert_eq!(store.count_edges_with_provenance("live").unwrap(), 0);
+        assert_eq!(
+            store
+                .enclosing_definition_at(&corpus, "src/caller.ts", NOTIFY_LINE)
+                .unwrap(),
+            Some(run),
+            "a full rebuild must reproduce `run` under the same id"
+        );
+        assert!(
+            store.get_node(again).unwrap().is_none(),
+            "the revert removed `again`"
+        );
+        assert!(
+            raw_edge_site_exists(&db_path, run, NOTIFY_LINE),
+            "the rebuilt graph resolves line 4: this is the site the pending row is stale against"
+        );
+
+        // The table agrees with the graph.
+        assert!(
+            !raw_has_row(&db_path, run, NOTIFY_LINE, "notify"),
+            "a pending row Phase B has recorded a call site for must not survive \
+             `init --semantic --force` (#811)"
+        );
+        assert!(
+            !raw_has_row(&db_path, again, 9, "charge"),
+            "rows of a definition the revert removed are orphans and must go"
+        );
+        assert!(
+            raw_has_row(&db_path, run, FROBNICATE_LINE, "frobnicate"),
+            "the genuine unresolved reference must stay pending"
+        );
+        assert_eq!(
+            raw_pending_count(&db_path),
+            1,
+            "exactly the one honest abstention remains"
+        );
+        assert_eq!(
+            store.pending_ref_count().unwrap(),
+            1,
+            "the count the freshness note shows agrees with the raw table"
+        );
+    }
+
+    /// Positive 6: repeated full rebuilds are stable. A second and third
+    /// `--force` must not reintroduce stale rows, change the pending count, or
+    /// change the graph.
+    #[test]
+    fn repeated_full_rebuilds_keep_the_pending_count_stable() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (tmp, db_path, corpus, run) = repo_with_a_shadowed_call();
+        edit_overlay_and_revert(&tmp, &db_path, &corpus, run);
+
+        init_semantic(tmp.path(), true);
+        let after_first = (raw_pending_count(&db_path), semantic_fingerprint(&db_path));
+        assert_eq!(
+            after_first.0, 1,
+            "precondition: the first rebuild reconciled"
+        );
+
+        for pass in 2..=3 {
+            init_semantic(tmp.path(), true);
+            assert_eq!(
+                raw_pending_count(&db_path),
+                after_first.0,
+                "rebuild {pass} changed the pending count"
+            );
+            assert!(
+                raw_has_row(&db_path, run, FROBNICATE_LINE, "frobnicate"),
+                "rebuild {pass} lost the genuine abstention"
+            );
+            assert!(
+                !raw_has_row(&db_path, run, NOTIFY_LINE, "notify"),
+                "rebuild {pass} reintroduced the stale row"
+            );
+            assert_eq!(
+                semantic_fingerprint(&db_path),
+                after_first.1,
+                "rebuild {pass} changed the nodes, the ref edges or the call sites"
+            );
+        }
+        // And the table is now a fixed point of the reconcile itself.
+        let mut store = travsr_store::SqliteStore::open(&db_path).unwrap();
+        assert_eq!(
+            store.reconcile_ref_resolution_states().unwrap(),
+            travsr_store::RefReconcileReport::default()
+        );
+    }
+
+    /// The state a pre-fix session leaves behind, on a current index: pending
+    /// rows whose call sites Phase B has already recorded. The live lane runs
+    /// over the unchanged file, so its abstentions land beside the sites init's
+    /// Phase B wrote, and nothing is armed because `phase_b_commit` is at HEAD.
+    fn stale_rows_on_a_current_index(
+        tmp: &tempfile::TempDir,
+        db_path: &std::path::Path,
+        corpus: &str,
+        run: travsr_core::NodeId,
+    ) {
+        let caller = tmp.path().join("src/caller.ts");
+        let mut store = travsr_store::SqliteStore::open(db_path).unwrap();
+        live_resolve_file(&mut store, corpus, tmp.path(), &caller, None);
+        assert!(
+            raw_has_row(db_path, run, NOTIFY_LINE, "notify"),
+            "precondition"
+        );
+        assert!(
+            raw_has_row(db_path, run, FROBNICATE_LINE, "frobnicate"),
+            "precondition"
+        );
+        assert!(
+            raw_edge_site_exists(db_path, run, NOTIFY_LINE),
+            "precondition: the stale shape is a pending row with a site beside it"
+        );
+        assert_eq!(
+            meta(db_path, "phase_b_commit"),
+            meta(db_path, "last_commit"),
+            "precondition: the index is current, so no Phase B is due"
+        );
+    }
+
+    /// Positive 7: a daemon restarted on a current index has no Phase B to run
+    /// and so never reaches ratification. Its startup reconcile must retire the
+    /// stale rows anyway, without touching the graph or triggering a rebuild.
+    #[test]
+    fn a_daemon_restart_on_a_current_index_reconciles_without_a_rebuild() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (tmp, db_path, corpus, run) = repo_with_a_shadowed_call();
+        stale_rows_on_a_current_index(&tmp, &db_path, &corpus, run);
+        let before = graph_fingerprint(&db_path);
+        let marker_before = meta(&db_path, "phase_b_commit");
+
+        // What the daemon does on startup, in order: open the store through the
+        // same helper `run` uses (which reconciles), then let the scheduler
+        // decide whether Phase B is due.
+        let store = open_daemon_store(&db_path).unwrap();
+        let sched = phase_b_sched::PhaseBScheduler::new(std::time::Duration::from_secs(30));
+        arm_phase_b_if_pending(&store, &sched);
+        assert!(
+            !sched.try_claim(),
+            "a current index must not arm a Phase B run: the reconcile is not a rebuild"
+        );
+        // Even if a tick did claim a run, the worker returns before any work.
+        assert_eq!(
+            run_background_phase_b_inner(tmp.path(), &store),
+            phase_b_sched::RunOutcome::Success
+        );
+        drop(store);
+
+        assert!(
+            !raw_has_row(&db_path, run, NOTIFY_LINE, "notify"),
+            "the stale row must not survive a daemon restart (#811)"
+        );
+        assert!(
+            raw_has_row(&db_path, run, FROBNICATE_LINE, "frobnicate"),
+            "the genuine abstention must survive it"
+        );
+        assert_eq!(raw_pending_count(&db_path), 1);
+        assert_eq!(
+            graph_fingerprint(&db_path),
+            before,
+            "no graph work may happen"
+        );
+        assert_eq!(meta(&db_path, "phase_b_commit"), marker_before);
+    }
+
+    /// Positive 8: the path that always reconciled still does, through the
+    /// shared helper: a resolved pending row goes, a genuine one stays, and an
+    /// orphan is purged, exactly as before the refactor.
+    #[test]
+    fn daemon_ratification_still_reconciles_pending_rows() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (tmp, db_path, corpus, run) = repo_with_a_shadowed_call();
+        stale_rows_on_a_current_index(&tmp, &db_path, &corpus, run);
+        // A row whose enclosing symbol no longer exists (a rename retired its id).
+        let ghost = travsr_core::NodeId(0xDEAD_BEEF);
+        {
+            let mut store = travsr_store::SqliteStore::open(&db_path).unwrap();
+            store
+                .upsert_ref_resolution_states(&[travsr_store::RefResolution {
+                    src: ghost,
+                    ref_line: 1,
+                    ref_col: 0,
+                    name: "gone".to_string(),
+                    state: "pending",
+                    resolved_dst: None,
+                }])
+                .unwrap();
+        }
+        assert_eq!(raw_pending_count(&db_path), 3, "precondition");
+
+        {
+            let mut store = travsr_store::SqliteStore::open(&db_path).unwrap();
+            ratify_live_overlay(&mut store, &["typescript".to_string()]);
+        }
+
+        assert!(
+            !raw_has_row(&db_path, run, NOTIFY_LINE, "notify"),
+            "resolved pending"
+        );
+        assert!(!raw_has_row(&db_path, ghost, 1, "gone"), "orphan");
+        assert!(
+            raw_has_row(&db_path, run, FROBNICATE_LINE, "frobnicate"),
+            "genuine"
+        );
+        assert_eq!(raw_pending_count(&db_path), 1);
+    }
+
+    /// The daemon's store-open path itself (`run` has no other), on a graph.db
+    /// holding one stale pending row, one genuine one and one orphan. Guards the
+    /// startup half of #811 at the point `run` depends on: remove the reconcile
+    /// from `open_daemon_store` and this fails.
+    #[test]
+    fn opening_the_daemon_store_reconciles_stale_rows() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".travsr")).unwrap();
+        let db_path = tmp.path().join(".travsr/graph.db");
+        let (caller, ghost) = {
+            let mut store = travsr_store::SqliteStore::open(&db_path).unwrap();
+            store.set_meta("last_commit", "abc123").unwrap();
+            store.set_meta("phase_b_commit", "abc123").unwrap();
+            let caller = travsr_core::Node::new(
+                travsr_core::VName::new("c", "", "src/a.ts", "typescript", "fn:caller"),
+                "function",
+            );
+            let callee = travsr_core::Node::new(
+                travsr_core::VName::new("c", "", "src/b.ts", "typescript", "fn:callee"),
+                "function",
+            );
+            store.put_node(&caller).unwrap();
+            store.put_node(&callee).unwrap();
+            store
+                .record_edge_sites(&[(caller.id, callee.id, 3, None)])
+                .unwrap();
+            let ghost = travsr_core::NodeId(0xDEAD_BEEF);
+            let row = |src, line, name: &str| travsr_store::RefResolution {
+                src,
+                ref_line: line,
+                ref_col: 0,
+                name: name.to_string(),
+                state: "pending",
+                resolved_dst: None,
+            };
+            store
+                .upsert_ref_resolution_states(&[
+                    row(caller.id, 3, "callee"),  // stale: a site exists on line 3
+                    row(caller.id, 7, "mystery"), // genuine: no site on line 7
+                    row(ghost, 1, "gone"),        // orphan: no such node
+                ])
+                .unwrap();
+            (caller.id, ghost)
+        };
+        assert_eq!(raw_pending_count(&db_path), 3, "precondition");
+
+        let store = open_daemon_store(&db_path).expect("the daemon's store open");
+        drop(store);
+
+        assert!(!raw_has_row(&db_path, caller, 3, "callee"), "stale row");
+        assert!(!raw_has_row(&db_path, ghost, 1, "gone"), "orphan row");
+        assert!(raw_has_row(&db_path, caller, 7, "mystery"), "genuine row");
+        assert_eq!(raw_pending_count(&db_path), 1);
+    }
+
+    /// Negative 14: the reconcile does not depend on Phase B work existing. With
+    /// `phase_b_commit` already at `last_commit` and nothing to rebuild, the
+    /// startup pass alone brings the table in line with the graph.
+    #[test]
+    fn startup_reconcile_needs_no_phase_b_work() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("graph.db");
+        let (caller, callee) = {
+            let mut store = travsr_store::SqliteStore::open(&db_path).unwrap();
+            store.set_meta("last_commit", "abc123").unwrap();
+            store.set_meta("phase_b_commit", "abc123").unwrap();
+            let caller = travsr_core::Node::new(
+                travsr_core::VName::new("c", "", "src/a.ts", "typescript", "fn:caller"),
+                "function",
+            );
+            let callee = travsr_core::Node::new(
+                travsr_core::VName::new("c", "", "src/b.ts", "typescript", "fn:callee"),
+                "function",
+            );
+            store.put_node(&caller).unwrap();
+            store.put_node(&callee).unwrap();
+            store
+                .put_edge(&travsr_core::Edge::new(
+                    caller.id,
+                    callee.id,
+                    travsr_core::EdgeKind::RefCall,
+                ))
+                .unwrap();
+            store
+                .record_edge_sites(&[(caller.id, callee.id, 3, None)])
+                .unwrap();
+            let row = |line, name: &str| travsr_store::RefResolution {
+                src: caller.id,
+                ref_line: line,
+                ref_col: 0,
+                name: name.to_string(),
+                state: "pending",
+                resolved_dst: None,
+            };
+            store
+                .upsert_ref_resolution_states(&[row(3, "callee"), row(7, "mystery")])
+                .unwrap();
+            (caller.id, callee.id)
+        };
+        assert_eq!(raw_pending_count(&db_path), 2, "precondition");
+        let edges_before = travsr_store::SqliteStore::open(&db_path)
+            .unwrap()
+            .edge_count()
+            .unwrap();
+
+        let store = std::sync::Mutex::new(travsr_store::SqliteStore::open(&db_path).unwrap());
+        // Nothing is due, so the scheduler stays idle...
+        let sched = phase_b_sched::PhaseBScheduler::new(std::time::Duration::from_secs(30));
+        arm_phase_b_if_pending(&store, &sched);
+        assert!(!sched.try_claim());
+        // ...and the startup reconcile is the only thing that runs.
+        reconcile_ref_resolution_states_on_startup(&store);
+        // Twice, to show the second pass is a no-op.
+        reconcile_ref_resolution_states_on_startup(&store);
+        drop(store);
+
+        assert!(!raw_has_row(&db_path, caller, 3, "callee"));
+        assert!(raw_has_row(&db_path, caller, 7, "mystery"));
+        assert_eq!(raw_pending_count(&db_path), 1);
+        let store = travsr_store::SqliteStore::open(&db_path).unwrap();
+        assert_eq!(store.edge_count().unwrap(), edges_before);
+        assert!(store.get_node(callee).unwrap().is_some());
+        assert_eq!(meta(&db_path, "phase_b_commit").as_deref(), Some("abc123"));
+    }
+
     /// `ratified_languages` maps analyzer names onto how nodes are labeled.
     #[test]
     fn ratified_languages_maps_javascript_and_the_lsif_pass_onto_typescript() {
@@ -10134,6 +11324,37 @@ mod tests {
             paths.contains("drafts/important.md"),
             "important.md must be re-included by the negation rule"
         );
+    }
+
+    /// #827: nothing tied `DEFAULT_TRAVSRIGNORE_RULE_COUNT` to the string it
+    /// counts, so `init`'s summary line silently drifted whenever a rule was
+    /// added. Also pins `Pods/`, the rule the issue was actually about, and
+    /// asserts no rule duplicates a hard `SKIP_DIRS` name (those are dropped
+    /// before `.travsrignore` is read, so listing them here is dead and falsely
+    /// advertises them as negatable).
+    #[test]
+    fn travsrignore_scaffold_matches_its_rule_count() {
+        let rules: Vec<&str> = DEFAULT_TRAVSRIGNORE
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && !l.starts_with('#'))
+            .collect();
+        assert_eq!(
+            rules.len(),
+            DEFAULT_TRAVSRIGNORE_RULE_COUNT,
+            "DEFAULT_TRAVSRIGNORE_RULE_COUNT must equal the rules in the scaffold: {rules:?}"
+        );
+        assert!(
+            rules.contains(&"Pods/"),
+            "CocoaPods must stay excluded on iOS repos: {rules:?}"
+        );
+        for rule in &rules {
+            let name = rule.trim_end_matches('/');
+            assert!(
+                !crate::watcher::SKIP_DIRS.contains(&name),
+                "`{rule}` is already a hard SKIP_DIRS entry, so this rule is dead"
+            );
+        }
     }
 
     /// #376 W1: `travsr init` deliberately skips `embed_text` generation (it
@@ -11342,6 +12563,218 @@ mod tests {
         assert!(flag.load(std::sync::atomic::Ordering::Relaxed));
     }
 
+    // ── #862: Phase 2 must be computed from the eligible embedded count ───────
+
+    /// The arithmetic in isolation. Same graph, two readings of `embedded`: the
+    /// unfiltered one the store used to return, and the filtered one it returns
+    /// now. Ten Phase 2 nodes are genuinely pending in both.
+    #[test]
+    fn phase2_remaining_is_masked_by_an_inflated_embedded_count() {
+        // total 100, phase1 10/10 done, 80 of 90 Phase 2 nodes embedded.
+        assert_eq!(phase2_remaining(100, 90, 10, 10), 10);
+        // Twenty vectors on ineligible nodes, counted: the saturation swallows
+        // the ten real ones and the tick believes Phase 2 is complete.
+        assert_eq!(phase2_remaining(100, 110, 10, 10), 0);
+        // And with a smaller inflation it under-reports rather than zeroes.
+        assert_eq!(phase2_remaining(100, 95, 10, 10), 5);
+        // Nothing embedded yet, and the empty graph.
+        assert_eq!(phase2_remaining(100, 0, 10, 0), 90);
+        assert_eq!(phase2_remaining(0, 0, 0, 0), 0);
+    }
+
+    /// The #862 graph on disk: 100 eligible nodes (10 core at shell 5, all
+    /// embedded; 90 at shell 0, 80 embedded), 20 `field` nodes with no
+    /// `embed_text` that carry vectors anyway, a backend configured, Phase B
+    /// complete. Returns the repo, the store and the raw model-scoped vector
+    /// count in embed.db.
+    fn repo_with_inflated_embeddings() -> (tempfile::TempDir, travsr_store::SqliteStore, i64) {
+        const MODEL: &str = "test-model-862";
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".travsr")).unwrap();
+        travsr_plugin_host::write_repo_backend_id(tmp.path(), MODEL).unwrap();
+        let db_path = tmp.path().join(".travsr/graph.db");
+        let mut store = travsr_store::SqliteStore::open(&db_path).unwrap();
+        set_phase_b_complete(&mut store, "abc123");
+
+        let node = |kind: &str, sig: String| {
+            travsr_core::Node::new(
+                travsr_core::VName::new("c", "", "src/lib.ts", "typescript", sig),
+                kind,
+            )
+        };
+        let mut shells = Vec::new();
+        let mut rows: Vec<i64> = Vec::new();
+        for i in 0..10 {
+            let n = node("function", format!("fn:core{i}"));
+            store.put_node(&n).unwrap();
+            shells.push((n.id, 5));
+            rows.push(n.id.0 as i64);
+        }
+        for i in 0..90 {
+            let n = node("function", format!("fn:leaf{i}"));
+            store.put_node(&n).unwrap();
+            shells.push((n.id, 0));
+            if i < 80 {
+                rows.push(n.id.0 as i64);
+            }
+        }
+        for i in 0..20 {
+            let n = node("field", format!("field:T.f{i}"));
+            store.put_node(&n).unwrap();
+            rows.push(n.id.0 as i64);
+        }
+        store.write_shell_numbers(&shells).unwrap();
+
+        let embed_db = tmp.path().join(".travsr/embed.db");
+        let conn = rusqlite::Connection::open(&embed_db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE node_embeddings (
+                 node_id   INTEGER NOT NULL,
+                 model_id  TEXT    NOT NULL,
+                 embedding BLOB    NOT NULL,
+                 text_hash TEXT,
+                 PRIMARY KEY (node_id, model_id)
+             ) WITHOUT ROWID;
+             CREATE INDEX idx_node_embeddings_model ON node_embeddings(model_id);",
+        )
+        .unwrap();
+        for id in &rows {
+            conn.execute(
+                "INSERT INTO node_embeddings (node_id, model_id, embedding) VALUES (?1, ?2, X'00')",
+                rusqlite::params![id, MODEL],
+            )
+            .unwrap();
+        }
+        let raw: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM node_embeddings WHERE model_id = ?1",
+                rusqlite::params![MODEL],
+                |r| r.get(0),
+            )
+            .unwrap();
+        (tmp, store, raw)
+    }
+
+    /// The critical integration case. Before the fix the tick read `embedded =
+    /// 110`, computed `phase2_remaining = 0`, latched `phase2_spawned` and never
+    /// launched Phase 2 while ten nodes had no vector. Now it reads 90, computes
+    /// 10, and attempts the spawn. No sidecar is installed for the test model,
+    /// so the attempt fails and the flag stays false: a false flag after the
+    /// tick is what "Phase 2 was not suppressed" looks like here, and a true one
+    /// is exactly the suppression.
+    #[test]
+    fn embed_tick_does_not_suppress_phase2_because_of_ineligible_vectors() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (tmp, store, raw_vectors) = repo_with_inflated_embeddings();
+        let db_path = tmp.path().join(".travsr/graph.db");
+        assert_eq!(
+            raw_vectors, 110,
+            "precondition: the unfiltered count is inflated"
+        );
+
+        // The threshold the tick derives from this k-core distribution.
+        let threshold =
+            travsr_plugin_host::derive_phase1_threshold_for_status(&db_path).unwrap_or(3);
+        assert_eq!(threshold, 5, "precondition: the 10 core nodes are Phase 1");
+        let progress = store.embed_progress("test-model-862", threshold).unwrap();
+        assert_eq!(
+            progress,
+            (100, 90, 10, 10),
+            "embedded is the eligible count, Phase 1 is complete"
+        );
+        let (total, embedded, p1_total, p1_done) = progress;
+        assert_eq!(phase2_remaining(total, embedded, p1_total, p1_done), 10);
+        assert_eq!(
+            phase2_remaining(total, raw_vectors as u64, p1_total, p1_done),
+            0,
+            "the unfiltered count would have concluded Phase 2 was complete"
+        );
+
+        let store = std::sync::Mutex::new(store);
+        let phase2_spawned = std::sync::atomic::AtomicBool::new(false);
+        maybe_spawn_embed(tmp.path(), &store, &phase2_spawned);
+        assert!(
+            !phase2_spawned.load(std::sync::atomic::Ordering::Relaxed),
+            "the tick must try to launch Phase 2 (and fail for want of a sidecar), \
+             not latch it as complete on the strength of ineligible vectors"
+        );
+
+        // Nothing about the graph or the vectors changed to get there.
+        let s = store.lock().unwrap();
+        assert_eq!(
+            s.embed_progress("test-model-862", threshold).unwrap(),
+            progress
+        );
+        let still: i64 = rusqlite::Connection::open(tmp.path().join(".travsr/embed.db"))
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM node_embeddings", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            still, 110,
+            "ineligible vectors are not deleted to fix the count"
+        );
+    }
+
+    /// The control for the test above: when Phase 2 genuinely is complete, the
+    /// tick still latches the flag, so the corrected count did not simply make
+    /// the tick spawn unconditionally.
+    #[test]
+    fn embed_tick_still_latches_phase2_when_every_eligible_node_is_embedded() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (tmp, store, _) = repo_with_inflated_embeddings();
+        // Embed the ten leaf nodes that were missing.
+        let missing: Vec<i64> = {
+            let conn = rusqlite::Connection::open(tmp.path().join(".travsr/graph.db")).unwrap();
+            let all: Vec<i64> = {
+                let mut st = conn
+                    .prepare("SELECT id FROM nodes WHERE kind = 'function'")
+                    .unwrap();
+                st.query_map([], |r| r.get(0))
+                    .unwrap()
+                    .map(|r| r.unwrap())
+                    .collect()
+            };
+            let edb = rusqlite::Connection::open(tmp.path().join(".travsr/embed.db")).unwrap();
+            all.into_iter()
+                .filter(|id| {
+                    !edb.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM node_embeddings WHERE node_id = ?1)",
+                        rusqlite::params![id],
+                        |r| r.get::<_, bool>(0),
+                    )
+                    .unwrap()
+                })
+                .collect()
+        };
+        assert_eq!(missing.len(), 10, "precondition");
+        {
+            let edb = rusqlite::Connection::open(tmp.path().join(".travsr/embed.db")).unwrap();
+            for id in &missing {
+                edb.execute(
+                    "INSERT INTO node_embeddings (node_id, model_id, embedding) VALUES (?1, 'test-model-862', X'00')",
+                    rusqlite::params![id],
+                )
+                .unwrap();
+            }
+        }
+        let threshold = travsr_plugin_host::derive_phase1_threshold_for_status(
+            &tmp.path().join(".travsr/graph.db"),
+        )
+        .unwrap_or(3);
+        assert_eq!(
+            store.embed_progress("test-model-862", threshold).unwrap(),
+            (100, 100, 10, 10)
+        );
+
+        let store = std::sync::Mutex::new(store);
+        let phase2_spawned = std::sync::atomic::AtomicBool::new(false);
+        maybe_spawn_embed(tmp.path(), &store, &phase2_spawned);
+        assert!(
+            phase2_spawned.load(std::sync::atomic::Ordering::Relaxed),
+            "with every eligible node embedded, Phase 2 is complete and the flag latches"
+        );
+    }
+
     #[test]
     fn embed_reindex_in_flight_reflects_idle_state() {
         // With no sidecar currently running, the in-flight flag must be false.
@@ -11725,9 +13158,9 @@ impl Daemon {
         }
 
         let db_path = travsr_dir.join("graph.db");
-        let store = Arc::new(Mutex::new(
-            SqliteStore::open(&db_path).context("opening graph.db")?,
-        ));
+        // Opens graph.db and runs the #811 startup reconcile; see
+        // `open_daemon_store` for why the two are one step.
+        let store = open_daemon_store(&db_path)?;
         // R5 (#342): separate read-only connection so Query messages do not
         // hold the write mutex while the indexer worker needs it.
         let read_store = Arc::new(Mutex::new(
