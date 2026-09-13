@@ -5886,7 +5886,7 @@ mod tests {
         use tracing_subscriber::layer::{Layer as _, SubscriberExt as _};
         use tracing_subscriber::EnvFilter;
 
-        let directive = filter_directive_for("error", travsr_config::LogFilterSource::Config);
+        let directive = filter_directive_for("error");
         // A layer that records what actually reached it, so this asserts on the
         // events a subscriber receives rather than on the directive string.
         #[derive(Clone, Default)]
@@ -13184,37 +13184,36 @@ impl Daemon {
         // level for a file that identifies itself. `shortTarget` in the
         // extension splits on `::`, so this still renders as `daemon`.
         //
-        // Not appended when RUST_LOG chose the directive: that is the expert
-        // escape hatch and is passed through exactly as written. Readers tell
-        // the two apart by `log_level_from`, not by trying to parse the value.
+        // Appended whatever chose the directive, `RUST_LOG` included. Exempting
+        // the escape hatch reintroduced the stale-session bug through the one
+        // path that opted out: under `RUST_LOG=warn` no session line was
+        // written, so a reader found a previous session's line and believed it.
+        // Readers tell a `RUST_LOG` run apart by `log_level_from`, which needs
+        // a line to be written at all.
         //
         // What is reported is what was INSTALLED, not what was resolved. A
         // malformed RUST_LOG falls back, and reporting the resolved pair there
         // would have the line name a level the process is not filtering at. The
         // fallback also has to go back through `filter_directive_for`, or it
         // silently drops the session exemption the rest of this depends on.
-        let (env_filter, log_directive, log_source) = match tracing_subscriber::EnvFilter::try_new(
-            filter_directive_for(&log_directive, log_source),
-        ) {
-            Ok(filter) => (filter, log_directive, log_source),
-            Err(_) => {
-                let fallback = filter_directive_for(
-                    travsr_config::DEFAULT_LOG_LEVEL,
-                    travsr_config::LogFilterSource::Default,
-                );
-                // Built from constants this crate owns, so it parses; the
-                // `unwrap_or_else` keeps that from being an assertion.
-                let filter =
-                    tracing_subscriber::EnvFilter::try_new(&fallback).unwrap_or_else(|_| {
-                        tracing_subscriber::EnvFilter::new(travsr_config::DEFAULT_LOG_LEVEL)
-                    });
-                (
-                    filter,
-                    travsr_config::DEFAULT_LOG_LEVEL.to_string(),
-                    travsr_config::LogFilterSource::Default,
-                )
-            }
-        };
+        let (env_filter, log_directive, log_source) =
+            match tracing_subscriber::EnvFilter::try_new(filter_directive_for(&log_directive)) {
+                Ok(filter) => (filter, log_directive, log_source),
+                Err(_) => {
+                    let fallback = filter_directive_for(travsr_config::DEFAULT_LOG_LEVEL);
+                    // Built from constants this crate owns, so it parses; the
+                    // `unwrap_or_else` keeps that from being an assertion.
+                    let filter =
+                        tracing_subscriber::EnvFilter::try_new(&fallback).unwrap_or_else(|_| {
+                            tracing_subscriber::EnvFilter::new(travsr_config::DEFAULT_LOG_LEVEL)
+                        });
+                    (
+                        filter,
+                        travsr_config::DEFAULT_LOG_LEVEL.to_string(),
+                        travsr_config::LogFilterSource::Default,
+                    )
+                }
+            };
         // JSON lines on disk. One line is one object, so every field is named
         // and typed rather than recovered by guessing at column positions, and
         // `jq`, Loki and Datadog all read it as-is. Nobody is asked to read JSON:
@@ -14473,20 +14472,26 @@ fn live_editor_sessions(
     live
 }
 
-/// The directive actually installed, given the resolved one and where it came
-/// from.
+/// The directive actually installed, given a resolved one.
 ///
 /// Appends the session target so `daemon.session.start` survives whatever level
-/// it reports (see [`SESSION_LOG_TARGET`]). Not appended for `RUST_LOG`, which
-/// is the expert escape hatch and is honoured exactly as written.
-pub(crate) fn filter_directive_for(
-    directive: &str,
-    source: travsr_config::LogFilterSource,
-) -> String {
-    match source {
-        travsr_config::LogFilterSource::RustLog => directive.to_string(),
-        _ => format!("{directive},{SESSION_LOG_TARGET}=trace"),
-    }
+/// it reports (see [`SESSION_LOG_TARGET`]).
+///
+/// Appended for `RUST_LOG` too, which it was not at first. The argument for
+/// exempting the escape hatch was that readers tell a `RUST_LOG` run apart by
+/// `log_level_from`, but that only holds if a line is written at all: under
+/// `RUST_LOG=warn` the daemon wrote no session line, so a reader landing on the
+/// same day's file found a *previous* session's line, believed it, and asked
+/// for a restart that could never clear, because every restart under that
+/// `RUST_LOG` writes no line either. That is precisely the stale-session bug
+/// the exemption exists to prevent, reintroduced through the one path that
+/// opted out of it.
+///
+/// One line per process start is a small enough imposition on an explicit
+/// `RUST_LOG` to be worth a file that always says what it is. Everything else
+/// in the directive is still honoured exactly as written.
+pub fn filter_directive_for(directive: &str) -> String {
+    format!("{directive},{SESSION_LOG_TARGET}=trace")
 }
 
 /// How long a query has to take before serving it is an event rather than

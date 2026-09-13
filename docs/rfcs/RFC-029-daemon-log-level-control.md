@@ -7,8 +7,8 @@
 **Implemented so far:** the `log.level` config key and its precedence, the
 daemon reading it at startup, the session line becoming exempt from the level it
 reports, the Health panel's Write control and its pending-restart note, and the
-Repositories expanders. 70 extension tests pass, 9 of them new; 18 `travsr-config`
-tests pass, 5 of them new.
+Repositories expanders. 72 extension tests pass, 11 of them new; 18
+`travsr-config` tests pass, 5 of them new; 246 in `travsr-daemon`, 3 of them new.
 
 ## Context
 
@@ -101,9 +101,20 @@ One line per daemon start is a price worth paying at any level for a file that
 identifies itself. The extension's `shortTarget` splits on `::`, so entries
 still render under `daemon` and the log view is unchanged.
 
-Not appended when `RUST_LOG` chose the directive: that is the expert escape
-hatch and is passed through exactly as written. A `RUST_LOG` directive is not a
-bare level, so the panel already declines to read an active level from it.
+Appended whatever chose the directive, `RUST_LOG` included. The first version
+exempted the escape hatch on the grounds that readers tell a `RUST_LOG` run
+apart by `log_level_from`, which is true but only if a line is written at all:
+under `RUST_LOG=warn` the daemon wrote no session line, a reader landing on the
+same day's file found a *previous* session's line, believed it, and asked for a
+restart that could never clear, because every restart under that `RUST_LOG`
+writes no line either. That is the exact bug this section exists to prevent,
+reintroduced through the one path that opted out of it. Everything else in an
+explicit `RUST_LOG` is still honoured as written; one line per process start is
+a small enough imposition for a file that always says what it is.
+
+The panel reads the active level only when `log_level_from` is `log.level` or
+`default`. Judging by the shape of the value instead was wrong for
+`RUST_LOG=debug`, which is what `daemon start --verbose` sets itself.
 
 The line carries two new fields:
 
@@ -270,8 +281,10 @@ was disclosure.
 and follows the same key, resolved at global scope, or one setting would be true
 of one file and not the other.
 
-`init --json` reports `phase_b: "partial"` where it previously said `complete`
-for a crashed analyzer. A visible change for anything keyed on that string.
+`travsr mcp --global`'s file follows the setting but deliberately not
+`RUST_LOG`, unlike the daemon's. That process is spawned by an editor, so its
+environment is not one a person chose for it, and honouring `RUST_LOG` there let
+an inherited value empty the durable log. `RUST_LOG` still governs its stderr.
 
 At `error` the only line a healthy daemon writes is its own session line. That
 is the point (the file says who wrote it and that it will stay quiet), but it

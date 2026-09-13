@@ -835,18 +835,6 @@ export function buildLanguageRows(
   });
 }
 
-/** Gather everything the Health page's sections need.
- *
- *  Each source is independent and every one of them can fail on its own: the
- *  daemon can be down while the CLI still answers, a binary can be too old for
- *  a tool, a config file can be missing. So each lands in its own field and a
- *  failure becomes `null`, which the page renders as "could not read this"
- *  rather than as a clean bill of health. Nothing here throws.
- *
- *  The spawns run together rather than in sequence: `lang list` alone takes
- *  about 17 seconds on Windows because it sweeps PATH per catalog language, and
- *  serialising four of those would make opening the panel feel broken.
- */
 /**
  * The level the daemon that wrote this log was actually filtering at, from its
  * own `daemon.session.start` line.
@@ -857,10 +845,10 @@ export function buildLanguageRows(
  * kept demanding a restart that had already happened.
  *
  * Empty when there is no session line in the window (a daemon that has not
- * started today, or one built before the field existed) and when the line
- * carries a `RUST_LOG` directive rather than a bare level: `travsr_daemon=debug`
- * is not comparable with a stored level, and pretending it is would make the
- * panel ask for a restart that would change nothing.
+ * started today, or one built before the field existed) and when the line did
+ * not come from the stored setting: a `RUST_LOG` run is not comparable with a
+ * stored level, and treating it as one would ask for a restart that changes
+ * nothing.
  */
 export function activeLogLevel(log: LogEntry[]): string {
   for (let i = log.length - 1; i >= 0; i -= 1) {
@@ -880,6 +868,18 @@ export function activeLogLevel(log: LogEntry[]): string {
   return "";
 }
 
+/** Gather everything the Health page's sections need.
+ *
+ *  Each source is independent and every one of them can fail on its own: the
+ *  daemon can be down while the CLI still answers, a binary can be too old for
+ *  a tool, a config file can be missing. So each lands in its own field and a
+ *  failure becomes `null`, which the page renders as "could not read this"
+ *  rather than as a clean bill of health. Nothing here throws.
+ *
+ *  The spawns run together rather than in sequence: `lang list` alone takes
+ *  about 17 seconds on Windows because it sweeps PATH per catalog language, and
+ *  serialising four of those would make opening the panel feel broken.
+ */
 export async function gatherHealth(
   client: McpClient,
   binary: string,
@@ -1117,9 +1117,19 @@ export async function gatherHealth(
   // (already looking at the newest) costs no extra read.
   const logLevelActive = (() => {
     const newest = logFiles.files[0];
-    const alreadyNewest =
-      newest === undefined || log.length === 0 || log[0]?.day === newest.day;
-    if (alreadyNewest || root === undefined) return activeLogLevel(log);
+    if (root === undefined || newest === undefined) return activeLogLevel(log);
+    const alreadyNewest = log.length === 0 || log[0]?.day === newest.day;
+    // Try the window already in hand first, but only accept a hit. `log` is
+    // built with the reader's `logLines` (default 500), so on a daemon that has
+    // written more than that since start the session line has fallen out of it
+    // and a miss means "not in this window", not "no session line". Answering
+    // "" there silently withheld the restart note from exactly the long-running
+    // daemons most likely to need it, so a miss re-reads the newest file at the
+    // full cap rather than concluding anything.
+    if (alreadyNewest) {
+      const fromWindow = activeLogLevel(log);
+      if (fromWindow !== "") return fromWindow;
+    }
     return activeLogLevel(readDaemonLogFile(root, newest.name, LOG_MAX_LINES));
   })();
 
@@ -2247,14 +2257,20 @@ export function registerShowGraphStats(
         );
         return;
       }
-      // A write that succeeded but changes nothing is not success either.
-      // `TRAVSR_LOG_LEVEL` outranks the repo file, so the value lands on disk
-      // and the daemon still uses the environment; saying "will be written at
-      // <level>" there would be the opposite of what happens.
-      const envOverride = process.env.TRAVSR_LOG_LEVEL;
-      if (envOverride !== undefined && envOverride.trim() !== "") {
+      // A write that succeeded but changes nothing is not success either. Both
+      // variables outrank the repo file, `RUST_LOG` over everything, so the
+      // value lands on disk and the daemon keeps using the environment. Saying
+      // "will be written at <level>" there is the opposite of what happens, and
+      // the restart it offers would change nothing. `cmd_set` warns about the
+      // same thing in a terminal; the panel has to as well, since a daemon it
+      // spawns inherits this process's environment.
+      const override_ = [
+        { name: "RUST_LOG", value: process.env.RUST_LOG },
+        { name: "TRAVSR_LOG_LEVEL", value: process.env.TRAVSR_LOG_LEVEL },
+      ].find((e) => e.value !== undefined && e.value.trim() !== "");
+      if (override_ !== undefined) {
         void vscode.window.showWarningMessage(
-          `Travsr: log.level is now ${msg.level}, but TRAVSR_LOG_LEVEL=${envOverride} is set in this environment and takes precedence. Unset it for the setting to take effect.`
+          `Travsr: log.level is now ${msg.level}, but ${override_.name}=${override_.value} is set in this environment and takes precedence. Unset it for the setting to take effect.`
         );
         return;
       }

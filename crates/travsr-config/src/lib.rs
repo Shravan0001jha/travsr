@@ -552,6 +552,21 @@ pub fn resolve_log_filter(repo_root: Option<&Path>) -> (String, LogFilterSource)
     decide_log_filter(rust_log.as_deref(), configured.as_deref())
 }
 
+/// The stored setting alone, with `RUST_LOG` deliberately not consulted.
+///
+/// For a durable file written by a process whose environment nobody chose: the
+/// global stdio MCP server is spawned by an editor, so an inherited `RUST_LOG`
+/// there is an accident of whoever launched the editor rather than an
+/// instruction about that file. Honouring it let `RUST_LOG=error` empty the
+/// log, and a per-target directive with no bare level disable every other
+/// target in it.
+///
+/// [`resolve_log_filter`] remains the right call for a process a person starts
+/// and whose stderr they are reading.
+pub fn resolve_log_level_setting(repo_root: Option<&Path>) -> (String, LogFilterSource) {
+    decide_log_filter(None, effective("log.level", repo_root).as_deref())
+}
+
 /// The precedence itself, with both inputs passed in.
 ///
 /// Split out from [`resolve_log_filter`] so it can be tested: the real function

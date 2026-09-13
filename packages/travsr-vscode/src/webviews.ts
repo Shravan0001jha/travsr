@@ -1816,39 +1816,37 @@ export function buildStatsHtml(
           // meant expanding a group would have had to duplicate it, and the two
           // copies would drift.
           const repoRow = (r: RepoRow): string => {
-            {
-                const active = r.name === health.activeRepo;
-                return row(
-                  r.name,
-                  // What was checked is whether the graph database is on disk,
-                  // nothing about the working tree. This said "ok", which reads
-                  // as a verdict on the repository and is more than the check
-                  // supports: a repo deleted months ago still says "ok" for as
-                  // long as its database survives in ~/.travsr.
-                  r.exists
-                    ? active
-                      ? "active"
-                      : "database present"
-                    : active
-                      ? "active, no database"
-                      : "database missing",
-                  r.exists ? "ok" : "warn",
-                  // No per-row Remove. This section reports which repositories
-                  // travsr knows about; the two bulk fixes in its header cover
-                  // what actually accumulates (entries whose database is gone,
-                  // and entries left by test runs), and the Repos panel keeps a
-                  // per-row remove for everything else. A destructive control
-                  // beside every row of a list you mostly read is a misclick
-                  // waiting to happen.
-                  "",
-                  // The tooltip carries the full name first: a name past the
-                  // key column wraps rather than being cut, but it is still the
-                  // thing you hover to read. The database path follows it,
-                  // because two checkouts can share a basename and the registry
-                  // shows nothing else to tell them apart.
-                  r.path ? `${r.name}\nGraph database: ${r.path}` : r.name
-                );
-            }
+            const active = r.name === health.activeRepo;
+            return row(
+              r.name,
+              // What was checked is whether the graph database is on disk,
+              // nothing about the working tree. This said "ok", which reads
+              // as a verdict on the repository and is more than the check
+              // supports: a repo deleted months ago still says "ok" for as
+              // long as its database survives in ~/.travsr.
+              r.exists
+                ? active
+                  ? "active"
+                  : "database present"
+                : active
+                  ? "active, no database"
+                  : "database missing",
+              r.exists ? "ok" : "warn",
+              // No per-row Remove. This section reports which repositories
+              // travsr knows about; the two bulk fixes in its header cover
+              // what actually accumulates (entries whose database is gone,
+              // and entries left by test runs), and the Repos panel keeps a
+              // per-row remove for everything else. A destructive control
+              // beside every row of a list you mostly read is a misclick
+              // waiting to happen.
+              "",
+              // The tooltip carries the full name first: a name past the
+              // key column wraps rather than being cut, but it is still the
+              // thing you hover to read. The database path follows it,
+              // because two checkouts can share a basename and the registry
+              // shows nothing else to tell them apart.
+              r.path ? `${r.name}\nGraph database: ${r.path}` : r.name
+            );
           };
           return (
             shown.map(repoRow).join("") +

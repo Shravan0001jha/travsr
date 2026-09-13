@@ -567,7 +567,7 @@ async fn async_main() {
         _ => None,
     };
     // Held for the process lifetime: dropping the guard closes the log.
-    let _log_guard = if is_daemon {
+    let log_guard = if is_daemon {
         None
     } else {
         init_tracing(global_log_dir.as_deref())
@@ -579,6 +579,14 @@ async fn async_main() {
     // closed early (e.g. `| head`), which is not an error on our side.
     use std::io::Write as _;
     let _ = std::io::stdout().flush();
+
+    // And flush the log the same way, for the same reason the daemon's fatal
+    // exits do: every arm below is `std::process::exit`, which runs no
+    // destructors, so a guard left to drop at end of scope never drops and the
+    // tail of the file is lost with the unjoined writer thread. That was
+    // always true here; it starts mattering now that this file follows a level
+    // the user set and is therefore worth reading to the end.
+    drop(log_guard);
 
     match result {
         Ok(()) => std::process::exit(0),
@@ -598,10 +606,26 @@ async fn async_main() {
 /// `travsr daemon logs` reads afterwards and follows the `log.level` setting the
 /// Health panel writes. Resolved at global scope (no repo), since this process
 /// serves every registered repo at once.
-fn file_log_filter() -> tracing_subscriber::EnvFilter {
-    let (directive, _) = travsr_config::resolve_log_filter(None);
-    tracing_subscriber::EnvFilter::try_new(&directive)
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(travsr_config::DEFAULT_LOG_LEVEL))
+///
+/// Deliberately does NOT consult `RUST_LOG`, and that asymmetry with the daemon
+/// is the point. This process is spawned by an MCP client, so its environment is
+/// the editor's, not something a person chose for it: honouring `RUST_LOG` here
+/// let an inherited `RUST_LOG=error` empty the durable log, and the exact form
+/// the CLI's own troubleshooting text prints,
+/// `RUST_LOG=travsr_plugin_host=debug travsr init ...`, carries no bare level
+/// and so disabled every other target in the file. That is the same class of
+/// accident this whole change exists to remove, and the layer was an
+/// unconditional `info` before precisely so the file stayed worth reading.
+/// `RUST_LOG` still governs stderr, which is the caller's own channel.
+fn file_log_filter() -> (tracing_subscriber::EnvFilter, String, &'static str) {
+    let (level, source) = travsr_config::resolve_log_level_setting(None);
+    let directive = travsr_daemon::filter_directive_for(&level);
+    let filter = tracing_subscriber::EnvFilter::try_new(&directive).unwrap_or_else(|_| {
+        tracing_subscriber::EnvFilter::new(travsr_daemon::filter_directive_for(
+            travsr_config::DEFAULT_LOG_LEVEL,
+        ))
+    });
+    (filter, level, source.label())
 }
 
 /// Initialise the global tracing subscriber.
@@ -674,6 +698,7 @@ fn init_tracing(
         // directly, and `travsr daemon logs` renders it back for people rather
         // than making them read JSON. `with_current_span` is on because the
         // repo tag that `--repo` filters by lives in a span, not in the event.
+        let (file_filter, file_level, file_level_from) = file_log_filter();
         tracing_subscriber::registry()
             .with(
                 tracing_subscriber::fmt::layer()
@@ -682,7 +707,7 @@ fn init_tracing(
                     .with_span_list(false)
                     .with_writer(writer)
                     .with_ansi(false)
-                    .with_filter(file_log_filter()),
+                    .with_filter(file_filter),
             )
             .with(
                 tracing_subscriber::fmt::layer()
@@ -690,6 +715,20 @@ fn init_tracing(
                     .with_filter(env_filter),
             )
             .init();
+        // The same self-describing first line the daemon writes, for the same
+        // reason and on the same exempt target: this file is now governed by a
+        // setting, so it has to say which one, and it has to say it at any
+        // level. Without this the durable log the panel points people at was
+        // the one file that could not answer "why is this empty".
+        tracing::info!(
+            target: travsr_daemon::SESSION_LOG_TARGET,
+            event = "mcp.session.start",
+            version = env!("CARGO_PKG_VERSION"),
+            pid = std::process::id(),
+            log_level = %file_level,
+            log_level_from = file_level_from,
+            "global stdio MCP server starting"
+        );
         Some(guard)
     }
 

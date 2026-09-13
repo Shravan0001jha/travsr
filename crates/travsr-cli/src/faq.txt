@@ -196,6 +196,7 @@ $ travsr daemon logs -f --level warn --since 10m
 - lsif.spawn, lsif.complete, kcore.updated
 - query.served, embed.text.updated, lsp.diagnostics
 - file.skipped, the one you see most when something is wrong
+query.served is the exception to "it is in the log": a query slower than 200ms is recorded at info, a faster one at debug, so at the default level you see the slow ones and nothing else. Set log.level to debug to see every query.
 The keys are identifiers and keep their spelling; the messages beside them are written for people and can be reworded at any time. That is why both exist: an alert or a jq filter built on event=phase_b.complete keeps working, where one that matched the message text would break the next time someone improved the wording.
 $ travsr daemon logs --lines 0 --json
 

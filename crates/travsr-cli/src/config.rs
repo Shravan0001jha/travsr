@@ -111,12 +111,34 @@ fn cmd_set(key: &str, value: &str, repo: bool, now: bool) -> Result<()> {
     // log that did not change. Only when a daemon is actually up: on a repo
     // with none, the next start picks the value up and there is nothing to do.
     if key == "log.level" {
-        let running = current_repo_root_for_write()
-            .is_some_and(|root| crate::daemon_client::daemon_lock_held(&root));
-        if running {
+        // What actually applies after this write, not what was written. A
+        // global set run inside a repo that has its own `log.level` changes
+        // nothing for that repo (env > repo > global), so promising a restart
+        // would apply it is false; `get` answers that question properly.
+        let repo_root = current_repo_root_for_write();
+        let effective_now = travsr_config::get(key, repo_root.as_deref())
+            .ok()
+            .and_then(|s| s.value);
+        let shadowed = effective_now.as_deref().is_some_and(|v| v != value.trim());
+        if shadowed {
+            println!(
+                "  note: a higher-precedence layer still sets log.level = {}; this write does not change what applies here",
+                effective_now.unwrap_or_default()
+            );
+        } else if repo_root
+            .as_deref()
+            .is_some_and(crate::daemon_client::daemon_lock_held)
+        {
             println!("  the running daemon is still at its startup level; `travsr daemon restart` applies this");
         }
-        if std::env::var_os("RUST_LOG").is_some() {
+        // Same emptiness rule `decide_log_filter` uses: `RUST_LOG=` is how a
+        // shell clears it for one command, and warning about an override that
+        // is not there would send someone hunting for a variable they already
+        // unset. The two must agree about the same input.
+        if std::env::var("RUST_LOG")
+            .ok()
+            .is_some_and(|v| !v.trim().is_empty())
+        {
             println!("  note: RUST_LOG is set in this environment and overrides log.level for any daemon started from it");
         }
     }
