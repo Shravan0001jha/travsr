@@ -105,6 +105,22 @@ fn cmd_set(key: &str, value: &str, repo: bool, now: bool) -> Result<()> {
     let where_ = if repo { "repo config" } else { "global config" };
     println!("\u{2713} set {key} = {value}  ({where_})");
 
+    // The daemon reads its filter once, at startup, so a running one keeps
+    // writing at the old level and the file gives no sign that a change was
+    // made. Say so here rather than leaving it to be discovered by watching a
+    // log that did not change. Only when a daemon is actually up: on a repo
+    // with none, the next start picks the value up and there is nothing to do.
+    if key == "log.level" {
+        let running = current_repo_root_for_write()
+            .is_some_and(|root| crate::daemon_client::daemon_lock_held(&root));
+        if running {
+            println!("  the running daemon is still at its startup level; `travsr daemon restart` applies this");
+        }
+        if std::env::var_os("RUST_LOG").is_some() {
+            println!("  note: RUST_LOG is set in this environment and overrides log.level for any daemon started from it");
+        }
+    }
+
     // WS4: `--now` applies an embed governance change immediately by cancelling
     // and respawning any in-flight reindex with the freshly-written config (the
     // default overrides resolve to the value we just set).

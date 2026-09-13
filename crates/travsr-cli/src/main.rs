@@ -602,6 +602,19 @@ async fn async_main() {
 ///
 /// Log redaction: file contents are never logged. Spans record only paths,
 /// counts, and numeric identifiers — never raw source text.
+/// Filter for the rolling `daemon.log.*` file written by `travsr mcp --global`.
+///
+/// Separate from the stderr filter on purpose: stderr belongs to whoever ran the
+/// command and defaults to `error`, while the file is the durable artifact
+/// `travsr daemon logs` reads afterwards and follows the `log.level` setting the
+/// Health panel writes. Resolved at global scope (no repo), since this process
+/// serves every registered repo at once.
+fn file_log_filter() -> tracing_subscriber::EnvFilter {
+    let (directive, _) = travsr_config::resolve_log_filter(None);
+    tracing_subscriber::EnvFilter::try_new(&directive)
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(travsr_config::DEFAULT_LOG_LEVEL))
+}
+
 fn init_tracing(
     file_dir: Option<&std::path::Path>,
 ) -> Option<tracing_appender::non_blocking::WorkerGuard> {
@@ -644,7 +657,14 @@ fn init_tracing(
                 travsr_daemon::logfile::LOG_PREFIX,
             ));
 
-        // The file gets INFO so the log is worth reading, matching the daemon.
+        // The file gets `log.level` (default info) so the log is worth reading,
+        // matching the daemon — this writer produces the same `daemon.log.*`
+        // files, in the global home, and `travsr daemon logs --global` reads
+        // them with the same reader, so one setting has to govern both or the
+        // control in the Health panel would be true of one file and not the
+        // other. Global scope: this process serves every registered repo, so no
+        // single repo's `config.toml` is the right layer to consult.
+        //
         // stderr keeps the caller's filter, which defaults to error: a stdio
         // MCP client should not have its terminal filled with our internals.
         //
@@ -662,7 +682,7 @@ fn init_tracing(
                     .with_span_list(false)
                     .with_writer(writer)
                     .with_ansi(false)
-                    .with_filter(tracing_subscriber::EnvFilter::new("info")),
+                    .with_filter(file_log_filter()),
             )
             .with(
                 tracing_subscriber::fmt::layer()

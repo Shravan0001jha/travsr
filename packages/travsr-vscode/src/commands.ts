@@ -29,6 +29,7 @@ import {
   LOG_MAX_LINES,
   LOG_MAX_FILES_LISTED,
   LOG_AUTO_SECONDS,
+  LOG_LEVELS,
   UNKNOWN_INDEX,
   formatLogSize,
   EMPTY_HEALTH,
@@ -846,6 +847,31 @@ export function buildLanguageRows(
  *  about 17 seconds on Windows because it sweeps PATH per catalog language, and
  *  serialising four of those would make opening the panel feel broken.
  */
+/**
+ * The level the daemon that wrote this log was actually filtering at, from its
+ * own `daemon.session.start` line.
+ *
+ * The LAST such line, not the first: `readDaemonLogFile` returns the tail in
+ * file order, which is oldest-first. Reading the first one meant a file holding
+ * a restart reported the level the daemon started the *day* with, so the panel
+ * kept demanding a restart that had already happened.
+ *
+ * Empty when there is no session line in the window (a daemon that has not
+ * started today, or one built before the field existed) and when the line
+ * carries a `RUST_LOG` directive rather than a bare level: `travsr_daemon=debug`
+ * is not comparable with a stored level, and pretending it is would make the
+ * panel ask for a restart that would change nothing.
+ */
+export function activeLogLevel(log: LogEntry[]): string {
+  for (let i = log.length - 1; i >= 0; i -= 1) {
+    if (log[i].event !== "daemon.session.start") continue;
+    const m = /\blog_level=("?)([A-Za-z_=,.]+)\1/.exec(log[i].detail ?? "");
+    const raw = m?.[2] ?? "";
+    return LOG_LEVELS.includes(raw) ? raw : "";
+  }
+  return "";
+}
+
 export async function gatherHealth(
   client: McpClient,
   binary: string,
@@ -899,7 +925,7 @@ export async function gatherHealth(
     }
   };
 
-  const [versionOut, daemonOut, embedOut, langOut, healthRaw, reposRaw, repoLangsRaw] = await Promise.all([
+  const [versionOut, daemonOut, embedOut, langOut, healthRaw, reposRaw, repoLangsRaw, configOut] = await Promise.all([
     settle(spawnLangCommand(binary, ["--version"], root ?? process.cwd()), ""),
     settle(spawnLangCommand(binary, ["daemon", "status"], root ?? process.cwd(), 8_000), ""),
     settle(spawnLangCommand(binary, ["embed", "list", "--json"], root ?? process.cwd()), ""),
@@ -909,6 +935,11 @@ export async function gatherHealth(
     // Which languages the graph actually found in this repo, so the Languages
     // table only offers to install or enable an analyzer the repo can use.
     settle(client.callTool("repo_languages"), ""),
+    // The resolved `log.level`, with the layer that set it. Read through the
+    // binary rather than by parsing `.travsr/config.toml` here, so the env var
+    // and the global file are accounted for the same way the daemon accounts
+    // for them, and an older binary with no such key simply yields nothing.
+    settle(spawnLangCommand(binary, ["config", "list", "--json"], root ?? process.cwd()), ""),
   ]);
 
   const binaryVersion = (/(\d+\.\d+\.\d+[^\s]*)/.exec(versionOut) ?? [])[1] ?? "";
@@ -1041,6 +1072,36 @@ export async function gatherHealth(
     }
   }
 
+  // `config list --json` rows are {key, value, source, default}. A null `value`
+  // means no layer set it, so the default is what applies; the panel shows that
+  // as the selection because it is what the daemon will use, and names the
+  // source as "default" so it does not read as a deliberate choice.
+  const { logLevel, logLevelSource } = ((): { logLevel: string; logLevelSource: string } => {
+    if (configOut.trim() === "") return { logLevel: "", logLevelSource: "" };
+    try {
+      const rows = JSON.parse(configOut) as Array<{
+        key?: string; value?: string | null; source?: string; default?: string;
+      }>;
+      const row = rows.find((r) => r.key === "log.level");
+      if (row === undefined) return { logLevel: "", logLevelSource: "" };
+      const value = typeof row.value === "string" && row.value !== "" ? row.value : row.default;
+      if (typeof value !== "string" || !LOG_LEVELS.includes(value)) {
+        // A level this extension does not offer cannot be shown as a selection
+        // without silently rewriting it on the next change. Hide the control.
+        return { logLevel: "", logLevelSource: "" };
+      }
+      return { logLevel: value, logLevelSource: row.source ?? "" };
+    } catch {
+      return { logLevel: "", logLevelSource: "" };
+    }
+  })();
+
+  // What the running daemon actually filters at, from the `log_level=` field on
+  // its own session-start line. Absent on a daemon built before that field
+  // existed, and on a log with no session line in the window being shown, both
+  // of which leave it empty so the panel claims nothing rather than guessing.
+  const logLevelActive = activeLogLevel(log);
+
   const newest = logFiles.files[0];
   return {
     daemonRunning,
@@ -1052,6 +1113,9 @@ export async function gatherHealth(
     binaryVersion,
     logFileName: newest?.name ?? "",
     logFileSize: newest ? formatLogSize(newest.size) : "",
+    logLevel,
+    logLevelSource,
+    logLevelActive,
     commitHook,
     sidecars,
     embedModels,
@@ -1391,6 +1455,7 @@ type PanelMessage =
   | { command: "setLogLines"; lines: number }
   | { command: "setLogFile"; file: string }
   | { command: "setLogAuto"; seconds: number }
+  | { command: "setLogLevel"; level: string }
   | { command: "startDaemon" }
   | { command: "restartDaemon" }
   | { command: "stopDaemon" }
@@ -2114,6 +2179,58 @@ export function registerShowGraphStats(
       } finally {
         logOnly = false;
       }
+      return;
+    }
+    if (msg.command === "setLogLevel") {
+      // Validated against the list the control offers, not trusted: this string
+      // goes onto a command line, and the webview is the untrusted side of the
+      // boundary even when the only thing that posts here is our own select.
+      if (!LOG_LEVELS.includes(msg.level)) {
+        void vscode.window.showWarningMessage(`Travsr: unknown log level "${msg.level}"`);
+        return;
+      }
+      const root = repoRoot();
+      if (root === undefined) {
+        void vscode.window.showWarningMessage("Travsr: open a folder to change the log level.");
+        return;
+      }
+      // Spawned, not run in the shared terminal like the daemon actions above:
+      // this has to finish before the refresh below re-reads the value, and a
+      // terminal write is fire-and-forget. `--repo` on purpose, because the
+      // level is a debugging choice about one repository's daemon and writing
+      // the global file from a panel would change it for every other repo on
+      // the machine.
+      const bin = vscode.workspace.getConfiguration("travsr").get<string>("binaryPath") || "travsr";
+      try {
+        await spawnLangCommand(bin, ["config", "set", "log.level", msg.level, "--repo"], root);
+      } catch (e) {
+        void vscode.window.showErrorMessage(
+          `Travsr: could not set log level: ${e instanceof Error ? e.message : String(e)}`
+        );
+        return;
+      }
+      // Full refresh, not log-only: the note under the bar is rendered from
+      // `logLevel` vs `logLevelActive`, and both come from the health pass.
+      await refresh();
+      // The daemon reads its level once at startup, so a running one is still
+      // on the old setting. Offered rather than done: a log-level change must
+      // not silently cancel an in-flight index, and the panel's note keeps
+      // saying so until someone acts.
+      void vscode.window
+        .showInformationMessage(
+          `Travsr: daemon.log will be written at ${msg.level}. The running daemon restarts to pick it up.`,
+          "Restart daemon"
+        )
+        .then(async (pick) => {
+          if (pick !== "Restart daemon") return;
+          // Same argv and the same shared terminal the panel's own Restart
+          // button uses, so a restart started here is visible where the user
+          // already looks for it.
+          runTravsrCommand(["daemon", "restart"], root);
+          // The daemon needs a moment to come back and write its session line,
+          // which is what clears the note. Same delay `stopDaemon` uses.
+          setTimeout(() => void refresh(), 1500);
+        });
       return;
     }
     if (msg.command === "setLogAuto") {

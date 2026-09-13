@@ -57,6 +57,18 @@ pub fn set_allow_unsandboxed_lsif(val: bool) {
     travsr_indexer::sandbox::set_cli_allow_unsandboxed(val);
 }
 
+/// Tracing target for the one event that must survive whatever level the log is
+/// written at: `daemon.session.start`.
+///
+/// A log file has to be able to say which session produced it and under what
+/// filter, or a reader cannot tell an empty file from a quiet one, and will
+/// happily read the previous session's line as if it described this one. The
+/// subscriber setup appends a directive admitting this target unconditionally.
+///
+/// The extension's `shortTarget` splits on `::`, so entries still render under
+/// `daemon` rather than growing a second name in the log view.
+pub const SESSION_LOG_TARGET: &str = "travsr_daemon::session";
+
 /// The user-facing product version, set once by the `travsr` binary at startup.
 static BUILD_VERSION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
@@ -13062,9 +13074,42 @@ impl Daemon {
         // this repo, four days of logs were 136 lines, every one of them the
         // same repeated warning and not one lifecycle event. `travsr daemon
         // logs` on top of that would have been a working feature showing
-        // nothing. `RUST_LOG` still overrides in both directions.
-        let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
-            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+        // nothing.
+        //
+        // The level is now a stored setting (`log.level`), not only an
+        // inherited environment variable. `RUST_LOG` still overrides it; see
+        // `travsr_config::resolve_log_filter` for the precedence and why. The
+        // resolved directive is read once here and reported in the session's
+        // first line below, so a file that is unexpectedly quiet or unexpectedly
+        // enormous says which layer chose that.
+        let (log_directive, log_source) = travsr_config::resolve_log_filter(Some(&repo_root));
+        // The session line is exempt from the level it reports.
+        //
+        // It is emitted at INFO, so at `error` or `warn` the filter suppressed
+        // the one line that says which session wrote this file and at what
+        // level — a log that cannot describe itself, and worse, a reader that
+        // then finds the PREVIOUS session's line and believes it. That is
+        // exactly what happened: setting `error` and restarting left the Health
+        // panel reading a dead session's `log_level=info` and insisting
+        // forever that a restart was still owed.
+        //
+        // So it gets its own target, admitted unconditionally by an appended
+        // directive. One line per daemon start is a price worth paying at any
+        // level for a file that identifies itself. `shortTarget` in the
+        // extension splits on `::`, so this still renders as `daemon`.
+        //
+        // Not appended when RUST_LOG chose the directive: that is the expert
+        // escape hatch and is passed through exactly as written. A RUST_LOG
+        // directive is not a bare level, so the panel already declines to read
+        // an active level from it and shows no note either way.
+        let filter_directive = match log_source {
+            travsr_config::LogFilterSource::RustLog => log_directive.clone(),
+            _ => format!("{log_directive},{SESSION_LOG_TARGET}=trace"),
+        };
+        let env_filter =
+            tracing_subscriber::EnvFilter::try_new(&filter_directive).unwrap_or_else(|_| {
+                tracing_subscriber::EnvFilter::new(travsr_config::DEFAULT_LOG_LEVEL)
+            });
         // JSON lines on disk. One line is one object, so every field is named
         // and typed rather than recovered by guessing at column positions, and
         // `jq`, Loki and Datadog all read it as-is. Nobody is asked to read JSON:
@@ -13100,10 +13145,19 @@ impl Daemon {
         // First event in every session, so a rotated file is interpretable on
         // its own: which build wrote it, which repo, which process.
         tracing::info!(
+            // See SESSION_LOG_TARGET: this one event outranks the level filter
+            // so the file always says who wrote it and at what level.
+            target: SESSION_LOG_TARGET,
             event = "daemon.session.start",
             version = build_version(),
             pid = std::process::id(),
             repo = %repo_root.display(),
+            // What this file will and will not contain, and who decided. Without
+            // it, "there are no debug lines in here" and "debug is off" are
+            // indistinguishable from the file itself, which is the only
+            // artifact left once the process is gone.
+            log_level = %log_directive,
+            log_level_from = log_source.label(),
             // No `foreground` field on purpose. A backgrounded daemon is a
             // re-exec of `daemon start --foreground`, so the flag is true in the
             // child either way: accurate for the process, and misleading to the

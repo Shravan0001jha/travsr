@@ -203,6 +203,13 @@ export function webviewShell(title: string, body: string, script: string): strin
     border-radius: 5px; font-size: 12px; font-family: inherit; }
   .log-bar input[type=search]::placeholder { color: var(--fg-subtle); }
   .chips { display: flex; gap: 4px; }
+  /* Expands a counted-but-hidden group in place. Styled as a link rather than
+     a button because it sits inside a sentence ("and 46 more  Show") and a
+     bordered control there reads as an action on the registry, which this is
+     not: it only reveals rows already in the document. */
+  .link-btn { cursor: pointer; background: none; border: 0; padding: 0 0 0 4px;
+    font: inherit; font-size: 11px; color: var(--blue); text-decoration: underline; }
+  .link-btn:hover { color: var(--fg); }
   .chip-btn { cursor: pointer; padding: 3px 9px; font-size: 11px; border-radius: 5px;
     background: var(--bg-elev); color: var(--fg-muted);
     border: 1px solid var(--border); font-family: inherit; }
@@ -341,6 +348,13 @@ export function webviewShell(title: string, body: string, script: string): strin
     border-radius: 4px; padding: 2px 4px; font-size: 11px; font-family: inherit; }
   .tog { display: inline-flex; align-items: center; gap: 4px; cursor: pointer; }
   .tog input { margin: 0; }
+  /* Sits between the mode bar and the log itself, and only when the stored
+     level and the running daemon's disagree. Warn-coloured because it reports
+     that a change the reader just made is not in effect yet, which is the same
+     class of thing as a stale index, not a neutral aside. */
+  .log-note { margin: -4px 0 8px; font-size: 11px; color: var(--gold);
+    display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .btn-sm { padding: 2px 8px; font-size: 11px; border-radius: 4px; }
   /* Quiet asides beside the File control: the day boundary is UTC, and the list
      may be shorter than what is on disk. Both are things a reader needs once
      and should not have to read twice. */
@@ -971,6 +985,23 @@ export interface HealthData {
   binaryVersion: string;
   logFileName: string;
   logFileSize: string;
+  /** The `log.level` setting: what a daemon started from now on will write.
+   *  Empty when the binary predates the key or `config list` could not be read,
+   *  which is what hides the control rather than showing a dead one. */
+  logLevel: string;
+  /** Which layer set it, in `travsr config`'s own words ("default", "repo
+   *  config", ...). Shown so a value that did not come from this panel says
+   *  where it did come from. */
+  logLevelSource: string;
+  /** What the RUNNING daemon is actually filtering at, read from its own
+   *  `daemon.session.start` line.
+   *
+   *  Deliberately a separate field from `logLevel`, not a nicety: the level is
+   *  read once at startup, so a daemon that has been up since before the
+   *  setting changed is still writing at the old one. Collapsing the two would
+   *  make the panel claim a change had taken effect while the file it is
+   *  showing proves otherwise. Empty when no session line is in view. */
+  logLevelActive: string;
   commitHook: boolean | null;
   sidecars: SidecarRow[] | null;
   /** The embedding catalog, for the model picker. Empty when it could not be read. */
@@ -996,6 +1027,9 @@ export const EMPTY_HEALTH: HealthData = {
   binaryVersion: "",
   logFileName: "",
   logFileSize: "",
+  logLevel: "",
+  logLevelSource: "",
+  logLevelActive: "",
   commitHook: null,
   sidecars: null,
   embedModels: [],
@@ -1130,6 +1164,14 @@ const rankOf = (lvl: string): number => LOG_RANK[lvl] ?? 2;
  *  Exported so the extension can reject a value the control never offered
  *  instead of trusting a number from the webview into `setInterval`. */
 export const LOG_AUTO_SECONDS: readonly number[] = [0, 5, 15, 30, 60];
+
+/** The levels the Level control offers, coarsest first.
+ *
+ *  Must stay the same set as `travsr_config::LOG_LEVELS`, since the value goes
+ *  straight to `travsr config set log.level`, which rejects anything else. The
+ *  handler validates against this list before spawning, so a crafted webview
+ *  message cannot put an arbitrary string on the command line. */
+export const LOG_LEVELS: readonly string[] = ["error", "warn", "info", "debug", "trace"];
 
 /** The `.log-line` rows for a log tail, newest first.
  *
@@ -1285,6 +1327,60 @@ export function buildStatsHtml(
     `${esc(label)} <span class="chip-n">${n}</span></button>`;
 
   const logRows = buildLogRowsHtml(log);
+
+  // The Level control writes `log.level`; the chips beside it filter what is
+  // already on screen. Two different jobs on one bar, so the control is
+  // labelled "Write" and carries the distinction in its title: a chip cannot
+  // show a debug line that was never written, which is the confusion the
+  // daemon's own `--verbose` help text already has to explain.
+  //
+  // Never rendered with a guessed selection: a dropdown showing "info" on a
+  // binary that has no such key would be a control that silently does nothing.
+  // But an empty space where a control should be is its own failure — the
+  // feature looks missing rather than unavailable — so the absence says which
+  // binary is behind, the same way the Languages section reports a contract
+  // skew instead of withholding rows silently.
+  const logLevelControl =
+    health.logLevel === ""
+      ? // Actionable, not just accurate. Naming the setting still leaves the
+        // reader to find it, and the one thing that fixes this is already a
+        // handled message, so the report carries its own fix the way every
+        // other problem on this page does.
+        `<span class="hint" title="This panel writes the level with \`travsr config set log.level\`, which the resolved binary does not have. The extension runs the binary at travsr.binaryPath, or \`travsr\` on PATH.">Write: needs a newer travsr${
+          health.binaryVersion ? ` (this one is ${esc(health.binaryVersion)})` : ""
+        }</span><button class="link-btn" onclick="openBinarySetting()">Change binary</button>`
+      : `<label class="sel">Write
+    <select id="logLevel" onchange="onLogLevelChange()"
+            title="How much the daemon writes to daemon.log from now on (travsr config set log.level). Takes effect when the daemon next starts; the chips to the left only filter lines that were already written. Currently ${esc(health.logLevelSource)}. RUST_LOG, when set, overrides this.">
+      ${LOG_LEVELS.map(
+        (l) =>
+          `<option value="${l}"${l === health.logLevel ? " selected" : ""}>${l}</option>`
+      ).join("\n      ")}
+    </select>
+  </label>`;
+
+  // Only when the two genuinely disagree AND there is a running daemon for the
+  // claim to be about. The daemon reads its level once at startup, so this is
+  // the honest "your change is stored but not live yet" signal, and it names
+  // the restart rather than leaving the reader to find it.
+  //
+  // `daemonRunning` is load-bearing, not defensive: `logLevelActive` comes from
+  // a session line in a file that outlives the process that wrote it. Without
+  // this gate the note said "the running daemon is still writing at info" about
+  // a daemon that had already stopped, offering a restart that would change
+  // nothing a restart had not already changed.
+  const logLevelPending =
+    health.daemonRunning &&
+    health.logLevel !== "" &&
+    health.logLevelActive !== "" &&
+    health.logLevelActive !== health.logLevel
+      ? `<div class="log-note">The running daemon is still writing at <b>${esc(
+          health.logLevelActive
+        )}</b>. <b>${esc(
+          health.logLevel
+        )}</b> applies when it next starts. <button class="btn btn-sm" onclick="panelAction(this,'restartDaemon')">Restart daemon</button></div>`
+      : "";
+
   const autoOptions = LOG_AUTO_SECONDS.map(
     (s) =>
       `<option value="${s}"${s === autoSeconds ? " selected" : ""}>${s === 0 ? "Off" : `${s}s`}</option>`
@@ -1715,9 +1811,12 @@ export function buildStatsHtml(
           const shown = sorted.slice(0, REPO_ROWS);
           const hidden = sorted.slice(REPO_ROWS);
           const hiddenStale = hidden.filter((r) => !r.exists).length;
-          return (
-            shown
-              .map((r) => {
+          // One renderer for every row, because the hidden groups below now
+          // render the same rows the shown ones do. Inlining it in `shown.map`
+          // meant expanding a group would have had to duplicate it, and the two
+          // copies would drift.
+          const repoRow = (r: RepoRow): string => {
+            {
                 const active = r.name === health.activeRepo;
                 return row(
                   r.name,
@@ -1749,8 +1848,10 @@ export function buildStatsHtml(
                   // shows nothing else to tell them apart.
                   r.path ? `${r.name}\nGraph database: ${r.path}` : r.name
                 );
-              })
-              .join("") +
+            }
+          };
+          return (
+            shown.map(repoRow).join("") +
             // The stale count belongs to the rows that were hidden. It was
             // taken over the whole registry, so a registry that is mostly
             // stale reported more missing databases than there are hidden
@@ -1758,10 +1859,20 @@ export function buildStatsHtml(
             // the hidden rows are stale there is nothing to qualify, and the
             // clause was a double negative reading "0 of which have no
             // database".
+            //
+            // Both groups now expand in place rather than only being counted.
+            // The cap is still right for the default view (a machine that has
+            // run the suite has seventy entries and eight of them are the
+            // point), but "and 46 more" with no way to see them makes the page
+            // report a fact the reader cannot act on. The rows are in the
+            // document and hidden with `hidden`, so expanding costs no spawn
+            // and no redraw; a redraw collapses them again, which is the same
+            // thing every other control on this page does.
             (hidden.length > 0
               ? `<div class="hrow muted">and ${hidden.length} more${
                   hiddenStale > 0 ? `, ${hiddenStale} with no database` : ""
-                }</div>`
+                } <button class="link-btn" id="repoMoreBtn" aria-expanded="false" aria-controls="repoMore" onclick="toggleRepoRows('repoMore',this)">Show</button></div>` +
+                `<div id="repoMore" hidden>${hidden.map(repoRow).join("")}</div>`
               : "") +
             // Said, not silently dropped. Hiding rows is how this page would
             // start lying again; the count and the way to clear them are both
@@ -1769,7 +1880,8 @@ export function buildStatsHtml(
             (repoTemps.length > 0
               ? `<div class="hrow muted">${repoTemps.length} test ${
                   repoTemps.length === 1 ? "repository" : "repositories"
-                } left by test runs, not listed</div>`
+                } left by test runs, not listed <button class="link-btn" id="repoTempsBtn" aria-expanded="false" aria-controls="repoTemps" onclick="toggleRepoRows('repoTemps',this)">Show</button></div>` +
+                `<div id="repoTemps" hidden>${repoTemps.map(repoRow).join("")}</div>`
               : "") +
             (shown.length === 0 && repoTemps.length === 0
               ? `<div class="hrow muted">No repositories registered.</div>`
@@ -1912,7 +2024,9 @@ ${activityRows}
   </label>
   <label class="tog"><input type="checkbox" id="logUtc" onchange="filterLog()"> UTC</label>
   <label class="tog"><input type="checkbox" id="logJson" onchange="filterLog()"> JSON</label>
+  ${logLevelControl}
 </div>
+${logLevelPending}
 <div class="log" id="logBox" onclick="onLogClick(event)">
 <div class="empty" id="logEmpty" style="display:none">No lines match this filter.</div>
 ${logRows}
@@ -1922,6 +2036,18 @@ ${logRows}
 
   const script = `
 function doRefresh(btn){ setSticky(btn,'Refresh'); vscode.postMessage({command:'refresh'}); }
+
+// Reveals rows that are already in this document, so there is no message and
+// no redraw. Toggles \`hidden\` rather than a style, which is what the host page
+// forces with \`[hidden]{display:none!important}\`, and keeps aria-expanded in
+// step so the control reports its own state to a screen reader.
+function toggleRepoRows(id, btn){
+  var box = document.getElementById(id);
+  if (!box) return;
+  box.hidden = !box.hidden;
+  btn.textContent = box.hidden ? 'Show' : 'Hide';
+  btn.setAttribute('aria-expanded', box.hidden ? 'false' : 'true');
+}
 
 // How long ago this document was built, ticking so the reader can tell whether
 // what they are looking at is seconds or an hour old. Without it the header
@@ -2076,6 +2202,16 @@ window.addEventListener('message', function (ev) {
 function onLogFileChange() {
   var sel = document.getElementById('logFile');
   if (sel) vscode.postMessage({ command: 'setLogFile', file: sel.value });
+}
+
+// Writes the setting. Unlike every other control on this bar this one changes
+// what the daemon RECORDS rather than what this document shows, so there is
+// nothing to filter locally and no fast path: the extension writes the config
+// and re-renders, and the note above the log says whether a restart is still
+// owed before it is live.
+function onLogLevelChange() {
+  var sel = document.getElementById('logLevel');
+  if (sel) vscode.postMessage({ command: 'setLogLevel', level: sel.value });
 }
 
 function filterLog() {
