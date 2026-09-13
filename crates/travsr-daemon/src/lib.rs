@@ -13139,11 +13139,21 @@ impl Daemon {
         // Bounded and lossy instead: under pressure the right thing to drop is
         // log lines, never indexing throughput. `non_blocking` reports what it
         // discarded, so the loss is visible rather than silent.
-        let (non_blocking, _appender_guard) =
+        let (non_blocking, appender_guard) =
             tracing_appender::non_blocking::NonBlockingBuilder::default()
                 .buffered_lines_limit(logfile::BUFFERED_LINES)
                 .lossy(true)
                 .finish(file_appender);
+        // Held in an Option so the fatal-exit paths below can flush it.
+        //
+        // Dropping the guard is what flushes the channel and joins the writer
+        // thread, and `std::process::exit` runs no destructors: a guard left to
+        // "drop at end of scope" never drops on those paths, so the last events
+        // written are still in the channel when the process dies. That silently
+        // cost the `daemon.session.exit` line this change added, and usually the
+        // session-start line with it. `.take()` rather than a move because two
+        // different select arms can reach the exit.
+        let mut appender_guard = Some(appender_guard);
         use tracing_subscriber::layer::SubscriberExt as _;
         use tracing_subscriber::util::SubscriberInitExt as _;
         // INFO, not WARN. At WARN the file held nothing a user would want: on
@@ -13175,14 +13185,36 @@ impl Daemon {
         // extension splits on `::`, so this still renders as `daemon`.
         //
         // Not appended when RUST_LOG chose the directive: that is the expert
-        // escape hatch and is passed through exactly as written. A RUST_LOG
-        // directive is not a bare level, so the panel already declines to read
-        // an active level from it and shows no note either way.
-        let filter_directive = filter_directive_for(&log_directive, log_source);
-        let env_filter =
-            tracing_subscriber::EnvFilter::try_new(&filter_directive).unwrap_or_else(|_| {
-                tracing_subscriber::EnvFilter::new(travsr_config::DEFAULT_LOG_LEVEL)
-            });
+        // escape hatch and is passed through exactly as written. Readers tell
+        // the two apart by `log_level_from`, not by trying to parse the value.
+        //
+        // What is reported is what was INSTALLED, not what was resolved. A
+        // malformed RUST_LOG falls back, and reporting the resolved pair there
+        // would have the line name a level the process is not filtering at. The
+        // fallback also has to go back through `filter_directive_for`, or it
+        // silently drops the session exemption the rest of this depends on.
+        let (env_filter, log_directive, log_source) = match tracing_subscriber::EnvFilter::try_new(
+            filter_directive_for(&log_directive, log_source),
+        ) {
+            Ok(filter) => (filter, log_directive, log_source),
+            Err(_) => {
+                let fallback = filter_directive_for(
+                    travsr_config::DEFAULT_LOG_LEVEL,
+                    travsr_config::LogFilterSource::Default,
+                );
+                // Built from constants this crate owns, so it parses; the
+                // `unwrap_or_else` keeps that from being an assertion.
+                let filter =
+                    tracing_subscriber::EnvFilter::try_new(&fallback).unwrap_or_else(|_| {
+                        tracing_subscriber::EnvFilter::new(travsr_config::DEFAULT_LOG_LEVEL)
+                    });
+                (
+                    filter,
+                    travsr_config::DEFAULT_LOG_LEVEL.to_string(),
+                    travsr_config::LogFilterSource::Default,
+                )
+            }
+        };
         // JSON lines on disk. One line is one object, so every field is named
         // and typed rather than recovered by guessing at column positions, and
         // `jq`, Loki and Datadog all read it as-is. Nobody is asked to read JSON:
@@ -13781,6 +13813,11 @@ impl Daemon {
                             eprintln!(
                                 "travsr daemon: graph.db removed, exiting. Re-run `travsr init` to rebuild."
                             );
+                            // Flush before leaving, or the line above never
+                            // reaches the file: `exit` runs no destructors, so
+                            // the guard would not drop and the non-blocking
+                            // writer would never be joined.
+                            drop(appender_guard.take());
                             std::process::exit(0);
                         }
                         // M9: .travsr is in SKIP_DIRS so the watcher never sees a
@@ -13938,6 +13975,11 @@ impl Daemon {
                             eprintln!(
                                 "travsr daemon: graph.db removed, exiting. Re-run `travsr init` to rebuild."
                             );
+                            // Flush before leaving, or the line above never
+                            // reaches the file: `exit` runs no destructors, so
+                            // the guard would not drop and the non-blocking
+                            // writer would never be joined.
+                            drop(appender_guard.take());
                             std::process::exit(0);
                         }
                         // Auto-arm when Phase B is pending (deferred init, or daemon
@@ -14431,11 +14473,6 @@ fn live_editor_sessions(
     live
 }
 
-/// Returns `(response, should_shutdown)`.
-///
-/// Called from the Unix domain-socket accept loop and the Windows Named Pipe
-/// accept loop. Gated to the two supported control-plane platforms so the
-/// compiler does not emit dead_code on exotic targets.
 /// The directive actually installed, given the resolved one and where it came
 /// from.
 ///
@@ -14461,6 +14498,14 @@ pub(crate) fn filter_directive_for(
 /// put the log back where it was.
 pub(crate) const SLOW_QUERY_MS: u128 = 200;
 
+/// Whether serving a query at this speed is an event or commentary.
+///
+/// Inclusive at the threshold, so `SLOW_QUERY_MS` reads as "this slow counts"
+/// rather than leaving a one-millisecond band that is neither.
+pub(crate) fn query_is_slow(elapsed_ms: u128) -> bool {
+    elapsed_ms >= SLOW_QUERY_MS
+}
+
 /// The one `query.served` line, at the level its content earns.
 ///
 /// This was unconditionally INFO, which made it the most frequent line in the
@@ -14479,14 +14524,6 @@ pub(crate) const SLOW_QUERY_MS: u128 = 200;
 ///
 /// The same split is already the house pattern: `sidecar.version.checked` is
 /// DEBUG because healthy spawns must not flood, while `below_floor` is WARN.
-/// Whether serving a query at this speed is an event or commentary.
-///
-/// Inclusive at the threshold, so `SLOW_QUERY_MS` reads as "this slow counts"
-/// rather than leaving a one-millisecond band that is neither.
-pub(crate) fn query_is_slow(elapsed_ms: u128) -> bool {
-    elapsed_ms >= SLOW_QUERY_MS
-}
-
 fn log_query_served(tool: &str, cached: bool, elapsed_ms: u128) {
     if query_is_slow(elapsed_ms) {
         tracing::info!(
@@ -14507,6 +14544,11 @@ fn log_query_served(tool: &str, cached: bool, elapsed_ms: u128) {
     }
 }
 
+/// Returns `(response, should_shutdown)`.
+///
+/// Called from the Unix domain-socket accept loop and the Windows Named Pipe
+/// accept loop. Gated to the two supported control-plane platforms so the
+/// compiler does not emit dead_code on exotic targets.
 #[cfg(any(unix, windows))]
 #[allow(clippy::too_many_arguments)]
 fn handle_control_message(

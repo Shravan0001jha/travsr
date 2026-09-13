@@ -591,17 +591,6 @@ async fn async_main() {
     }
 }
 
-/// Initialise the global tracing subscriber.
-///
-/// Without the `otlp` feature: stderr-only JSON/pretty subscriber filtered by
-/// `RUST_LOG` (default: `info`).
-///
-/// With the `otlp` feature: adds an OpenTelemetry OTLP layer that exports spans
-/// via gRPC to `TRAVSR_OTLP_ENDPOINT` (default: `http://localhost:4317`).
-/// This is off by default — only enable it when you have a collector running.
-///
-/// Log redaction: file contents are never logged. Spans record only paths,
-/// counts, and numeric identifiers — never raw source text.
 /// Filter for the rolling `daemon.log.*` file written by `travsr mcp --global`.
 ///
 /// Separate from the stderr filter on purpose: stderr belongs to whoever ran the
@@ -615,6 +604,17 @@ fn file_log_filter() -> tracing_subscriber::EnvFilter {
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(travsr_config::DEFAULT_LOG_LEVEL))
 }
 
+/// Initialise the global tracing subscriber.
+///
+/// Without the `otlp` feature: stderr-only JSON/pretty subscriber filtered by
+/// `RUST_LOG` (default: `info`).
+///
+/// With the `otlp` feature: adds an OpenTelemetry OTLP layer that exports spans
+/// via gRPC to `TRAVSR_OTLP_ENDPOINT` (default: `http://localhost:4317`).
+/// This is off by default — only enable it when you have a collector running.
+///
+/// Log redaction: file contents are never logged. Spans record only paths,
+/// counts, and numeric identifiers — never raw source text.
 fn init_tracing(
     file_dir: Option<&std::path::Path>,
 ) -> Option<tracing_appender::non_blocking::WorkerGuard> {

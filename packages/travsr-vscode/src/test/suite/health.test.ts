@@ -304,13 +304,13 @@ suite("verdict", () => {
 });
 
 suite("active daemon log level", () => {
-  const sessionLine = (time: string, level: string): LogEntry => ({
+  const sessionLine = (time: string, level: string, from = "log.level"): LogEntry => ({
     time,
     level: "INFO",
     target: "daemon",
     message: "daemon starting",
     event: "daemon.session.start",
-    detail: `version=1.0.0 pid=1234 log_level=${level} log_level_from=log.level pruned_logs=0`,
+    detail: `version=1.0.0 pid=1234 log_level=${level} log_level_from=${from} pruned_logs=0`,
     iso: `2026-09-13T${time}Z`,
     raw: "{}",
   });
@@ -333,8 +333,24 @@ suite("active daemon log level", () => {
   test("a RUST_LOG directive is not reported as a level", () => {
     // `travsr_plugin_host=debug` is not comparable with a stored level, and
     // treating it as one would ask for a restart that changes nothing.
-    const log = [sessionLine("09:00:00", "travsr_plugin_host=debug")];
+    const log = [sessionLine("09:00:00", "travsr_plugin_host=debug", "RUST_LOG")];
     assert.strictEqual(activeLogLevel(log), "");
+  });
+
+  test("a bare RUST_LOG level is not reported either", () => {
+    // The case that shipped broken: `daemon start --verbose` sets
+    // RUST_LOG=debug, so the session line reads `log_level=debug
+    // log_level_from=RUST_LOG`. Judging by the shape of the value accepted it
+    // as a stored level, and the panel then demanded a restart that could not
+    // change anything, because RUST_LOG wins on the next start too. The source
+    // decides, not the shape.
+    assert.strictEqual(activeLogLevel([sessionLine("09:00:00", "debug", "RUST_LOG")]), "");
+    assert.strictEqual(activeLogLevel([sessionLine("09:00:00", "error", "RUST_LOG")]), "");
+  });
+
+  test("a level that came from the config or the default is reported", () => {
+    assert.strictEqual(activeLogLevel([sessionLine("09:00:00", "debug", "log.level")]), "debug");
+    assert.strictEqual(activeLogLevel([sessionLine("09:00:00", "info", "default")]), "info");
   });
 
   test("every offered level round-trips out of a session line", () => {

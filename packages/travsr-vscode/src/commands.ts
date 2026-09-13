@@ -865,8 +865,16 @@ export function buildLanguageRows(
 export function activeLogLevel(log: LogEntry[]): string {
   for (let i = log.length - 1; i >= 0; i -= 1) {
     if (log[i].event !== "daemon.session.start") continue;
-    const m = /\blog_level=("?)([A-Za-z_=,.]+)\1/.exec(log[i].detail ?? "");
-    const raw = m?.[2] ?? "";
+    const detail = log[i].detail ?? "";
+    // `log_level_from` decides, not the shape of the value. Checking only that
+    // `log_level` looked like a bare level was wrong for `RUST_LOG=debug`,
+    // which is what the product itself sets for `daemon start --verbose`: the
+    // panel read `debug`, compared it with a stored `info`, and offered a
+    // restart that could not change anything, because RUST_LOG wins on the
+    // next start too.
+    const from = /\blog_level_from=("?)([A-Za-z_.]+)\1/.exec(detail)?.[2] ?? "";
+    if (from !== "log.level" && from !== "default") return "";
+    const raw = /\blog_level=("?)([A-Za-z_=,.]+)\1/.exec(detail)?.[2] ?? "";
     return LOG_LEVELS.includes(raw) ? raw : "";
   }
   return "";
@@ -1100,7 +1108,20 @@ export async function gatherHealth(
   // its own session-start line. Absent on a daemon built before that field
   // existed, and on a log with no session line in the window being shown, both
   // of which leave it empty so the panel claims nothing rather than guessing.
-  const logLevelActive = activeLogLevel(log);
+  //
+  // Always from the NEWEST file, never from whichever one the File control has
+  // pinned. `log` is the reader's selection, and a reader looking at yesterday
+  // while today's daemon runs at a different level would otherwise be told the
+  // running daemon is at yesterday's, with a restart offered that is not owed.
+  // `day` on an entry says which rotated file it came from, so the common case
+  // (already looking at the newest) costs no extra read.
+  const logLevelActive = (() => {
+    const newest = logFiles.files[0];
+    const alreadyNewest =
+      newest === undefined || log.length === 0 || log[0]?.day === newest.day;
+    if (alreadyNewest || root === undefined) return activeLogLevel(log);
+    return activeLogLevel(readDaemonLogFile(root, newest.name, LOG_MAX_LINES));
+  })();
 
   const newest = logFiles.files[0];
   return {
@@ -2201,17 +2222,42 @@ export function registerShowGraphStats(
       // the global file from a panel would change it for every other repo on
       // the machine.
       const bin = vscode.workspace.getConfiguration("travsr").get<string>("binaryPath") || "travsr";
-      try {
-        await spawnLangCommand(bin, ["config", "set", "log.level", msg.level, "--repo"], root);
-      } catch (e) {
+      // `spawnLangCommandResult` and a check on the exit code, the same shape
+      // `disableLang` uses. `spawnLangCommand` resolves on every path including
+      // a non-zero exit, a spawn error and the 4 s timeout kill, so it never
+      // rejects and a `try/catch` around it can never fire: a failed write
+      // ("--repo requires being inside a git repository", a read-only
+      // config.toml, a missing binary, validation exit 1) reported success
+      // while the refresh quietly snapped the dropdown back.
+      const r = await spawnLangCommandResult(
+        bin,
+        ["config", "set", "log.level", msg.level, "--repo"],
+        root
+      );
+      // Full refresh either way, so the control shows what is actually stored
+      // rather than what was clicked. The note under the bar is rendered from
+      // `logLevel` vs `logLevelActive`, and both come from the health pass.
+      await refresh();
+      if (r.code !== 0) {
         void vscode.window.showErrorMessage(
-          `Travsr: could not set log level: ${e instanceof Error ? e.message : String(e)}`
+          `Travsr: could not set the log level. ${
+            lastLine(r.out) ||
+            `Run \`travsr config set log.level ${msg.level} --repo\` in a terminal for details.`
+          }`
         );
         return;
       }
-      // Full refresh, not log-only: the note under the bar is rendered from
-      // `logLevel` vs `logLevelActive`, and both come from the health pass.
-      await refresh();
+      // A write that succeeded but changes nothing is not success either.
+      // `TRAVSR_LOG_LEVEL` outranks the repo file, so the value lands on disk
+      // and the daemon still uses the environment; saying "will be written at
+      // <level>" there would be the opposite of what happens.
+      const envOverride = process.env.TRAVSR_LOG_LEVEL;
+      if (envOverride !== undefined && envOverride.trim() !== "") {
+        void vscode.window.showWarningMessage(
+          `Travsr: log.level is now ${msg.level}, but TRAVSR_LOG_LEVEL=${envOverride} is set in this environment and takes precedence. Unset it for the setting to take effect.`
+        );
+        return;
+      }
       // The daemon reads its level once at startup, so a running one is still
       // on the old setting. Offered rather than done: a log-level change must
       // not silently cancel an in-flight index, and the panel's note keeps
