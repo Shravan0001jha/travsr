@@ -5876,6 +5876,62 @@ mod tests {
     use std::process::Command as StdCommand;
     use std::sync::Mutex;
 
+    /// `log.level = error` has to still record errors, which is the whole point
+    /// of offering the level. Checked against a real `EnvFilter` rather than by
+    /// reading the directive string, because what matters is what the filter
+    /// admits, and an unknown word in a directive is silently read as a target
+    /// name rather than rejected.
+    #[test]
+    fn an_error_only_log_still_records_errors() {
+        use tracing_subscriber::layer::{Layer as _, SubscriberExt as _};
+        use tracing_subscriber::EnvFilter;
+
+        let directive = filter_directive_for("error", travsr_config::LogFilterSource::Config);
+        // A layer that records what actually reached it, so this asserts on the
+        // events a subscriber receives rather than on the directive string.
+        #[derive(Clone, Default)]
+        struct Seen(std::sync::Arc<Mutex<Vec<(String, tracing::Level)>>>);
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Seen {
+            fn on_event(
+                &self,
+                ev: &tracing::Event<'_>,
+                _: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                let m = ev.metadata();
+                self.0
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push((m.target().to_string(), *m.level()));
+            }
+        }
+
+        let seen = Seen::default();
+        let subscriber =
+            tracing_subscriber::registry()
+                .with(seen.clone().with_filter(
+                    EnvFilter::try_new(&directive).expect("our directive must parse"),
+                ));
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::error!("boom");
+            tracing::warn!("noise");
+            tracing::info!(target: SESSION_LOG_TARGET, "daemon starting");
+        });
+
+        let got = seen.0.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        assert!(
+            got.iter().any(|(_, l)| *l == tracing::Level::ERROR),
+            "an error-only log that drops errors is not a log; saw {got:?}"
+        );
+        assert!(
+            !got.iter().any(|(_, l)| *l == tracing::Level::WARN),
+            "error means error, not warn and above; saw {got:?}"
+        );
+        assert!(
+            got.iter().any(|(t, _)| t == SESSION_LOG_TARGET),
+            "the session line is exempt so the file can identify itself; saw {got:?}"
+        );
+    }
+
     /// `query.served` was INFO on every query, which made it 28 of about 130
     /// lines in this repo's own log, most of them `elapsed_ms=0` cache hits.
     /// The level now follows the content, so this pins where the line sits and
@@ -13122,10 +13178,7 @@ impl Daemon {
         // escape hatch and is passed through exactly as written. A RUST_LOG
         // directive is not a bare level, so the panel already declines to read
         // an active level from it and shows no note either way.
-        let filter_directive = match log_source {
-            travsr_config::LogFilterSource::RustLog => log_directive.clone(),
-            _ => format!("{log_directive},{SESSION_LOG_TARGET}=trace"),
-        };
+        let filter_directive = filter_directive_for(&log_directive, log_source);
         let env_filter =
             tracing_subscriber::EnvFilter::try_new(&filter_directive).unwrap_or_else(|_| {
                 tracing_subscriber::EnvFilter::new(travsr_config::DEFAULT_LOG_LEVEL)
@@ -13713,6 +13766,18 @@ impl Daemon {
                         // C3: .travsr is in SKIP_DIRS so the file watcher never fires
                         // for graph.db deletions. Poll every 5 s as the only trigger.
                         if !db_path.exists() {
+                            // Logged, not only printed. A backgrounded daemon is
+                            // spawned with null stdio, so this `eprintln!` reached
+                            // nobody and the log simply stopped mid-session with no
+                            // reason in it: the one artifact left after the process
+                            // is gone said nothing about why it went. It stays on
+                            // stderr too, for `daemon start --foreground`.
+                            tracing::error!(
+                                event = "daemon.session.exit",
+                                reason = "graph_db_removed",
+                                db = %db_path.display(),
+                                "graph.db removed, daemon exiting; re-run `travsr init` to rebuild"
+                            );
                             eprintln!(
                                 "travsr daemon: graph.db removed, exiting. Re-run `travsr init` to rebuild."
                             );
@@ -13858,6 +13923,18 @@ impl Daemon {
                     _ = phase_b_tick.tick() => {
                         // C3: poll every 5 s since .travsr is in SKIP_DIRS.
                         if !db_path.exists() {
+                            // Logged, not only printed. A backgrounded daemon is
+                            // spawned with null stdio, so this `eprintln!` reached
+                            // nobody and the log simply stopped mid-session with no
+                            // reason in it: the one artifact left after the process
+                            // is gone said nothing about why it went. It stays on
+                            // stderr too, for `daemon start --foreground`.
+                            tracing::error!(
+                                event = "daemon.session.exit",
+                                reason = "graph_db_removed",
+                                db = %db_path.display(),
+                                "graph.db removed, daemon exiting; re-run `travsr init` to rebuild"
+                            );
                             eprintln!(
                                 "travsr daemon: graph.db removed, exiting. Re-run `travsr init` to rebuild."
                             );
@@ -14359,6 +14436,22 @@ fn live_editor_sessions(
 /// Called from the Unix domain-socket accept loop and the Windows Named Pipe
 /// accept loop. Gated to the two supported control-plane platforms so the
 /// compiler does not emit dead_code on exotic targets.
+/// The directive actually installed, given the resolved one and where it came
+/// from.
+///
+/// Appends the session target so `daemon.session.start` survives whatever level
+/// it reports (see [`SESSION_LOG_TARGET`]). Not appended for `RUST_LOG`, which
+/// is the expert escape hatch and is honoured exactly as written.
+pub(crate) fn filter_directive_for(
+    directive: &str,
+    source: travsr_config::LogFilterSource,
+) -> String {
+    match source {
+        travsr_config::LogFilterSource::RustLog => directive.to_string(),
+        _ => format!("{directive},{SESSION_LOG_TARGET}=trace"),
+    }
+}
+
 /// How long a query has to take before serving it is an event rather than
 /// commentary.
 ///

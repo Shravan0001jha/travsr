@@ -34,7 +34,14 @@
 //! sidecar.version.probe_timeout
 //! editor.attached          editor.detached
 //! query.served             query.failed
+//! daemon.session.exit
 //! ```
+//!
+//! `daemon.session.exit` (ERROR) is the daemon stopping for a reason that is not
+//! a shutdown request: today, its `graph.db` being removed underneath it. It
+//! exists because that path only ever called `eprintln!`, and a backgrounded
+//! daemon is spawned with null stdio, so the log stopped mid-session with
+//! nothing in it to say why. `daemon.session.stop` remains the orderly case.
 //!
 //! `query.served` and `query.failed` were emitted long before they were listed
 //! here, which is how `query.served` came to be the most frequent line in the
