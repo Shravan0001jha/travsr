@@ -39,12 +39,31 @@ pub fn run(
 
     let db_path = repo_root.join(".travsr/graph.db");
 
+    // #893: a `.gitignore` entry cannot un-track a path git already holds, so on
+    // a repo that committed `.travsr/` before this existed, `init_repo`'s
+    // scaffold changed nothing and `git revert`/`git merge` still refuse to run
+    // against the permanently dirty WAL. Always stderr, so it reaches the `--json` path too without landing in
+    // the machine-readable summary on stdout. Reported, not auto-fixed: removing
+    // it rewrites the user's index.
+    if stats.travsr_dir_tracked {
+        eprintln!(
+            "warning: git tracks files under .travsr/, so ignoring it has no effect. \
+             The graph's WAL changes on every read, which keeps the working tree \
+             dirty and makes `git revert`/`git merge` refuse to run. \
+             `git rm -r --cached .travsr` to untrack it, then commit."
+        );
+    }
+
     if json {
         // Machine-readable summary on stdout for CI; progress went to stderr.
-        let phase_b = if stats.phase_b_report.is_some() {
-            "complete"
-        } else {
-            "pending"
+        // #878: a CI consumer reads this field instead of the human summary, so
+        // it must not say `complete` over a run whose TypeScript LSIF pass was
+        // skipped, or whose analyzer crashed. `travsr status` calls both
+        // `partial`; agree with it.
+        let phase_b = match &stats.phase_b_report {
+            None => "pending",
+            Some(r) if r.lsif_skipped.is_some() || !r.crashed.is_empty() => "partial",
+            Some(_) => "complete",
         };
         let summary = serde_json::json!({
             "files_indexed": stats.files_indexed,

@@ -205,7 +205,7 @@ fn extract_cargo_deps(corpus: &str, root: &Path) -> anyhow::Result<(Vec<Node>, V
     let root_doc: toml::Value = root_text.parse().context("parsing root Cargo.toml")?;
 
     // Collect all member Cargo.toml paths
-    let cargo_paths: Vec<PathBuf> = if let Some(members) = root_doc
+    let mut cargo_paths: Vec<PathBuf> = if let Some(members) = root_doc
         .get("workspace")
         .and_then(|w| w.get("members"))
         .and_then(|m| m.as_array())
@@ -237,8 +237,15 @@ fn extract_cargo_deps(corpus: &str, root: &Path) -> anyhow::Result<(Vec<Node>, V
             })
             .collect()
     } else {
-        vec![root_cargo]
+        vec![root_cargo.clone()]
     };
+
+    // A workspace root may also declare its own [package] (#893 C2). Without
+    // this the root package is never parsed, so it is emitted with an empty
+    // path and is indistinguishable from an external dependency.
+    if root_doc.get("package").is_some() && !cargo_paths.contains(&root_cargo) {
+        cargo_paths.push(root_cargo);
+    }
 
     // Parse each Cargo.toml: (pkg_name, rel_cargo_path, dep_names)
     let pkg_data: Vec<(String, String, Vec<String>)> = cargo_paths
@@ -354,6 +361,7 @@ fn extract_file_call_edges(
 
             // 1-based call-site line (issue #299). tree-sitter rows are 0-based.
             let occ_line = cap.node.start_position().row.saturating_add(1) as u32;
+            let occ_col = cap.node.start_position().column as u32;
 
             let Some((caller_fn, caller_impl)) = find_enclosing_fn(cap.node, source.as_slice())
             else {
@@ -405,6 +413,7 @@ fn extract_file_call_edges(
                         alt_callee_sig: None,
                         hint_crate: None,
                         caller_line: occ_line,
+                        caller_col: Some(occ_col),
                         is_method_call: true,
                         recv_type,
                     });
@@ -433,6 +442,7 @@ fn extract_file_call_edges(
                                     alt_callee_sig: None,
                                     hint_crate: None,
                                     caller_line: occ_line,
+                                    caller_col: Some(occ_col),
                                     is_method_call: false,
                                     recv_type: None,
                                 });
@@ -447,6 +457,7 @@ fn extract_file_call_edges(
                                     alt_callee_sig: None,
                                     hint_crate: Some(qual.clone()),
                                     caller_line: occ_line,
+                                    caller_col: Some(occ_col),
                                     is_method_call: false,
                                     recv_type: None,
                                 });
@@ -461,6 +472,7 @@ fn extract_file_call_edges(
                                     alt_callee_sig: None,
                                     hint_crate: None,
                                     caller_line: occ_line,
+                                    caller_col: Some(occ_col),
                                     is_method_call: false,
                                     recv_type: None,
                                 });
@@ -478,6 +490,7 @@ fn extract_file_call_edges(
                         alt_callee_sig: None,
                         hint_crate: None,
                         caller_line: occ_line,
+                        caller_col: Some(occ_col),
                         is_method_call: false,
                         recv_type: None,
                     });
@@ -524,6 +537,7 @@ fn extract_file_call_edges(
                         alt_callee_sig: None,
                         hint_crate: None,
                         caller_line: occ_line,
+                        caller_col: Some(occ_col),
                         is_method_call: false,
                         recv_type,
                     });
@@ -581,6 +595,7 @@ fn extract_macro_calls(
                 continue;
             }
             let occ_line = name_node.start_position().row.saturating_add(1) as u32;
+            let occ_col = name_node.start_position().column as u32;
             let Some((caller_fn, caller_impl)) = find_enclosing_fn(name_node, source) else {
                 continue;
             };
@@ -621,6 +636,7 @@ fn extract_macro_calls(
                 alt_callee_sig: None,
                 hint_crate: None,
                 caller_line: occ_line,
+                caller_col: Some(occ_col),
                 is_method_call,
                 // Macro-token recovery has no receiver AST node to inspect
                 // (it scans the raw token stream, not a parsed expression) —
@@ -873,18 +889,70 @@ const WRAPPER_CONSTRUCTOR_NAMES: &[&str] = &[
     "Option", "Arc", "Box", "Rc", "RefCell", "Mutex", "RwLock", "Cell", "Weak",
 ];
 
+/// Result/Option adapters that hand back the very value the constructor call
+/// produced, so an initializer wrapped in them carries exactly the evidence
+/// the bare constructor call does. Closed list on purpose: a name outside it
+/// stops the peel in [`peel_result_adapters`] and the initializer falls
+/// through to `None`, which is the safe answer.
+const TRANSPARENT_RESULT_ADAPTERS: &[&str] = &["unwrap", "expect", "context", "with_context"];
+
+/// Peel `?` and the [`TRANSPARENT_RESULT_ADAPTERS`] off a `let` initializer so
+/// `let s = T::open(p).with_context(|| ..)?` reaches the same `T::open(p)`
+/// constructor call that `let s = T::open(p)` already resolves through. Each
+/// step descends into a child node, so the loop always terminates.
+///
+/// Nothing else is peeled: `T::open(p).into_inner()` or `T::builder().build()`
+/// stop here and resolve to `None`, keeping the inference to shapes whose
+/// result type is the constructor's own.
+fn peel_result_adapters<'a>(
+    mut value: tree_sitter::Node<'a>,
+    source: &[u8],
+) -> tree_sitter::Node<'a> {
+    loop {
+        match value.kind() {
+            "try_expression" => match value.named_child(0) {
+                Some(inner) => value = inner,
+                None => return value,
+            },
+            "call_expression" => {
+                let Some(func) = value.child_by_field_name("function") else {
+                    return value;
+                };
+                if func.kind() != "field_expression" {
+                    return value;
+                }
+                let Some(field) = func.child_by_field_name("field") else {
+                    return value;
+                };
+                let Ok(name) = field.utf8_text(source) else {
+                    return value;
+                };
+                if !TRANSPARENT_RESULT_ADAPTERS.contains(&name) {
+                    return value;
+                }
+                match func.child_by_field_name("value") {
+                    Some(recv) => value = recv,
+                    None => return value,
+                }
+            }
+            _ => return value,
+        }
+    }
+}
+
 /// Resolve a `let_declaration`'s bound type per §4.5 bullet 2: prefer an
 /// explicit `type:` annotation; otherwise infer from a capitalized
 /// constructor call (`SqliteStore::open(..)`) or struct literal
-/// (`SqliteStore { .. }`) on the right-hand side. Anything else (a plain
-/// identifier, a method chain, a literal) is `None` — inferring through an
-/// arbitrary expression is exactly the unbounded problem #529 rejected doing
-/// with a denylist; only these two syntactically unambiguous shapes are used.
+/// (`SqliteStore { .. }`) on the right-hand side, after peeling any
+/// `?`/`unwrap`/`expect`/`context` adapters wrapped around it. Anything else
+/// (a plain identifier, an arbitrary method chain, a literal) is `None` —
+/// inferring through an arbitrary expression is exactly the unbounded problem
+/// #529 rejected doing with a denylist; only these shapes are used.
 fn extract_type_from_let(let_decl: tree_sitter::Node<'_>, source: &[u8]) -> Option<String> {
     if let Some(ty) = let_decl.child_by_field_name("type") {
         return extract_receiver_type_name(ty, source);
     }
-    let value = let_decl.child_by_field_name("value")?;
+    let value = peel_result_adapters(let_decl.child_by_field_name("value")?, source);
     match value.kind() {
         "call_expression" => {
             let func = value.child_by_field_name("function")?;
@@ -1272,6 +1340,47 @@ mod tests {
         );
     }
 
+    #[test]
+    fn t4d_constructor_behind_result_adapters_resolves() {
+        // Real repro (#877 follow-up): `travsr-daemon`'s init_repo_with_progress
+        // binds its store as
+        //   `let mut store = SqliteStore::open(&db_path).with_context(|| ..)?;`
+        // Before the adapter peel this returned None, so every `store.method()`
+        // in that function was emitted with `recv_type: None` and dropped by the
+        // daemon's #604 fail-closed gate, leaving those call edges to the
+        // fail-open rust-analyzer LSIF path alone.
+        let source =
+            b"fn f() { let mut store = SqliteStore::open(&p).with_context(|| x)?; store.begin_staging_tables(); }";
+        assert_eq!(
+            recv_type_for_call(source, "begin_staging_tables"),
+            Some("SqliteStore".to_string())
+        );
+        for src in [
+            &b"fn f() { let s = SqliteStore::open(&p)?; s.node_count(); }"[..],
+            &b"fn f() { let s = SqliteStore::open(&p).unwrap(); s.node_count(); }"[..],
+            &b"fn f() { let s = SqliteStore::open(&p).expect(\"m\"); s.node_count(); }"[..],
+            &b"fn f() { let s = SqliteStore::open(&p).context(\"m\")?; s.node_count(); }"[..],
+        ] {
+            assert_eq!(
+                recv_type_for_call(src, "node_count"),
+                Some("SqliteStore".to_string()),
+                "adapter-wrapped constructor must resolve: {}",
+                String::from_utf8_lossy(src)
+            );
+        }
+    }
+
+    #[test]
+    fn t4e_non_transparent_adapter_still_resolves_to_none() {
+        // Only adapters that return the constructor's own value are peeled. A
+        // chain that transforms the type (`.build()`, `.to_str()`) carries no
+        // evidence of the binding's type and must stay None.
+        let source = b"fn f() { let s = SqliteStore::builder().build(); s.node_count(); }";
+        assert_eq!(recv_type_for_call(source, "node_count"), None);
+        let source2 = b"fn f() { let s = PathBuf::from(&p).to_str().unwrap(); s.node_count(); }";
+        assert_eq!(recv_type_for_call(source2, "node_count"), None);
+    }
+
     /// Manual measurement tool for #529 Phase 0 (plan §6.1 R-2/R-3/R-4) — not
     /// part of the regular suite (`#[ignore]`). Walks this repo's own `.rs`
     /// files with the real extraction path and dumps every method-call site's
@@ -1396,6 +1505,18 @@ fn run(z: &Zoo) {
             .expect("bare call recovered from macro");
         assert_eq!(greet.caller_line, 5);
 
+        // RFC-027 #813 P2: the captured byte column points at the callee
+        // identifier itself, so the editor resolves the exact occurrence.
+        let src_str = std::str::from_utf8(source).unwrap();
+        let col_points_at = |u: &UnresolvedCall, leaf: &str| {
+            let line = src_str.lines().nth((u.caller_line - 1) as usize).unwrap();
+            let col = u.caller_col.expect("occurrence column captured") as usize;
+            line[col..].starts_with(leaf)
+        };
+        assert!(col_points_at(describe, "describe"));
+        assert!(col_points_at(speak, "speak"));
+        assert!(col_points_at(greet, "greet"));
+
         // No guessed callee ids: every recovered call is attributed to `run`.
         let run_id = VName::new("c", "", "main.rs", "rust", "fn:run").id();
         for u in &out {
@@ -1421,6 +1542,81 @@ fn run() {
             out.is_empty(),
             "expected no calls, got {:?}",
             out.iter().map(|u| &u.callee_sig).collect::<Vec<_>>()
+        );
+    }
+
+    // ── Cargo dep anchoring (#893 C2) ─────────────────────────────────────────
+
+    /// Writes `Cargo.toml` files under a fresh temp dir and runs the extractor.
+    /// Returns (crate signature -> path) for every emitted `crate` node.
+    fn cargo_crate_paths(files: &[(&str, &str)]) -> HashMap<String, String> {
+        let dir = tempfile::tempdir().unwrap();
+        for (rel, body) in files {
+            let path = dir.path().join(rel);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            std::fs::write(&path, body).unwrap();
+        }
+        let (nodes, _edges) = extract_cargo_deps("c", dir.path()).unwrap();
+        nodes
+            .iter()
+            .filter(|n| n.kind == "crate")
+            .map(|n| (n.vname.signature.clone(), n.vname.path.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn cargo_deps_anchor_root_package_in_a_workspace_root() {
+        // A root Cargo.toml that declares BOTH [package] and [workspace] members
+        // must still anchor its own package to the root manifest (#893 C2).
+        let paths = cargo_crate_paths(&[
+            (
+                "Cargo.toml",
+                "[package]\nname = \"rootpkg\"\n\n[workspace]\nmembers = [\"sub\"]\n\n[dependencies]\nclap = \"4\"\n",
+            ),
+            (
+                "sub/Cargo.toml",
+                "[package]\nname = \"subpkg\"\n\n[dependencies]\nrootpkg = { path = \"..\" }\n",
+            ),
+        ]);
+        assert_eq!(
+            paths.get("crate:rootpkg").map(String::as_str),
+            Some("Cargo.toml"),
+            "root package lost its manifest anchor; got {paths:?}"
+        );
+        assert_eq!(
+            paths.get("crate:subpkg").map(String::as_str),
+            Some("sub/Cargo.toml"),
+            "member package anchor regressed; got {paths:?}"
+        );
+        assert_eq!(
+            paths.get("crate:clap").map(String::as_str),
+            Some(""),
+            "external dependency must stay unanchored; got {paths:?}"
+        );
+    }
+
+    #[test]
+    fn cargo_deps_virtual_workspace_emits_members_only() {
+        // A virtual workspace has no root [package], so no crate node may be
+        // anchored to the root manifest.
+        let paths = cargo_crate_paths(&[
+            ("Cargo.toml", "[workspace]\nmembers = [\"a\", \"b\"]\n"),
+            ("a/Cargo.toml", "[package]\nname = \"a\"\n"),
+            ("b/Cargo.toml", "[package]\nname = \"b\"\n"),
+        ]);
+        assert_eq!(
+            paths.get("crate:a").map(String::as_str),
+            Some("a/Cargo.toml")
+        );
+        assert_eq!(
+            paths.get("crate:b").map(String::as_str),
+            Some("b/Cargo.toml")
+        );
+        assert!(
+            !paths.values().any(|p| p == "Cargo.toml"),
+            "virtual workspace must not anchor anything to the root manifest; got {paths:?}"
         );
     }
 }

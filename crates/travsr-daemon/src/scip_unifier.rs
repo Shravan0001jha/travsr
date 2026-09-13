@@ -43,6 +43,25 @@ pub struct UnifyOutcome {
     /// Defs in tree-sitter-unindexed files (vendored gem code) are NOT dropped:
     /// they are real navigable definitions, only excluded from the counters.
     pub dropped: HashSet<NodeId>,
+    /// #825: one detail row per distinct callable/type SCIP symbol counted in
+    /// `attempted` but not in `unified` — i.e. exactly the defs behind the E6
+    /// miss rate. Carried out so `travsr status` can name the symbols instead of
+    /// only reporting a count, and so a dev can see which language/construct is
+    /// failing. The miss set is deterministic, so re-running never changes it.
+    pub misses: Vec<UnifyMiss>,
+}
+
+/// A single unreconciled SCIP definition: a callable/type the compiler defined
+/// that could not be matched to its Phase A tree-sitter node, so its references
+/// attribute to an orphan duplicate. One row per distinct SCIP symbol (its
+/// first-seen occurrence), mirroring how the miss rate counts symbols.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnifyMiss {
+    pub language: String,
+    pub symbol: String,
+    pub path: String,
+    pub line: u32,
+    pub kind: String,
 }
 
 /// G1 unification pass for all SCIP-indexed languages.
@@ -96,7 +115,14 @@ pub fn unify_all(
     // re-query without re-parsing the SCIP descriptor.
     // Carries the kind too: the cross-file rung below is restricted by it, and
     // re-deriving it would mean re-parsing the SCIP descriptor.
-    let mut unmatched: Vec<(NodeId, &str, Vec<String>, &str)> = Vec::new();
+    // Carries the path and the container-qualified candidates too, for the
+    // overload-collapse rung, which is same-file and ignores line distance.
+    #[allow(clippy::type_complexity)]
+    let mut unmatched: Vec<(NodeId, &str, Vec<String>, &str, &str, Vec<String>)> = Vec::new();
+    // #825: first-seen detail for each callable/type SCIP symbol that becomes an
+    // attempt, so the residual misses (`attempted - unified`) can be named in
+    // `travsr status`. Keyed by scip symbol to match the per-symbol counters.
+    let mut miss_detail: HashMap<&str, UnifyMiss> = HashMap::new();
 
     // #780: paths the tree-sitter parser actually indexed. A SCIP def in a file
     // absent from this set is one only the SCIP tool saw — gitignored vendored
@@ -115,6 +141,17 @@ pub fn unify_all(
         // re-unified against themselves.
         let (parsed, is_scip) = match travsr_indexer::scip_unifier::scip_name_kind(scip_sym) {
             Some(p) => (p, true),
+            // Scala's sidecar reads SemanticDB, whose symbols are a bare
+            // descriptor chain with none of SCIP's `<scheme> <mgr> <pkg>
+            // <version>` prefix, so `scip_name_kind` rejects all of them. Parsed
+            // as SCIP-shaped rather than Phase-A-shaped, because the descriptor
+            // grammar is SCIP's: `…/Parsers#phrase().`.
+            None if node.vname.language.as_str() == "scala" => {
+                match travsr_indexer::scip_unifier::semanticdb_name_kind(&node.vname.signature) {
+                    Some(p) => (p, true),
+                    None => continue,
+                }
+            }
             None if matches!(node.vname.language.as_str(), "kotlin" | "swift" | "dart") => {
                 match travsr_indexer::scip_unifier::native_name_kind(
                     &node.vname.signature,
@@ -180,6 +217,18 @@ pub fn unify_all(
         // match arm), so its recovery cannot push the miss rate up.
         if is_callable_type && !dsl_contained {
             attempted_syms.insert(scip_sym);
+            miss_detail.entry(scip_sym).or_insert_with(|| UnifyMiss {
+                language: node.vname.language.clone(),
+                // Readable `Container.name` (or bare `name`) rather than the raw
+                // SCIP moniker — enough for a dev to spot the construct/language.
+                symbol: match parsed.container {
+                    Some(c) => format!("{c}.{}", parsed.name),
+                    None => parsed.name.to_string(),
+                },
+                path: node.vname.path.clone(),
+                line,
+                kind: parsed.kind.to_string(),
+            });
         }
 
         match store.find_ts_node_for_unification(
@@ -208,7 +257,14 @@ pub fn unify_all(
             Ok(None) if dsl_contained => {
                 dropped.insert(node.id);
             }
-            Ok(None) => unmatched.push((node.id, scip_sym, candidates, parsed.kind)),
+            Ok(None) => unmatched.push((
+                node.id,
+                scip_sym,
+                candidates,
+                parsed.kind,
+                node.vname.path.as_str(),
+                travsr_indexer::scip_unifier::overload_collapse_signatures(&parsed),
+            )),
             Err(e) => tracing::warn!(symbol = %scip_sym, "G1: DB lookup: {e:#}"),
         }
     }
@@ -218,7 +274,7 @@ pub fn unify_all(
     // C/C++ header/source). Alias it onto that node so it is dropped as a
     // duplicate and its edges/refs rewrite onto the real node, and credit its
     // symbol as unified so the miss-rate does not penalize the benign twin.
-    for (node_id, sym, candidates, kind) in unmatched {
+    for (node_id, sym, candidates, kind, path, overload_sigs) in unmatched {
         // Rung 1: the symbol unified in another file, so this occurrence is
         // the benign twin.
         if let Some(&ts_id) = sym_to_ts.get(sym) {
@@ -230,6 +286,40 @@ pub fn unify_all(
                 unified_syms.insert(sym);
             }
             continue;
+        }
+
+        // Rung 1b: the SCIP def is one overload of a method group whose Phase A
+        // node is shared by every overload. Phase A signatures carry no
+        // parameter list, so `C#n().`, `C#n(+1).`, ... all belong to the single
+        // `method:C.n` node anchored at the first overload's span, and every
+        // later overload misses both span-containment and the +/-5 window above.
+        // Resolving that by same-file uniqueness on the *container-qualified*
+        // signature is exact, not heuristic: one match means one method group.
+        //
+        // Measured on the C# fixture (commandlineparser): constructors are the
+        // dominant case, 113 of the 120 unreconciled callable defs. The first
+        // overload of `OptionAttribute` carried 0 ref/call edges while overloads
+        // +1..+4 carried all 103, so the candidate fix alone recovered nothing;
+        // this rung is what makes those edges reachable from the type.
+        //
+        // Placed before rung 2: a same-file qualified match is stronger evidence
+        // than rung 2's corpus-wide uniqueness, and it is checked first so the
+        // wider rung never gets to answer a question this one already can.
+        if !overload_sigs.is_empty() {
+            match store.find_unique_ts_node_in_file(corpus, path, &overload_sigs) {
+                Ok(Some(ts_id)) => {
+                    aliases.push((sym.to_string(), ts_id));
+                    alias_map.insert(node_id, ts_id);
+                    sym_to_ts.entry(sym).or_insert(ts_id);
+                    if attempted_syms.contains(sym) {
+                        unified_syms.insert(sym);
+                    }
+                    tracing::trace!(symbol = %sym, ?ts_id, "G1: unified onto overload group");
+                    continue;
+                }
+                Ok(None) => {}
+                Err(e) => tracing::warn!(symbol = %sym, "G1: overload lookup: {e:#}"),
+            }
         }
 
         // Rung 2: the declaration is the *only* Phase A node and it lives in
@@ -284,6 +374,14 @@ pub fn unify_all(
 
     let attempted = attempted_syms.len();
     let unified = unified_syms.len();
+    // #825: the residual misses are exactly the attempted symbols that never
+    // unified. Emit one detail row each (sorted by path:line for a stable list)
+    // so `travsr status` can name them rather than only counting them.
+    let mut misses: Vec<UnifyMiss> = attempted_syms
+        .difference(&unified_syms)
+        .filter_map(|s| miss_detail.get(s).cloned())
+        .collect();
+    misses.sort_by(|a, b| a.path.cmp(&b.path).then(a.line.cmp(&b.line)));
 
     if let Err(e) = store.register_symbol_aliases(&aliases) {
         tracing::warn!("G1: register_symbol_aliases batch: {e:#}");
@@ -312,6 +410,7 @@ pub fn unify_all(
         attempted,
         alias_map,
         dropped,
+        misses,
     }
 }
 
@@ -379,6 +478,64 @@ mod tests {
             !out.dropped.contains(&real.id),
             "the real method must not be dropped"
         );
+    }
+
+    #[test]
+    fn a_real_miss_is_named_in_the_outcome() {
+        // #825: an indexed-file callable def with no Phase A twin is a real miss.
+        // It must appear in `out.misses` with its language, kind, readable
+        // `Container.name`, and path:line, so `travsr status` can name it instead
+        // of only counting it.
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        // A Phase A twin at lib/app.rb makes that path "indexed"; the orphan def
+        // lives in the same file but has no twin of its own.
+        let ts = Node::new(
+            VName::new("c", "main", "lib/app.rb", "ruby", "method:App.run"),
+            "method",
+        )
+        .with_line(2)
+        .with_end_line(2);
+        store
+            .write_phase_b_batch(std::slice::from_ref(&ts), &[], "scip")
+            .unwrap();
+
+        let good = scip_node("lib/app.rb", "scip-ruby gem g 0.0.0 App#run().", 2);
+        let orphan = scip_node("lib/app.rb", "scip-ruby gem g 0.0.0 App#missing().", 99);
+
+        let nodes = vec![good.clone(), orphan.clone()];
+        let mut refs: Vec<ScipRef> = Vec::new();
+        let out = unify_all(&mut store, "c", &nodes, &mut refs);
+
+        assert_eq!(out.attempted, 2, "both callable defs are attempts");
+        assert_eq!(out.unified, 1, "only App#run unifies onto its twin");
+        assert_eq!(out.misses.len(), 1, "exactly the orphan is a named miss");
+        let m = &out.misses[0];
+        assert_eq!(m.language, "ruby");
+        assert_eq!(m.kind, "function");
+        assert_eq!(m.symbol, "App.missing");
+        assert_eq!(m.path, "lib/app.rb");
+        assert_eq!(m.line, 99);
+    }
+
+    #[test]
+    fn a_fully_unified_pass_reports_no_misses() {
+        // The list must be empty when nothing misses, so status prints no stray
+        // rows.
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let ts = Node::new(
+            VName::new("c", "main", "lib/app.rb", "ruby", "method:App.run"),
+            "method",
+        )
+        .with_line(2)
+        .with_end_line(2);
+        store
+            .write_phase_b_batch(std::slice::from_ref(&ts), &[], "scip")
+            .unwrap();
+        let good = scip_node("lib/app.rb", "scip-ruby gem g 0.0.0 App#run().", 2);
+        let mut refs: Vec<ScipRef> = Vec::new();
+        let out = unify_all(&mut store, "c", &[good], &mut refs);
+        assert_eq!(out.unified, out.attempted);
+        assert!(out.misses.is_empty(), "no misses => empty list");
     }
 
     #[test]
