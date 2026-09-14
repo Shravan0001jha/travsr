@@ -87,8 +87,21 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: bash .github/scripts/vscode-version-gate.sh publish-pin
 
+      # `--omit=dev`, matching the same audit in vscode.yml, which is the gate
+      # every pull request to this package already passes. The two disagreed,
+      # and the stricter one here is unreachable rather than safer: the publish
+      # runs `vsce package --no-dependencies`, so the .vsix carries package.json,
+      # media/, out/ and resources/ and not one node_modules entry. Nothing npm
+      # resolves is shipped, so a devDependency advisory (mocha, vsce, textlint)
+      # cannot reach a user through the extension.
+      #
+      # It can, however, block a republish. A js-yaml advisory reachable only
+      # from mocha and vsce was failing this step while #882 was open, which is
+      # the case where the release being held up is itself the security fix.
+      # Build-tooling advisories are real, but they belong to CI and Dependabot,
+      # not to the gate deciding whether users get the current binary.
       - name: Audit npm dependencies
-        run: npm audit --audit-level=high
+        run: npm audit --omit=dev --audit-level=high
 
       - name: Type-check
         run: npm run lint

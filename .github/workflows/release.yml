@@ -145,6 +145,7 @@ jobs:
             "plugin-hashes.lock"
             "release/installer target maps"
             "release promotion gate policy"
+            "vscode version gate (shell tests)"
             "TL1/TL2 — zero LLM/embedding deps in travsr-mcp"
             "Phase 2 correctness suite"
             "Bench p95 < 50 ms"
