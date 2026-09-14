@@ -22,6 +22,11 @@ name: vscode marketplace drift
 # against the current stable release. Same shape and rationale as
 # lang-release-drift.yml: two systems that cannot see each other, reconciled by
 # asking the live one what it holds.
+#
+# The comparison logic and its failure modes live in
+# .github/scripts/vscode-version-gate.sh, which is unit-tested. Keeping it out
+# of this file is deliberate: the first revision inlined it here, and both
+# defects found in review were only reachable by extracting the step by hand.
 
 on:
   # A release is the event that creates the drift, so check immediately after
@@ -33,14 +38,11 @@ on:
     # when someone runs `travsr lang install`; here every extension install in
     # the window lands on the wrong binary, so the window is the cost.
     - cron: '0 7 * * *'
-  # On a pull request the published-vs-release comparison is informational: only
-  # a republish can clear it, so gating unrelated PRs on it would block work none
-  # of them can unblock. The tree-pin check below it gates on every trigger,
-  # because that one IS fixable in a PR.
   pull_request:
     paths:
       - 'packages/travsr-vscode/src/installer.ts'
       - 'packages/travsr-vscode/package.json'
+      - '.github/scripts/vscode-version-gate.sh'
       - '.github/workflows/vscode-marketplace-drift.yml'
       - '.github/workflows/vscode-publish.yml'
   workflow_dispatch:
@@ -56,114 +58,28 @@ jobs:
       - name: Checkout
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
         with:
-          # Tags are the record of what each published extension contained, so
-          # the shallow default is not enough.
+          # The drift step reads the pin a published extension shipped with
+          # straight out of its vscode-v* tag, and which tag that is only
+          # becomes known after the Marketplace answers, so the tags have to be
+          # here already. The shallow default has none of them.
           fetch-depth: 0
 
+      # Reports what is published. On a pull request this is informational:
+      # only a republish clears drift, and an unreachable gallery is not
+      # something a pull request can fix either. Both route the same way, and
+      # neither is ever reported as "no drift".
       - name: compare the published extension against the current release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
+        run: bash .github/scripts/vscode-version-gate.sh marketplace-drift
 
-          # 1. What is the current stable binary release?
-          #    `v*` excluding the vscode-v* family and any prerelease/draft.
-          LATEST=$(gh release list --repo "$GITHUB_REPOSITORY" --limit 100 \
-            --json tagName,isPrerelease,isDraft \
-            --jq '[.[] | select(.isPrerelease == false and .isDraft == false)
-                       | select(.tagName | startswith("v"))
-                       | select(.tagName | startswith("vscode-") | not)
-                       | .tagName][0]')
-          [ -n "$LATEST" ] || { echo "could not resolve the latest stable release" >&2; exit 1; }
-          echo "latest stable binary release: $LATEST"
-
-          # 2. What version is actually on the Marketplace?
-          #    Public gallery API. flags=914 asks for versions in the response.
-          PUBLISHED=$(curl -sS -X POST \
-            'https://marketplace.visualstudio.com/_apis/public/gallery/extensionquery' \
-            -H 'Content-Type: application/json' \
-            -H 'Accept: application/json;api-version=7.2-preview.1' \
-            -d '{"filters":[{"criteria":[{"filterType":7,"value":"travsr.travsr-vscode"}]}],"flags":914}' \
-            | jq -r '.results[0].extensions[0].versions[0].version // empty')
-
-          if [ -z "$PUBLISHED" ]; then
-            # Not a silent pass: an unreachable gallery means we learned
-            # nothing, and "learned nothing" must not read as "no drift".
-            echo "::error::could not read the published extension version from the Marketplace"
-            exit 1
-          fi
-          echo "published extension version: $PUBLISHED"
-
-          # 3. What binary does THAT build point at? The vscode-v<version> tag
-          #    is the record of what shipped, which avoids downloading and
-          #    unpacking the .vsix to read one constant.
-          TAG="vscode-v$PUBLISHED"
-          git rev-parse -q --verify "refs/tags/$TAG" >/dev/null || {
-            echo "::error::the Marketplace serves $PUBLISHED but no $TAG tag exists, so what it contains cannot be established"
-            exit 1
-          }
-          DL=$(git show "$TAG:packages/travsr-vscode/src/installer.ts" \
-                | grep -m1 'export const DOWNLOAD_VERSION' | cut -d'"' -f2)
-          [ -n "$DL" ] || { echo "::error::could not read DOWNLOAD_VERSION from $TAG" >&2; exit 1; }
-          echo "that build installs: v$DL"
-
-          # 4. The comparison.
-          if [ "v$DL" = "$LATEST" ]; then
-            echo "OK: the published extension installs $LATEST, the current release"
-            exit 0
-          fi
-
-          SUMMARY="the published extension installs v$DL but the current release is $LATEST"
-
-          # Only a republish can clear this, and a pull request cannot publish.
-          # Failing PRs on it would block every unrelated change touching these
-          # paths on a state none of them can fix, so a PR reports it and moves
-          # on. The scheduled and post-release runs are the ones that gate,
-          # because those are the ones a human can act on.
-          if [ "${GITHUB_EVENT_NAME:-}" = "pull_request" ]; then
-            echo "::warning::$SUMMARY (informational on a pull request: only a republish clears it)"
-            LEVEL=notice
-          else
-            echo "::error::$SUMMARY"
-            LEVEL=error
-          fi
-
-          cat >&2 <<EOF
-
-          Marketplace extension  $PUBLISHED  (tag $TAG)
-            DOWNLOAD_VERSION     $DL
-          Current stable release $LATEST
-
-          Every fresh install that reaches the download prompt gets a binary
-          $DL instead of ${LATEST#v}. Republish the extension: bump
-          packages/travsr-vscode/package.json, confirm DOWNLOAD_VERSION is
-          ${LATEST#v}, and cut a new vscode-v* tag.
-          EOF
-
-          [ "$LEVEL" = "notice" ] && exit 0
-          exit 1
-
-      # What a pull request CAN fix, so this one gates on every trigger: the pin
-      # in the tree must name the current stable release. The step above reads
-      # what is published; this reads what the next publish would carry.
-      - name: the pin in this tree must name the current release
-        run: |
-          set -euo pipefail
-          DL=$(grep -m1 'export const DOWNLOAD_VERSION' \
-                 packages/travsr-vscode/src/installer.ts | cut -d'"' -f2)
-          LATEST=$(gh release list --repo "$GITHUB_REPOSITORY" --limit 100 \
-            --json tagName,isPrerelease,isDraft \
-            --jq '[.[] | select(.isPrerelease == false and .isDraft == false)
-                       | select(.tagName | startswith("v"))
-                       | select(.tagName | startswith("vscode-") | not)
-                       | .tagName][0]')
-          LATEST="${LATEST#v}"
-          [ -n "$LATEST" ] || { echo "could not resolve the latest stable release" >&2; exit 1; }
-          [ "$DL" = "$LATEST" ] || {
-            echo "::error::DOWNLOAD_VERSION $DL in the tree is not the current release v$LATEST"
-            echo "fix packages/travsr-vscode/src/installer.ts before the next publish" >&2
-            exit 1
-          }
-          echo "OK: the tree pins $DL, the current release"
+      # The independently actionable half: what the NEXT publish would carry.
+      # This has to run even when the step above has already failed, because
+      # the two findings are unrelated. A drift alarm nobody can clear in a
+      # pull request must not also hide a stale pin somebody can fix in one.
+      # `!cancelled()` rather than `always()` so a cancelled run still stops.
+      - name: the pin in this tree must not be behind the current release
+        if: ${{ !cancelled() }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: bash .github/scripts/vscode-version-gate.sh tree-pin

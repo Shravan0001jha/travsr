@@ -401,6 +401,28 @@ jobs:
       - name: verify release matrix and installer target maps agree (#576)
         run: node .github/scripts/check-target-maps.mjs
 
+  vscode-version-gate:
+    name: vscode version gate (shell tests)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install shellcheck if missing
+        run: |
+          if ! command -v shellcheck >/dev/null 2>&1; then
+            sudo apt-get update && sudo apt-get install -y shellcheck
+          fi
+
+      - name: shellcheck the version gate (#882)
+        run: shellcheck .github/scripts/vscode-version-gate.sh .github/scripts/tests/vscode-version-gate.test.sh
+
+      # The gate decides whether a release can be cut and whether a pull
+      # request goes red, and its interesting cases are all states that are
+      # awkward to reach on purpose (a gallery outage, a WAF page, a release
+      # PR mid-flight). The test stubs gh and curl and drives them.
+      - name: version gate behaviour (#882)
+        run: bash .github/scripts/tests/vscode-version-gate.test.sh
+
   install-sh-lint:
     name: "install.sh (shellcheck)"
     runs-on: ubuntu-latest

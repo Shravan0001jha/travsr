@@ -73,30 +73,19 @@ jobs:
       # stable releases", pointing the other way: an extension must not ship a
       # pointer at a release that does not exist, or one already superseded at
       # the moment it is published.
+      #
+      # Equality, unlike the tree-pin check in vscode-marketplace-drift.yml,
+      # which only requires the pin not to be BEHIND. This is the step that
+      # makes the looser one safe: a pin running ahead of every real release is
+      # legal on master while a release is in flight, and stops being legal
+      # here, where it decides what users actually download.
       - name: DOWNLOAD_VERSION must be the latest stable release
         if: startsWith(github.ref, 'refs/tags/vscode-v')
+        # Resolved from the repository root; the job default is the package dir.
+        working-directory: ${{ github.workspace }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          DL=$(grep -m1 'export const DOWNLOAD_VERSION' src/installer.ts | cut -d'"' -f2)
-          # Stable only: prereleases are exempt for the same reason release.yml
-          # exempts them, a pin at an unpublished stable tag is a guaranteed 404.
-          LATEST=$(gh release list --repo "$GITHUB_REPOSITORY" --limit 100 \
-            --json tagName,isPrerelease,isDraft \
-            --jq '[.[] | select(.isPrerelease == false and .isDraft == false)
-                       | select(.tagName | startswith("v"))
-                       | select(.tagName | startswith("vscode-") | not)
-                       | .tagName][0]')
-          LATEST="${LATEST#v}"
-          [ -n "$LATEST" ] || { echo "could not resolve the latest stable release" >&2; exit 1; }
-          [ "$DL" = "$LATEST" ] || {
-            echo "DOWNLOAD_VERSION $DL != latest stable release v$LATEST" >&2
-            echo "the extension would install a binary that is not the current release" >&2
-            echo "fix packages/travsr-vscode/src/installer.ts" >&2
-            exit 1
-          }
-          echo "OK: DOWNLOAD_VERSION $DL is the latest stable release"
+        run: bash .github/scripts/vscode-version-gate.sh publish-pin
 
       - name: Audit npm dependencies
         run: npm audit --audit-level=high
