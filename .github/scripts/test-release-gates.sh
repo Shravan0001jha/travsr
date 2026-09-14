@@ -23,6 +23,9 @@ SCRIPT="$HERE/release-gates.sh"
 # Overridable so a deliberately broken copy (a mutant) can be checked against
 # the wiring assertions without editing the real workflow.
 RELEASE_YML="${RELEASE_YML:-$HERE/../workflows/release.yml}"
+# Same reason: the REQUIRED-name check below reads every workflow's job names,
+# and a mutant needs to be able to point it at a doctored copy of the tree.
+WORKFLOWS_DIR="${WORKFLOWS_DIR:-$HERE/../workflows}"
 
 PASS=0
 FAIL=0
@@ -202,6 +205,56 @@ if printf '%s\n' "$uncommented" | grep -n "skipped" >/dev/null; then
 else
     ok "release.yml never reasons about a skipped job outside comments"
 fi
+
+# Every name in preflight's REQUIRED list must be one a job can actually
+# produce. The list is matched against check-run names with `grep -qxF`, so a
+# name nothing emits is not a loud error: preflight simply never sees it pass
+# and every release tag fails on a check that no longer exists. This has
+# already happened once, when the MSRV job was renamed from 1.75 to 1.88
+# without editing the list, and the same trap is documented on that job.
+#
+# Job names are templates, so `test (${{ matrix.os }})` has to match
+# `test (ubuntu-latest)`. Each `${{ ... }}` becomes a glob `*` and the compare
+# is a bash pattern match, not a regex, so the parens, slashes and dashes in
+# these names carry no meaning of their own.
+#
+# Scope: this proves the name is emittable, not that the job runs on the
+# release commit's event. A name that resolves only to a release.yml job would
+# pass here and still never be green at preflight time.
+job_name_patterns() {
+    local f
+    for f in "$WORKFLOWS_DIR"/*.yml; do
+        # Job-level `name:` sits at exactly four spaces; steps are at six.
+        sed -n 's/^    name:[[:space:]]*//p' "$f"
+    done | sed -e 's/^"\(.*\)"$/\1/' -e "s/^'\(.*\)'$/\1/" \
+         -e 's/\${{[^}]*}}/*/g'
+}
+
+mapfile -t PATTERNS < <(job_name_patterns)
+if [[ "${#PATTERNS[@]}" -eq 0 ]]; then
+    fail "found no job names under $WORKFLOWS_DIR, so the REQUIRED check proves nothing"
+fi
+
+mapfile -t REQUIRED_NAMES < <(
+    awk '/REQUIRED=\(/{f=1;next} f&&/^[[:space:]]*\)/{exit} f' "$RELEASE_YML" \
+        | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e 's/^"\(.*\)"$/\1/'
+)
+if [[ "${#REQUIRED_NAMES[@]}" -eq 0 ]]; then
+    fail "could not read preflight's REQUIRED list from $RELEASE_YML"
+fi
+
+for req in "${REQUIRED_NAMES[@]}"; do
+    matched=""
+    for pat in "${PATTERNS[@]}"; do
+        # shellcheck disable=SC2053  # pattern match is the point, not equality
+        if [[ "$req" == $pat ]]; then matched=1; break; fi
+    done
+    if [[ -n "$matched" ]]; then
+        ok "required check \"$req\" is a name some job emits"
+    else
+        fail "required check \"$req\" matches no job name in $WORKFLOWS_DIR; preflight would wait forever on it"
+    fi
+done
 
 echo
 echo "passed: $PASS  failed: $FAIL"
