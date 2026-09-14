@@ -32,6 +32,24 @@ EXTENSION_ID='travsr.travsr-vscode'
 INSTALLER_TS='packages/travsr-vscode/src/installer.ts'
 SEMVER_RE='^[0-9]+\.[0-9]+\.[0-9]+$'
 
+# Before anything else, and before the `cd` below shells out to git. Every
+# tool failure further down is deliberately reported in terms of what could
+# not be learned ("no stable release found", "response was not the expected
+# JSON"), because the data being wrong and the data being unreadable must both
+# fail. That wording is only honest if the tools themselves are known to be
+# present: with jq absent, `jq ... 2>/dev/null` fails exactly like an empty
+# release list, and a machine without jq would have read "no stable release"
+# as a fact about the repository. GitHub's runners ship all four; a laptop may
+# not, and that is where a maintainer reproduces a red run.
+missing=""
+for tool in git gh curl jq; do
+  command -v "$tool" >/dev/null 2>&1 || missing="$missing $tool"
+done
+if [ -n "$missing" ]; then
+  echo "::error::vscode-version-gate.sh needs these tools on PATH and cannot find them:$missing" >&2
+  exit 1
+fi
+
 cd "$(git rev-parse --show-toplevel)"
 
 # --- reporting -------------------------------------------------------------

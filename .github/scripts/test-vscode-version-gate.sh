@@ -23,6 +23,9 @@ set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 GATE="$HERE/vscode-version-gate.sh"
+# Overridable so a doctored copy (a mutant) can be run against the wiring
+# assertions at the end without editing the real workflow.
+PUBLISH_YML="${PUBLISH_YML:-$HERE/../workflows/vscode-publish.yml}"
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
@@ -134,8 +137,16 @@ expect() {  # <name> <want_rc> <want_substring>
   ok "$name"
 }
 
-refute() {  # <name> <unwanted_substring>: guards against a raw tool error
+# Guards against a raw tool error leaking through. "Does not contain X" is
+# vacuously true of empty output, so a gate that printed nothing (a missing
+# tool, a crash before the first echo) must not pass here; every refute
+# therefore also demands that the run produced something.
+refute() {  # <name> <unwanted_substring>
   local name="$1" unwanted="$2"
+  if [ -z "$OUT" ]; then
+    fail "$name (no output at all, so absence of '$unwanted' proves nothing)"
+    return
+  fi
   case "$OUT" in
     *"$unwanted"*)
       fail "$name (output must not contain: $unwanted)"
@@ -149,16 +160,29 @@ refute() {  # <name> <unwanted_substring>: guards against a raw tool error
 
 unset FAKE_GH_FAIL FAKE_CURL_RC 2>/dev/null || true
 
+# One run, one positive assertion on it, then the refutes ride on the same
+# output. A refute on its own run could pass on a gate that failed silently.
 run schedule latest-stable
 expect "latest-stable takes the semver maximum, not the newest created" 0 "v1.0.0"
 refute "latest-stable ignores the newer backport v0.11.1" "v0.11.1"
-
-run schedule latest-stable
 refute "latest-stable ignores the vscode-v* tag family" "vscode-"
 
 FAKE_GH_FAIL=1 run schedule latest-stable
 expect "a gh failure is reported, never treated as no releases" 1 "could not list releases"
 unset FAKE_GH_FAIL
+
+# The tools the gate shells out to are checked before anything else runs, so a
+# machine without jq gets told that, rather than "no stable release found",
+# which reads as a fact about the repository. PATH is reduced to the stub
+# directory alone. The interpreter is named by absolute path ($BASH): bash
+# applies a preceding `PATH=` assignment BEFORE searching for the command word,
+# so a bare `bash` here would itself be "command not found" (exit 127) and
+# the gate would never start.
+OUT="$(cd "$REPO" && PATH="$WORK/bin" GITHUB_EVENT_NAME=schedule "$BASH" "$GATE" latest-stable 2>&1)"
+RC=$?
+expect "a missing tool is named, before any check runs" 1 "cannot find them"
+expect "the missing tool named is jq" 1 " jq"
+refute "a missing tool is never reported as an empty release list" "no stable release found"
 
 # --- tree-pin --------------------------------------------------------------
 
@@ -277,6 +301,53 @@ marketplace_body 0.12.0
 FAKE_GH_FAIL=1 run pull_request marketplace-drift
 expect "drift cannot be judged without the release list, on any trigger" 1 "could not resolve the latest stable release"
 unset FAKE_GH_FAIL
+
+# --- vscode-publish.yml wiring ---------------------------------------------
+#
+# What the gate cannot see from the inside: whether publishing can happen on a
+# ref the gates never ran on. The two version gates are steps in `build`,
+# conditioned on vscode-v* tags; `release` is the job that actually publishes.
+# Review found `release` on the wider `refs/tags/`, so a workflow_dispatch from
+# a CLI tag with dry_run off would have skipped both gates and published. The
+# three conditions must be one and the same predicate.
+
+# job_if <job>: the `if:` of a top-level job, whitespace-normalised.
+job_if() {
+  awk -v job="$1" '
+    $0 ~ "^  " job ":$" { injob = 1; next }
+    injob && /^  [A-Za-z0-9_-]+:/ { exit }
+    injob && /^    if:/ { sub(/^    if:[[:space:]]*/, ""); print; exit }
+  ' "$PUBLISH_YML" | tr -s '[:space:]' ' ' | sed 's/ $//'
+}
+
+# step_if <step name>: the `if:` of the named step, whitespace-normalised.
+step_if() {
+  awk -v name="$1" '
+    $0 ~ "^      - name: " name "$" { instep = 1; next }
+    instep && /^      - / { exit }
+    instep && /^        if:/ { sub(/^        if:[[:space:]]*/, ""); print; exit }
+  ' "$PUBLISH_YML" | tr -s '[:space:]' ' ' | sed 's/ $//'
+}
+
+release_if="$(job_if release)"
+pkg_if="$(step_if 'package.json version must match the tag')"
+pin_if="$(step_if 'DOWNLOAD_VERSION must be the latest stable release')"
+
+for pair in "release job:$release_if" "package.json gate:$pkg_if" "DOWNLOAD_VERSION gate:$pin_if"; do
+  label="${pair%%:*}"; cond="${pair#*:}"
+  if [ -z "$cond" ]; then
+    fail "publish wiring: could not read the condition of the $label from $PUBLISH_YML"
+  elif [[ "$cond" == *"refs/tags/vscode-v"* ]]; then
+    ok "publish wiring: the $label only runs on vscode-v* tags"
+  else
+    fail "publish wiring: the $label runs on refs the version gates do not cover: $cond"
+  fi
+done
+if [ -n "$release_if" ] && [ "$release_if" = "$pkg_if" ] && [ "$release_if" = "$pin_if" ]; then
+  ok "publish wiring: publishing and both gates share one predicate, so neither can drift alone"
+else
+  fail "publish wiring: conditions differ. release: '$release_if' | package.json: '$pkg_if' | pin: '$pin_if'"
+fi
 
 # --- result ----------------------------------------------------------------
 

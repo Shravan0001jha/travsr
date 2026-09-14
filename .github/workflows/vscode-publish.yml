@@ -134,7 +134,15 @@ jobs:
   release:
     name: Publish to Marketplace + Open VSX
     needs: build
-    if: startsWith(github.ref, 'refs/tags/')
+    # The same predicate as the two version gates in `build`, on purpose. This
+    # used to be `refs/tags/`, which is wider: a workflow_dispatch started from
+    # a CLI tag such as v1.0.0 with dry_run off would skip both gates (they
+    # only run on vscode-v*) and still reach `vsce publish`. Publishing has to
+    # be impossible on any ref the gates did not run on, so the three
+    # conditions are kept identical and test-vscode-version-gate.sh asserts it.
+    # A dispatch from a branch still packages (dry run) and still never
+    # publishes, as before.
+    if: startsWith(github.ref, 'refs/tags/vscode-v')
     environment: marketplace
     runs-on: ubuntu-latest
     permissions:
