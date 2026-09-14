@@ -31,7 +31,7 @@ travsr init       # indexes every tracked file → .travsr/graph.db
 ```
 
 The shell installer supports `--version <tag>` to install a specific release
-instead of latest stable (e.g. `sh -s -- --version v1.0.0`), `--system`
+instead of latest stable (e.g. `sh -s -- --version v1.1.0`), `--system`
 (installs to `/usr/local/bin`, e.g.
 `curl -fsSL https://travsr.com/install.sh | sh -s -- --system`, since a piped
 script can only take flags via `sh -s --`), and `TRAVSR_INSTALL_DIR` to

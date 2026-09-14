@@ -4,6 +4,84 @@ All notable changes to Travsr are documented here.
 
 ---
 
+## v1.1.0 - 2026-09-15
+
+> Install with `npm i -g @travsr.com/travsr` or
+> `curl -fsSL https://travsr.com/install.sh | sh`.
+>
+> A fresh build from `master`, carrying everything merged since `v1.0.0`.
+> Ships alongside VS Code extension 0.12.0, which offers this release when no
+> `travsr` binary resolves.
+
+### Upgrading from 1.0.0: run `travsr init` once in each repository
+
+The index format changes in this release (`SIGNATURE_FORMAT_VERSION` 2 to 3,
+#877), because Objective-C methods are now keyed by their whole selector and a
+node's identity hashes the format version. An index built by 1.0.0 is not
+updated in place: the watcher and the commit hook skip reindexing it, queries
+keep answering from the old graph, and `travsr status` prints
+
+```
+warning: this index was built with an older version of travsr (format v2, current v3); run `travsr init` to rebuild it
+```
+
+Run `travsr init` in each repository once after upgrading. It detects the old
+format and rebuilds the graph from scratch. Until then the graph does not
+follow new commits or saves.
+
+### Added
+
+- **The daemon's log level is a setting (#897, #896, RFC-029).** `log.level` is a registered config key (`error`, `warn`, `info`, `debug`, `trace`; default `info`; env `TRAVSR_LOG_LEVEL`), so `travsr config get/set/unset/list` manage it. `RUST_LOG` still wins when set. The log now describes itself at every level: the session start line records the level in force, and a daemon exit is logged as `daemon.session.exit`.
+- **Live semantic resolution between commits (RFC-027, #795, #814).** A save used to drop the file's committed semantic edges and rebuild from the fresh parse, recovering only the lexically unambiguous subset. Definitions an edit leaves byte-identical now keep their committed edges, only the changed region is re-resolved, and the live overlay reuses SCIP occurrences instead of guessing.
+- **JavaScript cross-file analysis without a tsconfig (#844, #833).** A CommonJS or plain JavaScript repository produced zero semantic edges, because the only path that resolves `require()` and ESM imports needed a `tsconfig.json` with `allowJs`. travsr now synthesizes one when the repository has none.
+- **Jest and Vitest test callbacks are indexed as tests (#887, #674).** `describe`, `it` and `test` callbacks in JavaScript and TypeScript become `test` and `suite` nodes carrying a test role, so `get_context` and `ask` file them under tests instead of letting them take the top slot.
+- **Language analyzers can report degraded runs (#877).** A sidecar's response carries run-scoped diagnostics, and the host logs every one, so an analyzer that produced partial output while knowing it was degraded is heard.
+- **`travsr status` names the semantic definitions that did not unify (#840, #825)**, instead of a count with a re-run suggestion that could never change it. Swift extension definitions now unify.
+- **`travsr explain` shows the gate inputs** behind an exact-anchor decision (#885).
+
+### Changed
+
+- **`travsr --version` and MCP `serverInfo.version` report the bare version (#782).** The `+<shortsha>` build suffix is gone, so both read `1.1.0`.
+- **`travsr ask`'s human table is borderless and drops the redundant Kind column (#839).** The frame roughly tripled the output size on broad queries. `--format json` is unchanged.
+- **The scaffolded `.travsrignore` covers more ecosystems (#837, #827):** `Pods/`, `Carthage/` and `.build/` join `vendor/` and `build/`. An `ask` abstention in a repository with no embeddings now suggests `travsr embed init` (#826).
+- **The reranker's circuit breaker keeps scores it already computed (#865).** A slow rerank used to discard its finished work and fall back to the lexical gate.
+- **The exact knapsack runs at the default token budget (#883, #824).** The cell limit was sized for a 2,000-token budget, so at the shipped 4,096 the exact selection was skipped for most queries.
+- **`travsr connect` names Claude Code's one-time approval step (#838, #829)** instead of reporting `ok` for a project-scoped server that is not usable until approved.
+- **A read command in a linked worktree says which checkout answered (#863)**, instead of blaming staleness.
+- **`get_context` discloses what the documentation lane sends (#884):** file paths and heading text leave the machine by default.
+- **A database whose version is current but whose shape is old is reported (#895).** The CLI heals it automatically; MCP cross-repo results exclude it and say so, rather than silently including it.
+
+### Fixed
+
+- **`travsr mcp` run directly in a terminal explains itself instead of hanging (#803, #777).**
+- **Exact short-symbol queries are grounded (#791, #778)**, and an exact anchor is grounded when no reranker scored it (#885, #822).
+- **`find_references` and `get_callers` agree (#877).** Both read the recorded occurrences; name-matched call edges are marked; `get_callers` no longer truncates at 4 KiB; two definitions sharing a name are disambiguated instead of collapsed.
+- **Global mode answers for real repositories (#877).** Twelve structural MCP tools returned nothing when a repository was named, because every registry key is an absolute path.
+- **`travsr init --force` keeps every `resolves-to` edge (#877).** An incremental delete removed inbound edges to symbols that survived the re-parse, losing a varying share on each run.
+- **Objective-C methods sharing a leading selector keyword no longer collapse into one node (#877)**, and TypeScript barrel re-exports produce a dependency edge.
+- **Rust inline format captures count as uses (#864)**, so a constant used only inside `format!("{NAME}")` no longer reports a confident zero.
+- **A skipped TypeScript LSIF pass is disclosed (#890, #878)** instead of reporting semantic analysis as complete.
+- **Build-driven analyzers run at their build root (#886, #724)**, so a project below the repository root is analysed.
+- **Embedding freshness follows file identity (#771, #509).** A deleted and recreated `embed.db` is picked up.
+- **`travsr mcp` uses the repository's own embedding backend (#876, #874)**, and the documentation lane measurements and header are corrected (#869, #870).
+- **Resolved references are reconciled after every semantic pass (#866, #811)**, and embedding progress counts only embeddable nodes (#867, #862).
+- **scip-ruby accessor, operator and DSL symbols reconcile with the parse (#793, #780).**
+- **Windows path containment in the TypeScript and Python LSIF emitters (#807, #806).**
+- **Seven defects from the dogfooding sweep (#895, #893)**, including a Cargo workspace root whose own dependencies were missing from the graph.
+
+### Security
+
+- **rustls 0.23.45 (RUSTSEC-2026-0285).** TLS 1.3 handshake messages were accepted across encryption level boundaries. The transcript stays authenticated, so an attacker cannot alter or complete a handshake.
+
+### Release and CI
+
+- **Promotion gates run on the tag-push path, and a skipped gate is never accepted (#892, #871).**
+- **VS Code extension drift is caught on the release side (#888, #882).** A daily job fails when a CLI release moves past the published extension, and extension publishing checks its version and download pin.
+
+**Full changelog:** https://github.com/Travsr-com/travsr/compare/v1.0.0...v1.1.0
+
+---
+
 ## v1.0.0 - 2026-08-23
 
 > First stable 1.0. Install with `npm i -g @travsr.com/travsr` or
