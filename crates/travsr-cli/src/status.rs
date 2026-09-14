@@ -135,7 +135,16 @@ fn phase_b_state(payload: &StatusPayload) -> String {
                     // than reporting a flat "complete" for a language that never ran.
                     .chain(warned_langs(payload, "needs_approval"))
                     .collect();
-                if crashed.is_empty() && not_run.is_empty() {
+                // #878: the language's native pass ran, but its compiler-backed
+                // LSIF pass did not, so it is missing most of its cross-file call
+                // edges. Neither "crashed" nor "not run" is true of it; it is
+                // incomplete, and a flat "complete" here is exactly the false
+                // success the issue reports.
+                let incomplete: Vec<String> = warned_langs(payload, "emitter_missing")
+                    .into_iter()
+                    .chain(warned_langs(payload, "emitter_failed"))
+                    .collect();
+                if crashed.is_empty() && not_run.is_empty() && incomplete.is_empty() {
                     "complete".to_string()
                 } else {
                     let mut parts = Vec::new();
@@ -144,6 +153,9 @@ fn phase_b_state(payload: &StatusPayload) -> String {
                     }
                     if !not_run.is_empty() {
                         parts.push(format!("not run: {}", not_run.join(", ")));
+                    }
+                    if !incomplete.is_empty() {
+                        parts.push(format!("incomplete: {}", incomplete.join(", ")));
                     }
                     format!("partial ({})", parts.join("; "))
                 }
@@ -298,8 +310,22 @@ pub fn run() -> anyhow::Result<()> {
     // a linked worktree, or a HEAD move the daemon has not yet reconciled — is
     // never answered for silently. cwd-local, so it holds for both the
     // daemon-answered and cold-store payloads.
-    if let Some(head) = head.as_deref() {
-        let stored = payload.last_commit.as_deref().unwrap_or("");
+    //
+    // A linked worktree served by another checkout's index is a different
+    // condition and gets a definitive note instead: the drift note would hedge
+    // ("expected in a linked worktree; otherwise ...") over a fact `status`
+    // already knows, and its "wait for the daemon to reconcile" advice cannot
+    // work when the served index describes a tree that is not this one.
+    //
+    // `TRAVSR_NO_WORKTREE_NOTE` silences the cross-checkout note but must not
+    // resurrect the drift note in its place, so the hatch is read here, at the
+    // print, rather than folded into the classification above.
+    let stored = payload.last_commit.as_deref().unwrap_or("");
+    if let Some(note) = crate::repo::cross_checkout_note_for_db(&cwd, &db_path, Some(stored)) {
+        if !crate::repo::worktree_note_suppressed() {
+            eprintln!("warning: {note}");
+        }
+    } else if let Some(head) = head.as_deref() {
         if let Some(note) = travsr_mcp::head_index_mismatch_note(head, stored) {
             eprintln!("{note}");
         }
@@ -450,6 +476,16 @@ pub fn run() -> anyhow::Result<()> {
                     // repo root — without one it hangs, so it is skipped up front.
                     ["skipped_no_compdb", lang] => eprintln!(
                         "warning: full '{lang}' analysis needs a compile database (compile_commands.json) at the repo root. Generate one (e.g. `bear -- make`, or CMake's CMAKE_EXPORT_COMPILE_COMMANDS)"
+                    ),
+                    // #878: the TypeScript LSIF emitter is discovered relative to
+                    // the travsr binary, so a binary copied out of its build or
+                    // install layout loses it and the language silently kept only
+                    // its tree-sitter call edges. Name the two fixes that exist.
+                    ["emitter_missing", lang] => eprintln!(
+                        "warning: full '{lang}' analysis is incomplete: the TypeScript analyzer (travsr-lsif-ts) could not be started, so cross-file call and reference edges are missing. This happens when the travsr binary is run from outside its install layout. Set TRAVSR_LSIF_TS to the emitter's dist/index.js (or reinstall travsr), then re-run `travsr init --semantic --force`"
+                    ),
+                    ["emitter_failed", lang] => eprintln!(
+                        "warning: full '{lang}' analysis is incomplete: the TypeScript analyzer (travsr-lsif-ts) started but failed, so cross-file call and reference edges are missing. Re-run `RUST_LOG=travsr_daemon=warn travsr init --semantic --force` to see its error"
                     ),
                     // E6: SCIP definitions that did not unify onto their Phase A
                     // tree-sitter node — their references attribute to an orphaned
@@ -756,6 +792,26 @@ mod tests {
         let mut p = payload("abc", "abc", false);
         p.phase_b_warnings = Some("skipped_no_analyzer:php,needs_consent:go".into());
         assert_eq!(phase_b_state(&p), "partial (not run: php, go)");
+    }
+
+    #[test]
+    fn phase_b_downgrades_when_the_lsif_emitter_was_skipped() {
+        // #878: a relocated binary cannot find `travsr-lsif-ts`, so typescript's
+        // native pass runs (it is in `ran`, the marker advances) while its
+        // compiler-backed pass does not. The language is neither crashed nor
+        // not-run; it is incomplete, and must not read as a flat "complete".
+        let mut p = payload("abc", "abc", false);
+        p.phase_b_warnings = Some("emitter_missing:typescript".into());
+        assert_eq!(phase_b_state(&p), "partial (incomplete: typescript)");
+        // An emitter that ran and failed is the same incompleteness.
+        p.phase_b_warnings = Some("emitter_failed:typescript".into());
+        assert_eq!(phase_b_state(&p), "partial (incomplete: typescript)");
+        // Composes with the existing buckets rather than replacing them.
+        p.phase_b_warnings = Some("crashed:go,emitter_missing:typescript".into());
+        assert_eq!(
+            phase_b_state(&p),
+            "partial (crashed: go; incomplete: typescript)"
+        );
     }
 
     #[test]

@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 #
-# Tests for .github/scripts/vscode-version-gate.sh.
+# Tests for .github/scripts/vscode-version-gate.sh (#882).
+#
+# Same shape as test-release-gates.sh (#871): zero dependencies beyond bash and
+# the tools the gate itself shells out to, a PASS/FAIL tally, runnable from
+# anywhere with `bash .github/scripts/test-vscode-version-gate.sh`.
 #
 # The gate decides whether a release can be cut and whether a pull request goes
 # red, and every one of its interesting cases involves a state that is awkward
@@ -17,12 +21,16 @@
 # because the drift check reads a shipped pin with `git show <tag>:...`.
 set -uo pipefail
 
-GATE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/vscode-version-gate.sh"
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+GATE="$HERE/vscode-version-gate.sh"
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
 PASS=0
 FAIL=0
+
+ok()   { PASS=$((PASS + 1)); echo "  ok    $1"; }
+fail() { FAIL=$((FAIL + 1)); echo "  FAIL  $1" >&2; }
 
 # --- stubs -----------------------------------------------------------------
 
@@ -111,30 +119,29 @@ run() {
 expect() {  # <name> <want_rc> <want_substring>
   local name="$1" want_rc="$2" want="$3"
   if [ "$RC" != "$want_rc" ]; then
-    printf 'FAIL %s\n     want exit %s, got %s\n%s\n' "$name" "$want_rc" "$RC" "$OUT" >&2
-    FAIL=$((FAIL + 1))
+    fail "$name (want exit $want_rc, got $RC)"
+    printf '%s\n' "$OUT" >&2
     return
   fi
   case "$OUT" in
     *"$want"*) ;;
     *)
-      printf 'FAIL %s\n     want output containing: %s\n%s\n' "$name" "$want" "$OUT" >&2
-      FAIL=$((FAIL + 1))
+      fail "$name (want output containing: $want)"
+      printf '%s\n' "$OUT" >&2
       return
       ;;
   esac
-  PASS=$((PASS + 1))
-  printf 'ok   %s\n' "$name"
+  ok "$name"
 }
 
 refute() {  # <name> <unwanted_substring>: guards against a raw tool error
   local name="$1" unwanted="$2"
   case "$OUT" in
     *"$unwanted"*)
-      printf 'FAIL %s\n     output must not contain: %s\n%s\n' "$name" "$unwanted" "$OUT" >&2
-      FAIL=$((FAIL + 1))
+      fail "$name (output must not contain: $unwanted)"
+      printf '%s\n' "$OUT" >&2
       ;;
-    *) PASS=$((PASS + 1)); printf 'ok   %s\n' "$name" ;;
+    *) ok "$name" ;;
   esac
 }
 
@@ -273,5 +280,6 @@ unset FAKE_GH_FAIL
 
 # --- result ----------------------------------------------------------------
 
-printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"
+echo
+echo "passed: $PASS  failed: $FAIL"
 [ "$FAIL" -eq 0 ]

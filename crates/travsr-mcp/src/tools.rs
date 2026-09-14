@@ -283,6 +283,14 @@ pub fn phase_b_degraded_note(store: &SqliteStore) -> Option<String> {
     }
 }
 
+/// Files considered when scoping a pending-reference count. Beyond this the
+/// report is advisory anyway, and the cap is what keeps the group-by bounded.
+///
+/// Shared by [`live_overlay_note`] and `find_references`' zero gate on purpose:
+/// the note and the answer it decorates must describe the same file set, or
+/// they can contradict each other (#895).
+const PENDING_FILE_CAP: usize = 64;
+
 /// RFC-027 section 10: tell a reader that this answer includes un-ratified
 /// edges, and where the remaining gaps are.
 ///
@@ -310,10 +318,6 @@ pub fn phase_b_degraded_note(store: &SqliteStore) -> Option<String> {
 /// overlay is in play at all, which is true of the whole graph the answer was
 /// drawn from, not of any one file in it.
 fn live_overlay_note(store: &SqliteStore, answer: &str) -> Option<String> {
-    /// Files considered when scoping the pending half. Beyond this the note is
-    /// advisory anyway, and the cap is what keeps the group-by bounded.
-    const PENDING_FILE_CAP: usize = 64;
-
     let live = store.count_edges_with_provenance("live").ok().unwrap_or(0);
     let pending: u64 = store
         .pending_ref_counts_by_file(PENDING_FILE_CAP)
@@ -358,12 +362,20 @@ fn live_overlay_note(store: &SqliteStore, answer: &str) -> Option<String> {
 ///
 /// `zero_nodes` is likewise excluded: an analyzer that ran and found nothing is a
 /// valid answer, not missing coverage.
+///
+/// #878 adds `emitter_missing` / `emitter_failed`: the TypeScript LSIF pass was
+/// due but `travsr-lsif-ts` never ran, so the language kept only its tree-sitter
+/// call edges (a fraction of the compiler-derived set) under a marker that read
+/// complete. `travsr status` downgrades to `partial (incomplete: ...)` for the
+/// same classes.
 fn phase_b_unanalyzed_note(store: &SqliteStore) -> Option<String> {
     const CLASSES: &[&str] = &[
         "crashed",
         "skipped_no_analyzer",
         "needs_approval",
         "needs_consent",
+        "emitter_missing",
+        "emitter_failed",
     ];
     let warnings = store.get_meta("phase_b_warnings").ok().flatten()?;
     let mut langs: Vec<&str> = Vec::new();
@@ -384,10 +396,13 @@ fn phase_b_unanalyzed_note(store: &SqliteStore) -> Option<String> {
     if langs.is_empty() {
         return None;
     }
+    // "or not all of them": the #878 classes leave a language with some call
+    // edges (native) but not the compiler-derived rest, so "no call edges" alone
+    // would overstate the gap while a short answer is still not authoritative.
     Some(format!(
-        "[note: no call edges were produced for {} on the last semantic analysis run, \
-         so an empty result here is not authoritative for {}. Run `travsr status` for the \
-         reason and the fix.]",
+        "[note: no call edges, or not all of them, were produced for {} on the last \
+         semantic analysis run, so an empty or short result here is not authoritative \
+         for {}. Run `travsr status` for the reason and the fix.]",
         langs.join(", "),
         if langs.len() == 1 {
             "that language"
@@ -680,26 +695,151 @@ pub fn get_callers(store: &SqliteStore, symbol: &str, path: Option<&str>) -> Str
 /// not on whether the run that produced them finished. Callers append a one-line
 /// caveat (they do not abstain — a partial answer is still useful) so the note is
 /// attached to exactly the answers that might be incomplete.
-fn phase_b_lang_crashed(store: &SqliteStore, lang: &str) -> bool {
-    store
-        .get_meta("phase_b_warnings")
-        .ok()
-        .flatten()
-        .is_some_and(|warnings| {
-            warnings.split(',').any(|entry| {
-                let mut parts = entry.splitn(3, ':');
-                parts.next() == Some("crashed") && parts.next() == Some(lang)
+/// The `phase_b_warnings` classes that leave a language with *partial* call-edge
+/// coverage under a completion marker that reads current: a crash (#715), and
+/// the TypeScript LSIF pass skipping while the native pass ran (#878). Every
+/// other class either means the language produced nothing at all (already
+/// handled by the empty-result gates) or is not a coverage statement.
+const PARTIAL_COVERAGE_CLASSES: &[&str] = &["crashed", "emitter_missing", "emitter_failed"];
+
+/// Which partial-coverage class, if any, the last Phase B run recorded for
+/// `lang`. Matches a whole `class:lang` entry, never a prefix.
+fn phase_b_lang_incomplete(store: &SqliteStore, lang: &str) -> Option<&'static str> {
+    let warnings = store.get_meta("phase_b_warnings").ok().flatten()?;
+    warnings.split(',').find_map(|entry| {
+        let mut parts = entry.splitn(3, ':');
+        let class = parts.next()?;
+        (parts.next() == Some(lang))
+            .then(|| {
+                PARTIAL_COVERAGE_CLASSES
+                    .iter()
+                    .copied()
+                    .find(|c| *c == class)
             })
-        })
+            .flatten()
+    })
+}
+
+/// #864: recorded evidence that Phase B did not analyse all of `lang` in this
+/// repo, as a reason phrase for the softened `find_references` zero, or `None`
+/// when the last run was complete for it.
+///
+/// Every source here is a fact Phase B writes about its own run, never an
+/// inference from how the graph turned out. That is the whole point: the
+/// occurrence ratio conflates "never analysed" with "analysed, calls nothing"
+/// and so can never read complete, while each of these is rewritten empty by a
+/// healthy run and therefore lets a definitive zero through.
+///
+/// `crashed:` is deliberately absent — the caller checks it first and has its
+/// own wording with a `--force` rebuild hint. The classes here are every OTHER
+/// `phase_b_warnings` class travsr-daemon writes: whenever the daemon records
+/// that a language's Phase B did not complete, its zero is softened rather than
+/// asserted. This is intentionally broader than [`phase_b_unanalyzed_note`]'s
+/// banner set (which lists only the "no call edges at all" classes): a language
+/// skipped for no compile database, an untrusted corpus, or a mismatched
+/// analyzer version really was not analysed, so the gate and the banner can
+/// name different sets without disagreeing about whether the zero is definitive.
+///
+/// Scope is the TARGET's language only, never the repo's other languages, so at
+/// most one language is ever named. A repo-wide reading would be more literal —
+/// a caller can in principle live in any language — but it re-creates the very
+/// failure this gate was written to avoid: a polyglot repo carries permanent
+/// warnings for languages it cannot analyse (this one has `skipped_no_compdb`
+/// for c and cpp, and no compile database is coming), so every zero in the repo
+/// would hedge and the hedge would stop meaning anything.
+///
+/// The residual gap is a caller in a different, unanalysed language. Measured on
+/// this repo: 25 of 17690 `ref/call` occurrences cross a language boundary
+/// (0.14%), and all 25 have an EMPTY source language — the file-attribution
+/// fallback, not a second analysed language. No analysed-language pair is
+/// affected, so the narrow gate costs nothing real today. Revisit if a genuine
+/// cross-language provider lands.
+///
+/// Targets in the empty language never arrive here: `language_has_edge_sites("")`
+/// is false by construction, so they return at the #299 branch above.
+fn phase_b_incomplete_reason(store: &SqliteStore, lang: &str) -> Option<String> {
+    // Rust-specific: rust-analyzer never ran, or ran and lost every ref.
+    if lang == "rust" {
+        match store
+            .get_meta("rust_lsif_degraded")
+            .ok()
+            .flatten()
+            .as_deref()
+        {
+            Some("sandbox_unavailable") => {
+                return Some("Rust analysis did not run (no OS sandbox)".to_string())
+            }
+            Some("all_refs_dropped") => {
+                return Some("no Rust reference resolved to an indexed symbol".to_string())
+            }
+            _ => {}
+        }
+    }
+    // Per-language classes: the analyzer was missing, skipped, or is waiting on
+    // a one-time approval, so this language has no call edges from that run.
+    // The full set travsr-daemon writes as `<class>:{lang}`, minus the three
+    // (`crashed`, `emitter_missing`, `emitter_failed`) the caller softens ahead
+    // of this gate. Any daemon class not accounted for in one of the two places
+    // would let its language keep the definitive zero, so this list tracks the
+    // daemon's, not `phase_b_unanalyzed_note`'s narrower banner set.
+    const CLASSES: &[(&str, &str)] = &[
+        ("skipped_no_analyzer", "no analyzer is installed"),
+        ("needs_approval", "its analyzer is waiting on approval"),
+        ("needs_consent", "its analyzer is waiting on consent"),
+        ("skipped_no_compdb", "it has no compilation database"),
+        ("zero_nodes", "its analyzer produced no symbols"),
+        (
+            "no_references",
+            "no reference resolved to an indexed symbol",
+        ),
+        ("version_mismatch", "its analyzer is a mismatched version"),
+        ("skipped_unregistered", "its analyzer is not registered"),
+        (
+            "untrusted_corpus",
+            "this corpus is not trusted for analysis",
+        ),
+    ];
+    if let Some(warnings) = store.get_meta("phase_b_warnings").ok().flatten() {
+        for entry in warnings.split(',') {
+            let mut parts = entry.trim().splitn(3, ':');
+            let (Some(class), Some(entry_lang)) = (parts.next(), parts.next()) else {
+                continue;
+            };
+            if entry_lang != lang {
+                continue;
+            }
+            if let Some((_, why)) = CLASSES.iter().find(|(c, _)| *c == class) {
+                return Some(format!("'{lang}' was not analysed, {why}"));
+            }
+        }
+    }
+    // Repo-wide (#583): a mid-edit reindex dropped call edges without moving
+    // HEAD. Cleared to "0" by the next Phase B run, so this does not latch.
+    if store.get_meta("phase_b_dirty").ok().flatten().as_deref() == Some("1") {
+        return Some("a re-index dropped call edges and they are not rebuilt yet".to_string());
+    }
+    None
 }
 
 /// The one-line caveat appended to a get_callers / find_references answer when
-/// [`phase_b_lang_crashed`] holds for the target language.
-fn crash_caveat(lang: &str) -> String {
+/// [`phase_b_lang_incomplete`] holds for the target language. The `crashed`
+/// wording is unchanged from #715; the #878 classes name the skipped analyzer.
+fn incomplete_caveat(lang: &str, class: &str) -> String {
+    let cause = match class {
+        "emitter_missing" => {
+            "the TypeScript analyzer (travsr-lsif-ts) could not be started on its last run"
+        }
+        "emitter_failed" => "the TypeScript analyzer (travsr-lsif-ts) failed on its last run",
+        _ => "crashed on its last run",
+    };
+    let subject = if class == "crashed" {
+        format!("semantic analysis for '{lang}' {cause}")
+    } else {
+        format!("semantic analysis for '{lang}' is incomplete: {cause}")
+    };
     format!(
-        "note: semantic analysis for '{lang}' crashed on its last run, so these \
-         results may be incomplete. Run `travsr status` for detail or `travsr init \
-         --semantic --force` to rebuild."
+        "note: {subject}, so these results may be incomplete. Run `travsr status` for \
+         detail or `travsr init --semantic --force` to rebuild."
     )
 }
 
@@ -912,11 +1052,14 @@ fn get_callers_raw(store: &SqliteStore, symbol: &str, path: Option<&str>) -> Str
     if lines.iter().any(|l| l.ends_with(HEURISTIC_SIGIL_ROW)) {
         lines.push(HEURISTIC_LEGEND.to_string());
     }
-    // #715: a crash in this language's last Phase B run leaves partial coverage
-    // while the marker reads complete, so this list may be missing callers in the
-    // un-indexed files. Attach the caveat to the confident (non-empty) answer.
-    if !lines.is_empty() && phase_b_lang_crashed(store, &seed.vname.language) {
-        lines.push(crash_caveat(&seed.vname.language));
+    // #715 / #878: a crash, or a skipped LSIF pass, in this language's last
+    // Phase B run leaves partial coverage while the marker reads complete, so
+    // this list may be missing callers. Attach the caveat to the confident
+    // (non-empty) answer.
+    if !lines.is_empty() {
+        if let Some(class) = phase_b_lang_incomplete(store, &seed.vname.language) {
+            lines.push(incomplete_caveat(&seed.vname.language, class));
+        }
     }
     lines.join("\n")
 }
@@ -950,7 +1093,7 @@ const MAX_CALLER_ROWS: usize = 500;
 /// `tree-sitter` and are structural facts from the AST, not name guesses.
 fn provenance_marker(edge: &travsr_core::Edge) -> &'static str {
     match edge.provenance.as_deref() {
-        Some("live") => " [live: resolved from your uncommitted edit, not yet ratified]",
+        Some("live") => LIVE_MARKER,
         Some("tree-sitter") if edge.kind == travsr_core::EdgeKind::RefCall => HEURISTIC_SIGIL_ROW,
         _ => "",
     }
@@ -959,6 +1102,12 @@ fn provenance_marker(edge: &travsr_core::Edge) -> &'static str {
 /// The name-matched-edge caveat, spelled out per site by `find_references` (via
 /// `RefSite::heuristic`), where one occurrence line carries it at most once.
 const HEURISTIC_MARKER: &str = " [heuristic: matched by name, not resolved by type]";
+
+/// The un-ratified-overlay marker, shared by `provenance_marker` (get_callers)
+/// and `site_marker` (find_references) so the two tools cannot describe the same
+/// edge in two different words. That constraint is stated in
+/// `travsr-store::reference_sites`.
+const LIVE_MARKER: &str = " [live: resolved from your uncommitted edit, not yet ratified]";
 
 /// The same caveat on a `get_callers` row: one character, plus one legend line
 /// at the end of the answer.
@@ -975,9 +1124,15 @@ const HEURISTIC_SIGIL_ROW: &str = " ~";
 /// rendered: a legend for a mark that is not on screen is noise.
 const HEURISTIC_LEGEND: &str = "~ = matched by name, not resolved by type";
 
-/// The marker for one occurrence site, empty unless it is name-matched.
+/// The marker for one occurrence site, empty unless it carries a caveat.
+///
+/// `live` is checked first: an un-ratified site is the stronger statement about
+/// how much to trust the row, and the two flags are independent rather than
+/// exclusive (#895). A site can be both, in which case the live caveat wins.
 fn site_marker(site: &travsr_core::RefSite) -> &'static str {
-    if site.heuristic {
+    if site.live {
+        LIVE_MARKER
+    } else if site.heuristic {
         HEURISTIC_MARKER
     } else {
         ""
@@ -1677,11 +1832,12 @@ pub fn find_references_structured(
             out.total = Some(total);
             out.truncated = total > MAX_REFERENCE_SITES;
             out.references = sites.into_iter().take(MAX_REFERENCE_SITES).collect();
-            // #715 parity with the text path: a crashed last Phase B run leaves
-            // partial coverage under a complete marker, so even a non-empty site
-            // list may be short. Surface the same caveat instead of `note: None`.
-            if phase_b_lang_crashed(store, &target.vname.language) {
-                out.note = Some(crash_caveat(&target.vname.language));
+            // #715 / #878 parity with the text path: a crashed last Phase B run,
+            // or a skipped LSIF pass, leaves partial coverage under a complete
+            // marker, so even a non-empty site list may be short. Surface the
+            // same caveat instead of `note: None`.
+            if let Some(class) = phase_b_lang_incomplete(store, &target.vname.language) {
+                out.note = Some(incomplete_caveat(&target.vname.language, class));
             }
         }
         _ => {
@@ -1756,6 +1912,9 @@ fn family_reference_sites(store: &SqliteStore, family: &[CoreNode]) -> Vec<travs
         let same = a.path == b.path && a.line == b.line;
         if same {
             b.heuristic |= a.heuristic;
+            // #895: same fold, or a family query silently drops the live caveat
+            // that the single-target query would have shown.
+            b.live |= a.live;
         }
         same
     });
@@ -1829,10 +1988,11 @@ fn references_body_for_target(store: &SqliteStore, target: &CoreNode) -> String 
             if total > shown {
                 lines.push(format!("[truncated: showing {shown} of {total} sites]"));
             }
-            // #715: a crashed last run leaves partial coverage under a complete
-            // marker, so this occurrence list may be short.
-            if phase_b_lang_crashed(store, &target.vname.language) {
-                lines.push(crash_caveat(&target.vname.language));
+            // #715 / #878: a crashed last run, or a skipped LSIF pass, leaves
+            // partial coverage under a complete marker, so this occurrence list
+            // may be short.
+            if let Some(class) = phase_b_lang_incomplete(store, &target.vname.language) {
+                lines.push(incomplete_caveat(&target.vname.language, class));
             }
             lines.join("\n")
         }
@@ -1871,16 +2031,23 @@ fn reference_fallback_from_edges(store: &SqliteStore, target: &CoreNode, header:
         // ref/call edges exist for this node. #299 M1: three very different
         // situations reach here and must not read identically.
         let lang = &target.vname.language;
-        // #715: a crashed last Phase B run for this language leaves partial
-        // coverage under a marker that reads complete, so a zero here is not a
-        // definitive zero regardless of the per-file / language-wide coverage
-        // gates below — those key on whether occurrences exist, not on whether the
-        // run finished. Soften first so a crash is never reported as a clean zero.
-        if phase_b_lang_crashed(store, lang) {
+        // #715 / #878: a crashed last Phase B run, or a skipped LSIF pass, for
+        // this language leaves partial coverage under a marker that reads
+        // complete, so a zero here is not a definitive zero regardless of the
+        // per-file / language-wide coverage gates below — those key on whether
+        // occurrences exist, not on whether the run finished. Soften first so
+        // neither is ever reported as a clean zero.
+        if let Some(class) = phase_b_lang_incomplete(store, lang) {
+            let cause = match class {
+                "crashed" => format!("Semantic analysis for '{lang}' crashed on its last run"),
+                _ => format!(
+                    "The TypeScript analyzer (travsr-lsif-ts) did not run for '{lang}' \
+                     on the last semantic analysis run"
+                ),
+            };
             return format!(
-                "{header}\n0 recorded reference(s), not a definitive zero. Semantic \
-                 analysis for '{lang}' crashed on its last run, so its occurrence \
-                 coverage is partial. Run `travsr status` for detail, `travsr init \
+                "{header}\n0 recorded reference(s), not a definitive zero. {cause}, so its \
+                 occurrence coverage is partial. Run `travsr status` for detail, `travsr init \
                  --semantic --force` to rebuild, or `find_pattern` for a textual search."
             );
         }
@@ -1952,18 +2119,80 @@ fn reference_fallback_from_edges(store: &SqliteStore, target: &CoreNode, header:
                  use `find_pattern` for a textual search."
             );
         }
-        // Coverage is effectively complete for this language and this symbol has
-        // neither occurrence rows nor ref/call edges. Report that as the fact it
-        // is. We cannot tell from here whether the uses do not exist, whether an
-        // ambiguous bare call was deliberately skipped, or whether the analyzer
-        // never emitted an occurrence for the call shape at all (scip-dotnet, for
-        // one, emits nothing for a generic invocation), so do not name a cause.
+        // #895: the overlay may hold references in this very file that nothing
+        // has resolved yet. `live_overlay_note` appends that count to whatever
+        // we return here, scoped to the files the answer names — so asserting a
+        // confident zero produces two sentences about one file that cannot both
+        // be true ("recorded no uses" beside "11 references ... detected but
+        // not resolved"). A pending row *is* a detected use, so soften on the
+        // same set the note reports over and the pair stays consistent.
+        //
+        // Dogfooded: `travsr references collect_global` said zero while all 11
+        // call sites sat pending in `travsr-mcp/src/tools.rs`; they resolved
+        // verbatim once Phase B caught up.
+        let pending_here = store
+            .pending_ref_counts_by_file(PENDING_FILE_CAP)
+            .unwrap_or_default()
+            .into_iter()
+            .find(|(path, _)| path == &target.vname.path)
+            .map(|(_, n)| n)
+            .unwrap_or(0);
+        if pending_here > 0 {
+            return format!(
+                "{header}\n0 recorded reference(s), not a definitive zero. \
+                 {pending_here} reference{} in '{}' {} detected but not yet \
+                 resolved, so uses of this symbol may be among them. They \
+                 resolve deterministically at the next commit; run `travsr init \
+                 --semantic` to resolve them now, or use `find_pattern` for a \
+                 textual search.",
+                if pending_here == 1 { "" } else { "s" },
+                target.vname.path,
+                if pending_here == 1 { "is" } else { "are" },
+            );
+        }
+        // The target's own file being analysed is necessary but not sufficient.
+        // A reference lives in whatever file *uses* the symbol, so a repo-wide
+        // "no uses anywhere" claim needs the analysis that would have recorded
+        // that use to have actually run, not just the one file the definition
+        // sits in.
+        //
+        // The gate is a recorded fact, not `language_occurrence_coverage`. #551
+        // rejected that ratio as a proxy for "was THIS file analysed"; it fails
+        // the repo-wide question too, for a different reason. The ratio counts
+        // files holding a `ref/call` occurrence, which cannot distinguish "never
+        // analysed" from "analysed, calls nothing", so it never reaches complete
+        // on a real repo — 208 of 239 real `.rs` files here, and every denominator
+        // we tried (all paths, callable-bearing paths, `files` rows) leaves a
+        // remainder of fixtures and call-free modules. Gating on it would make
+        // the definitive zero below unreachable, so every zero would print a
+        // hedge, which trains a reader to discount all of them.
+        //
+        // These markers are written by Phase B itself and rewritten empty on a
+        // healthy run, so a complete analysis still earns the definitive zero.
+        if let Some(reason) = phase_b_incomplete_reason(store, lang) {
+            return format!(
+                "{header}\n0 reference(s) recorded, but not a definitive zero: {reason}. \
+                 Run `travsr status`, or `find_pattern` for a textual search."
+            );
+        }
+        // Analysis for this language ran to completion and this symbol has
+        // neither occurrence rows nor ref/call edges: a genuine zero.
+        //
+        // The caveat names the recall limits that still exist. #864's repro was a
+        // uniquely-named constant used once inside a Rust format capture
+        // (`"{CONST} default rules"`), which no provider recorded; that gap is now
+        // closed in the extractor rather than described here (travsr-analysis
+        // recovers inline captures). What remains is the ambiguous bare call left
+        // unindexed by design, and analyzers that emit no occurrence for certain
+        // call shapes (scip-dotnet, for one, emits nothing for a generic
+        // invocation). Kept to one sentence on purpose: a paragraph of hedging
+        // would teach a reader to discount every zero, which is the same signal
+        // loss the gates above exist to prevent.
         return format!(
-            "{header}\n0 reference(s). The index recorded no uses of this symbol. \
-             That can mean it has none, or that the call sites were not indexed: \
-             an ambiguous bare call is skipped by design, and some analyzers emit \
-             no occurrence for certain call shapes. Use `find_pattern` for a \
-             textual search to tell the two apart."
+            "{header}\n0 reference(s). No uses recorded. Bare calls to a name defined \
+             in more than one place are left unindexed to avoid mis-targeting, and \
+             some analyzers emit no occurrence for certain call shapes; use \
+             `find_pattern` to be sure."
         );
     }
     let callers = store.get_nodes(&caller_ids).unwrap_or_default();
@@ -1983,10 +2212,11 @@ fn reference_fallback_from_edges(store: &SqliteStore, target: &CoreNode, header:
         "{total} caller definition(s) (exact occurrence lines unavailable for this language, showing caller definitions):"
     ));
     lines.extend(sites.into_iter().take(MAX_REFERENCE_SITES));
-    // #715: these structural caller definitions can also be short if the
-    // language's last Phase B run crashed before indexing every file.
-    if phase_b_lang_crashed(store, &target.vname.language) {
-        lines.push(crash_caveat(&target.vname.language));
+    // #715 / #878: these structural caller definitions can also be short if the
+    // language's last Phase B run crashed before indexing every file, or if its
+    // LSIF pass never ran.
+    if let Some(class) = phase_b_lang_incomplete(store, &target.vname.language) {
+        lines.push(incomplete_caveat(&target.vname.language, class));
     }
     lines.join("\n")
 }
@@ -2998,6 +3228,11 @@ fn collect_global(
 
     let single = candidates.len() == 1;
     let mut parts: Vec<String> = Vec::new();
+    // #893 B2: repos this fan-out could not open. Every caller below inherits
+    // the disclosure, so a partial cross-repo answer is never read as a
+    // complete one. Same note wording as `search_symbol_global`, which runs its
+    // own fan-out and cannot route through here.
+    let mut skipped: Vec<String> = Vec::new();
 
     for (repo_name, db_path) in candidates {
         match SqliteStore::open_read_only(db_path) {
@@ -3007,11 +3242,31 @@ fn collect_global(
                     parts.push(result);
                 }
             }
-            Err(e) => tracing::warn!("failed to open {}: {e}", db_path.display()),
+            Err(e) => {
+                tracing::warn!("failed to open {}: {e}", db_path.display());
+                skipped.push(format!("{repo_name} ({e})"));
+            }
         }
     }
 
-    parts.join("\n")
+    let joined = parts.join("\n");
+    if skipped.is_empty() {
+        return joined;
+    }
+    skipped.sort();
+    // Leading, not trailing: every caller sanitizes downstream and truncation
+    // runs from the end, which is exactly the large-fan-out case where this
+    // note matters most.
+    let note = format!(
+        "[note: this cross-repo answer is partial: {} registered repo(s) could not be opened and were skipped: {}]",
+        skipped.len(),
+        skipped.join("; ")
+    );
+    if joined.is_empty() {
+        note
+    } else {
+        format!("{note}\n{joined}")
+    }
 }
 
 // ── get_blast_radius ──────────────────────────────────────────────────────────
@@ -3540,11 +3795,12 @@ pub fn get_lang_status_global(
     let raw = collect_global(repos, repo, |store, _repo_name, _single| {
         get_lang_status_raw(store, file)
     });
-    if raw.is_empty() {
-        UNKNOWN_LANG_JSON.to_string()
-    } else {
-        // collect_global joins results with "\n"; take only the first JSON line.
-        raw.lines().next().unwrap_or("").to_string()
+    // collect_global joins results with "\n" and may lead with a `[note: ...]`
+    // skipped-repo line (#893 B2). This surface is parsed as JSON by the
+    // extension, so take the first JSON line rather than the first line.
+    match raw.lines().find(|l| l.starts_with('{')) {
+        Some(json) => json.to_string(),
+        None => UNKNOWN_LANG_JSON.to_string(),
     }
 }
 
@@ -3564,7 +3820,7 @@ pub fn search_symbol(store: &SqliteStore, name: &str, exact: bool) -> String {
     // repos), but stripping "in rust" from "knapsack in rust" prevents the
     // FTS from matching unrelated files that contain "rust" as a token.
     let (stripped, lang_filter) = infer_language_from_query(name);
-    let raw = search_symbol_raw(store, stripped.as_str(), lang_filter, exact);
+    let (_, raw) = search_symbol_raw(store, stripped.as_str(), lang_filter, exact);
     let content = if raw.is_empty() {
         format!("No symbols matching '{name}' found in the graph.")
     } else {
@@ -3640,12 +3896,16 @@ fn infer_language_from_query(query: &str) -> (String, Option<&'static str>) {
     (query.to_owned(), None)
 }
 
+/// Returns `(total matches, rendered lines)`. The rendered list is capped at
+/// `MAX_SEARCH_RESULTS`, the count is not: a caller ranking repos against each
+/// other needs to tell a 200-match repo from a 60-match one, which the capped
+/// line count cannot express (#893 B3).
 fn search_symbol_raw(
     store: &SqliteStore,
     name: &str,
     lang_filter: Option<&str>,
     exact: bool,
-) -> String {
+) -> (usize, String) {
     // Cap results: prevents self-DoS from wildcard queries (e.g. "a") and limits
     // accidental bulk exfiltration. The store LIKE query has no SQL LIMIT yet —
     // this Rust-side cap is the guard until that is added at the store layer.
@@ -3655,7 +3915,7 @@ fn search_symbol_raw(
         Ok(n) => n,
         Err(e) => {
             tracing::warn!("search_symbol error: {e}");
-            return String::new();
+            return (0, String::new());
         }
     };
 
@@ -3685,7 +3945,7 @@ fn search_symbol_raw(
             )
         })
         .collect();
-    lines.join("\n")
+    (nodes.len(), lines.join("\n"))
 }
 
 /// Global variant of `search_symbol`.
@@ -3707,10 +3967,15 @@ pub fn search_symbol_global(
     let (stripped, lang_filter) = infer_language_from_query(name);
     let search_term = stripped.as_str();
 
+    // #893 B2: repos the fan-out could not open. Surfaced in the payload, not
+    // only as a stderr warning, so a partial cross-repo answer is never read as
+    // a complete one. Stays empty on the single-repo path.
+    let mut skipped: Vec<String> = Vec::new();
+
     let raw = if repo.is_some() {
         // Single-repo path: SEC + stale filtering handled by collect_global.
         collect_global(repos, repo, |store, repo_name, single| {
-            let result = search_symbol_raw(store, search_term, lang_filter, exact);
+            let (_, result) = search_symbol_raw(store, search_term, lang_filter, exact);
             if result.is_empty() || single {
                 result
             } else {
@@ -3734,13 +3999,13 @@ pub fn search_symbol_global(
         candidates.retain(|(_, db)| db.exists());
         let single = candidates.len() == 1;
 
-        let mut parts: Vec<(usize, String)> = Vec::new();
+        let mut parts: Vec<(usize, &str, String)> = Vec::new();
         for (repo_name, db_path) in &candidates {
             match SqliteStore::open_read_only(db_path) {
                 Ok(store) => {
-                    let result = search_symbol_raw(&store, search_term, lang_filter, exact);
+                    let (count, result) =
+                        search_symbol_raw(&store, search_term, lang_filter, exact);
                     if !result.is_empty() {
-                        let count = result.lines().count();
                         let text = if single {
                             result
                         } else {
@@ -3750,17 +4015,24 @@ pub fn search_symbol_global(
                                 .collect::<Vec<_>>()
                                 .join("\n")
                         };
-                        parts.push((count, text));
+                        parts.push((count, repo_name, text));
                     }
                 }
-                Err(e) => tracing::warn!("failed to open {}: {e}", db_path.display()),
+                Err(e) => {
+                    tracing::warn!("failed to open {}: {e}", db_path.display());
+                    skipped.push(format!("{repo_name} ({e})"));
+                }
             }
         }
-        // Most matches first — most relevant repo surfaces at the top.
-        parts.sort_by_key(|b| std::cmp::Reverse(b.0));
+        // Most matches first — most relevant repo surfaces at the top, and
+        // survives the output cap, which truncates from the end. Repo name
+        // breaks ties: without it equal counts keep `HashMap` iteration order,
+        // so the same registry answered differently on each run (#893 B3).
+        parts.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(b.1)));
+        skipped.sort();
         parts
             .into_iter()
-            .map(|(_, text)| text)
+            .map(|(_, _, text)| text)
             .collect::<Vec<_>>()
             .join("\n")
     };
@@ -3769,6 +4041,17 @@ pub fn search_symbol_global(
         format!("No symbols matching '{name}' found in the graph.")
     } else {
         raw
+    };
+    // Leading, not trailing: `sanitize_for_mcp` truncates from the end, which is
+    // exactly the large-fan-out case where this note matters most.
+    let content = if skipped.is_empty() {
+        content
+    } else {
+        format!(
+            "[note: this cross-repo answer is partial: {} registered repo(s) could not be opened and were skipped: {}]\n{content}",
+            skipped.len(),
+            skipped.join("; ")
+        )
     };
     sanitize_for_mcp(&content)
 }
@@ -4230,7 +4513,7 @@ pub fn get_graph_stats_global(repos: &HashMap<String, PathBuf>, repo: Option<&st
     let mut total_nodes: u64 = 0;
     let mut total_edges: u64 = 0;
     // DEBT(cloud-launch): counts must be filtered to caller's EdgeFilter scope before SSE ships
-    collect_global(repos, repo, |store, _repo_name, _single| {
+    let skipped_note = collect_global(repos, repo, |store, _repo_name, _single| {
         total_nodes += match store.node_count() {
             Ok(n) => n,
             Err(e) => {
@@ -4247,7 +4530,15 @@ pub fn get_graph_stats_global(repos: &HashMap<String, PathBuf>, repo: Option<&st
         };
         String::new() // accumulation done via captured mutables; return value unused
     });
-    format!("nodes: {total_nodes}\nedges: {total_edges}")
+    let stats = format!("nodes: {total_nodes}\nedges: {total_edges}");
+    // #893 B2: the closure contributes no text, so `collect_global`'s return is
+    // either empty or the skipped-repo note. Without this the totals read as
+    // complete while silently missing every repo that failed to open.
+    if skipped_note.is_empty() {
+        stats
+    } else {
+        format!("{skipped_note}\n{stats}")
+    }
 }
 
 /// Return per-language node counts for the current repo graph.
@@ -5456,8 +5747,8 @@ fn humanize_doc_anchor(sig: &str) -> String {
 /// but a store lookup failure or a node deleted between KNN and this call
 /// must degrade gracefully, not silently drop a real hit), or
 /// `crate::rerank::rerank` itself returns `None` (model absent, disabled,
-/// panicked, or over the circuit-breaker budget — same fail-open contract
-/// the code lane already relies on).
+/// panicked, or skipped because the circuit breaker is open — same fail-open
+/// contract the code lane already relies on).
 fn rerank_doc_candidates(
     store: &SqliteStore,
     query: &str,
@@ -6846,6 +7137,20 @@ pub fn seed_trace(store: &SqliteStore, query: &str) -> String {
         score_ref,
     );
     out.push_str(&format!("CONF\t{}\n", seed_set.confidence.label()));
+    // #822: the gate inputs CONF is computed from, so a trace reader does not have
+    // to infer them from the per-token idf (which cannot express either).
+    out.push_str(&format!(
+        "GATES\tn_resolved={}\tcoverage={:.3}\tcoverage_ok={}\texact_anchor={}\tmax_rerank={}\trescued={}\n",
+        seed_set.n_resolved_gated,
+        seed_set.coverage,
+        seed_set.coverage_ok,
+        seed_set.exact_anchor_present,
+        seed_set
+            .max_rerank_score
+            .map(|r| format!("{r:.4}"))
+            .unwrap_or_else(|| "none".to_string()),
+        seed_set.anchor_rescued,
+    ));
     let final_ids: Vec<NodeId> = seed_set.seeds.iter().map(|s| s.node).collect();
     let final_nodes = store.get_nodes(&final_ids).unwrap_or_default();
     let by_id: HashMap<NodeId, &CoreNode> = final_nodes.iter().map(|n| (n.id, n)).collect();
@@ -8166,7 +8471,7 @@ mod tests {
     /// The `phase_b_warnings` parser matches a whole `crashed:<lang>` entry, not a
     /// prefix or a different warning class for the same language.
     #[test]
-    fn phase_b_lang_crashed_matches_exact_class_and_lang() {
+    fn phase_b_lang_incomplete_matches_exact_class_and_lang() {
         let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
         store
             .set_meta(
@@ -8174,14 +8479,18 @@ mod tests {
                 "skipped_no_analyzer:php,crashed:objectivec",
             )
             .unwrap();
-        assert!(phase_b_lang_crashed(&store, "objectivec"));
-        // A different warning class for the same language is not a crash.
-        assert!(!phase_b_lang_crashed(&store, "php"));
+        assert_eq!(
+            phase_b_lang_incomplete(&store, "objectivec"),
+            Some("crashed")
+        );
+        // A different warning class for the same language is not partial
+        // coverage (a language that never ran has the empty-result gates).
+        assert_eq!(phase_b_lang_incomplete(&store, "php"), None);
         // Not a substring match: `objc` must not match `objectivec`.
-        assert!(!phase_b_lang_crashed(&store, "objc"));
-        // No warnings at all → false.
+        assert_eq!(phase_b_lang_incomplete(&store, "objc"), None);
+        // No warnings at all → None.
         store.set_meta("phase_b_warnings", "").unwrap();
-        assert!(!phase_b_lang_crashed(&store, "objectivec"));
+        assert_eq!(phase_b_lang_incomplete(&store, "objectivec"), None);
     }
 
     /// #715: get_callers must attach the incompleteness caveat when the target
@@ -8225,6 +8534,56 @@ mod tests {
         assert!(
             crashed.contains("semantic analysis for 'rust' crashed on its last run"),
             "a crashed language must carry the incompleteness caveat: {crashed}"
+        );
+    }
+
+    /// #878: a TypeScript index whose LSIF pass was skipped has SOME callers
+    /// (from the native pass), which is exactly the confident-looking answer
+    /// that must carry a caveat. The crashed wording stays reserved for crashes.
+    #[test]
+    fn get_callers_caveats_a_language_whose_lsif_pass_was_skipped() {
+        use travsr_core::{Edge, EdgeKind, Node, VName};
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        let callee = Node::new(
+            VName::new("c", "", "src/svc.ts", "typescript", "method:charge"),
+            "method",
+        );
+        let caller = Node::new(
+            VName::new("c", "", "src/main.ts", "typescript", "fn:process"),
+            "function",
+        );
+        store.put_node(&callee).unwrap();
+        store.put_node(&caller).unwrap();
+        store
+            .put_edge(&Edge::new(caller.id, callee.id, EdgeKind::RefCall))
+            .unwrap();
+
+        store
+            .set_meta("phase_b_warnings", "emitter_missing:typescript")
+            .unwrap();
+        let out = get_callers_raw(&store, "charge", None);
+        assert!(out.contains("fn:process"), "caller still listed: {out}");
+        assert!(
+            out.contains("is incomplete")
+                && out.contains("travsr-lsif-ts")
+                && out.contains("may be incomplete"),
+            "a skipped LSIF pass must carry the incompleteness caveat: {out}"
+        );
+        assert!(
+            !out.contains("crashed on its last run"),
+            "a skipped emitter is not a crash: {out}"
+        );
+
+        // The class match is exact: another language's skip says nothing here.
+        store
+            .set_meta("phase_b_warnings", "emitter_missing:go")
+            .unwrap();
+        let out = get_callers_raw(&store, "charge", None);
+        assert!(!out.contains("may be incomplete"), "no caveat: {out}");
+        assert_eq!(phase_b_lang_incomplete(&store, "typescript"), None);
+        assert_eq!(
+            phase_b_lang_incomplete(&store, "go"),
+            Some("emitter_missing")
         );
     }
 
@@ -8633,6 +8992,216 @@ mod tests {
         );
     }
 
+    // ── #893 B2/B3: global fan-out disclosure + ordering ─────────────────────
+
+    /// Build a file-backed store under `root` holding `n` nodes whose names all
+    /// match the search term "Widget".
+    fn seed_fanout_repo(root: &std::path::Path, n: usize) -> PathBuf {
+        use travsr_core::{Node, VName};
+        let db_path = root.join("graph.db");
+        {
+            let mut store = travsr_store::SqliteStore::open(&db_path).unwrap();
+            for i in 0..n {
+                store
+                    .put_node(&Node::new(
+                        VName::new(
+                            "",
+                            "",
+                            format!("src/widget_{i}.rs"),
+                            "rust",
+                            format!("struct:Widget{i}"),
+                        ),
+                        "struct",
+                    ))
+                    .unwrap();
+            }
+        }
+        db_path
+    }
+
+    #[test]
+    fn search_symbol_global_fanout_ranks_by_match_count_and_is_deterministic() {
+        // #893 B3: identical input must produce an identical answer, and the
+        // documented "most matches first" order must be real. `alpha` and
+        // `bravo` tie deliberately: without an explicit tiebreak their relative
+        // order falls out of `HashMap` iteration, which varies per map.
+        let alpha_dir = tempfile::tempdir().unwrap();
+        let bravo_dir = tempfile::tempdir().unwrap();
+        let charlie_dir = tempfile::tempdir().unwrap();
+        let alpha = seed_fanout_repo(alpha_dir.path(), 5);
+        let bravo = seed_fanout_repo(bravo_dir.path(), 5);
+        let charlie = seed_fanout_repo(charlie_dir.path(), 9);
+
+        let mut seen: Vec<String> = Vec::new();
+        for _ in 0..16 {
+            // Fresh map each round: `HashMap` randomises per instance, so this
+            // is the in-process equivalent of re-running the MCP server.
+            let repos: HashMap<String, PathBuf> = [
+                ("alpha".to_string(), alpha.clone()),
+                ("bravo".to_string(), bravo.clone()),
+                ("charlie".to_string(), charlie.clone()),
+            ]
+            .into();
+            seen.push(search_symbol_global(&repos, "Widget", None, false));
+        }
+        let distinct = {
+            let mut u: Vec<&String> = seen.iter().collect();
+            u.sort();
+            u.dedup();
+            u.len()
+        };
+        let first = &seen[0];
+        assert_eq!(
+            distinct, 1,
+            "fan-out must be deterministic across identical calls, got {distinct} distinct outputs"
+        );
+        let pos = |repo: &str| first.find(&format!("[{repo}]")).unwrap_or(usize::MAX);
+        assert!(
+            pos("charlie") < pos("alpha") && pos("charlie") < pos("bravo"),
+            "most matches first: charlie (9) must precede alpha/bravo (5 each), got: {first}"
+        );
+        assert!(
+            pos("alpha") < pos("bravo"),
+            "equal counts must break deterministically by repo name, got: {first}"
+        );
+    }
+
+    #[test]
+    fn search_symbol_global_fanout_keeps_highest_matching_repo_under_output_cap() {
+        // #893 B3, reproducing the registry measured in the issue: searching
+        // "Server" matched 228 nodes in kubernetes, 120 in travsr and 70 in
+        // AFNetworking. Every one of those renders exactly MAX_SEARCH_RESULTS
+        // lines, so ranking on the *rendered* line count scored all three at 50
+        // — a dead tie that `HashMap` order then broke arbitrarily, after which
+        // the 4 096-byte output cap kept only the winner. kubernetes, the
+        // strongest repo by a factor of three, was the one that vanished.
+        //
+        // Names are chosen so alphabetical order *opposes* match order: if the
+        // ranking silently degraded to the name tiebreak, `zzz-most` would sort
+        // last and this would fail rather than pass by luck.
+        let most_dir = tempfile::tempdir().unwrap();
+        let mid_dir = tempfile::tempdir().unwrap();
+        let least_dir = tempfile::tempdir().unwrap();
+        let most = seed_fanout_repo(most_dir.path(), 228);
+        let mid = seed_fanout_repo(mid_dir.path(), 120);
+        let least = seed_fanout_repo(least_dir.path(), 70);
+
+        for _ in 0..16 {
+            let repos: HashMap<String, PathBuf> = [
+                ("aaa-least".to_string(), least.clone()),
+                ("mmm-mid".to_string(), mid.clone()),
+                ("zzz-most".to_string(), most.clone()),
+            ]
+            .into();
+            let result = search_symbol_global(&repos, "Widget", None, false);
+            assert!(
+                result.contains("[zzz-most]"),
+                "the highest-matching repo must survive the output cap, got: {result}"
+            );
+            let pos = |repo: &str| result.find(&format!("[{repo}]")).unwrap_or(usize::MAX);
+            assert!(
+                pos("zzz-most") < pos("mmm-mid") && pos("mmm-mid") < pos("aaa-least"),
+                "ranking must follow true match count (228 > 120 > 70), got: {result}"
+            );
+        }
+    }
+
+    #[test]
+    fn search_symbol_global_fanout_discloses_repos_it_cannot_open() {
+        // #893 B2: a repo the fan-out cannot open was only reported through a
+        // `tracing::warn` on stderr; the MCP payload looked like a complete
+        // answer. The response must name what it skipped.
+        let good_dir = tempfile::tempdir().unwrap();
+        let bad_dir = tempfile::tempdir().unwrap();
+        let good = seed_fanout_repo(good_dir.path(), 3);
+        let bad = bad_dir.path().join("graph.db");
+        // Not a SQLite database: the read-only open path rejects it.
+        std::fs::write(&bad, b"this is not a sqlite database").unwrap();
+
+        let repos: HashMap<String, PathBuf> =
+            [("goodrepo".to_string(), good), ("badrepo".to_string(), bad)].into();
+        let result = search_symbol_global(&repos, "Widget", None, false);
+        assert!(
+            result.contains("struct:Widget0"),
+            "the readable repo must still answer, got: {result}"
+        );
+        assert!(
+            result.contains("badrepo"),
+            "the skipped repo must be named in the payload, got: {result}"
+        );
+    }
+
+    #[test]
+    fn collect_global_fanout_discloses_repos_it_cannot_open() {
+        // #893 B2: `collect_global` is the shared fan-out behind every global
+        // tool except search_symbol. A repo it could not open was reported only
+        // by a `tracing::warn` on stderr, so get_repo_map / get_blast_radius /
+        // get_graph_stats all returned confidently partial cross-repo answers.
+        let good_dir = tempfile::tempdir().unwrap();
+        let bad_dir = tempfile::tempdir().unwrap();
+        let good = seed_fanout_repo(good_dir.path(), 3);
+        let bad = bad_dir.path().join("graph.db");
+        // Not a SQLite database: the read-only open path rejects it.
+        std::fs::write(&bad, b"this is not a sqlite database").unwrap();
+
+        let repos: HashMap<String, PathBuf> =
+            [("goodrepo".to_string(), good), ("badrepo".to_string(), bad)].into();
+
+        let map = get_repo_map_global(&repos, None);
+        assert!(
+            map.contains("this cross-repo answer is partial"),
+            "get_repo_map_global must disclose the skipped repo, got: {map}"
+        );
+        assert!(
+            map.contains("badrepo"),
+            "the skipped repo must be named in the payload, got: {map}"
+        );
+        assert!(
+            map.contains("[goodrepo]"),
+            "the readable repo must still answer, got: {map}"
+        );
+
+        // The summing tool is the sharpest case: its totals are wrong, not
+        // merely incomplete, when a repo is skipped.
+        let stats = get_graph_stats_global(&repos, None);
+        assert!(
+            stats.contains("badrepo"),
+            "get_graph_stats_global must disclose the skipped repo, got: {stats}"
+        );
+
+        // get_lang_status_global is parsed as JSON by the extension: the note
+        // must not become the line it returns.
+        let lang = get_lang_status_global(&repos, "src/widget_0.rs", None);
+        assert!(
+            lang.starts_with('{'),
+            "get_lang_status_global must stay JSON, got: {lang}"
+        );
+    }
+
+    #[test]
+    fn collect_global_adds_no_note_when_every_repo_opens() {
+        // The disclosure must be invisible unless something was actually
+        // skipped: the no-skips payload stays byte-identical to pre-#893.
+        let a_dir = tempfile::tempdir().unwrap();
+        let b_dir = tempfile::tempdir().unwrap();
+        let repos: HashMap<String, PathBuf> = [
+            ("alpha".to_string(), seed_fanout_repo(a_dir.path(), 3)),
+            ("bravo".to_string(), seed_fanout_repo(b_dir.path(), 3)),
+        ]
+        .into();
+
+        let map = get_repo_map_global(&repos, None);
+        assert!(
+            !map.contains("cross-repo answer is partial"),
+            "no repo was skipped, so no note may appear, got: {map}"
+        );
+        let stats = get_graph_stats_global(&repos, None);
+        assert_eq!(
+            stats, "nodes: 6\nedges: 0",
+            "no-skips get_graph_stats_global payload must be unchanged, got: {stats}"
+        );
+    }
+
     // ── search_symbol / get_callers path:line tests ───────────────────────────
 
     #[test]
@@ -8804,7 +9373,7 @@ mod tests {
         store.put_node(&ts_node).unwrap();
 
         // "auth handler typescript" should return only the TypeScript node.
-        let result = search_symbol_raw(&store, "auth", Some("typescript"), false);
+        let (_, result) = search_symbol_raw(&store, "auth", Some("typescript"), false);
         assert!(
             result.contains("src/auth.ts"),
             "expected typescript node: {result}"
@@ -8830,7 +9399,7 @@ mod tests {
         store.put_node(&rs_node).unwrap();
         store.put_node(&ts_node).unwrap();
 
-        let result = search_symbol_raw(&store, "auth", None, false);
+        let (_, result) = search_symbol_raw(&store, "auth", None, false);
         assert!(
             result.contains("auth.rs"),
             "rust node must appear: {result}"
@@ -11184,6 +11753,46 @@ fn parse_symbol_tokens(symbols_arg: &str) -> Vec<SymbolToken<'_>> {
 /// (no partial symbol output) once the token budget is exhausted — except the
 /// first resolved symbol is always included so a single large `Full` definition
 /// never returns empty.
+/// Appended to a snippet header when the source file changed after the index
+/// recorded the symbol's line span.
+const STALE_SPAN_MARKER: &str =
+    " [stale: file edited since indexing, this span may not be this symbol]";
+
+/// Has `path` changed on disk since the indexer last hashed it?
+///
+/// `files.sha256` exists for exactly this comparison (the batch writer calls it
+/// "needed for SHA256 delta detection"), so this reuses that column rather than
+/// adding a second freshness signal. The encoding matches the writer's
+/// lowercase `{:02x}` hex (`travsr-daemon::hex_encode`).
+///
+/// Why this matters (#895): `snippet_for_node_capped` reads the *current* file
+/// at the *stored* line. An uncommitted edit that inserts or deletes lines
+/// shifts every symbol below it, so the extractor returns a well-formed span of
+/// unrelated code under the requested name, with nothing to distrust. Dogfooded:
+/// 6 of 9 symbols in one file came back wrong, split exactly at the edit point.
+///
+/// `false` when no hash is recorded: an index predating the `files` table, or a
+/// path the indexer never hashed. Absence of evidence is not drift, and marking
+/// every symbol of such a repo would be noise.
+fn file_drifted_since_index(store: &SqliteStore, repo_root: &std::path::Path, path: &str) -> bool {
+    let Ok(Some(indexed)) = store.get_file_hash(path) else {
+        return false;
+    };
+    let Ok(bytes) = std::fs::read(repo_root.join(path)) else {
+        // Unreadable is already handled by the snippet reader returning None.
+        return false;
+    };
+    use sha2::{Digest, Sha256};
+    let actual = Sha256::digest(&bytes)
+        .iter()
+        .fold(String::with_capacity(64), |mut s, b| {
+            use std::fmt::Write;
+            let _ = write!(s, "{b:02x}");
+            s
+        });
+    actual != indexed
+}
+
 fn get_snippets_body(
     store: &SqliteStore,
     symbols_arg: &str,
@@ -11272,14 +11881,21 @@ fn get_snippets_body(
     let mut parts: Vec<String> = Vec::new();
     let mut tokens_used: usize = 0;
     let mut n_with_snippet: usize = 0;
+    // One hash per file, not per symbol: a request routinely names several
+    // symbols from the same file (that is how #895 was found).
+    let mut drift_cache: HashMap<String, bool> = HashMap::new();
 
     for node in &resolved {
+        let drifted = *drift_cache
+            .entry(node.vname.path.clone())
+            .or_insert_with(|| file_drifted_since_index(store, &repo_root, &node.vname.path));
         let header = format!(
-            "{} ({}) \u{2014} {} [package: {}]",
+            "{} ({}) \u{2014} {} [package: {}]{}",
             display_label(node),
             node.kind,
             node.vname.path,
-            node.package
+            node.package,
+            if drifted { STALE_SPAN_MARKER } else { "" }
         );
         let skeleton = |n: &CoreNode| skeleton_for_node_inner(n, &repo_root).map(|s| s.render());
 
@@ -11675,6 +12291,63 @@ mod snippet_tests {
             result.contains("0 with snippets"),
             "snippet count must be 0: {result}"
         );
+    }
+
+    /// Dogfooded on this repo (#895): `get_snippets` returned the wrong
+    /// function body for 6 of 9 symbols in one file. The index held each symbol
+    /// at its pre-edit line; an uncommitted edit had shifted everything below
+    /// it by +35; `snippet_for_node_capped` read the *current* file at the
+    /// *stored* line and returned a plausible span of unrelated code under the
+    /// requested name. Every symbol above the edit point was correct and every
+    /// symbol below it was wrong, which is what identified line drift as the
+    /// cause rather than name-prefix collision.
+    ///
+    /// A wrong snippet is worse than a missing one: nothing in the output let a
+    /// reader distrust it. `files.sha256` already exists for delta detection, so
+    /// the drift is detectable without new storage.
+    #[test]
+    fn get_snippets_discloses_a_span_whose_file_changed_since_indexing() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("lib.ts");
+        let original = "function hello() {\n  return 'hi';\n}\n";
+        std::fs::write(&src, original).unwrap();
+
+        let node = make_fn_node("lib.ts", "fn:hello", 1, 3);
+        let mut store = make_store_with_meta(&[node], dir.path());
+        // The hash the indexer would have recorded for the file as indexed.
+        store
+            .put_file_hash("lib.ts", &sha256_hex_for_test(original.as_bytes()))
+            .unwrap();
+
+        let fresh = get_snippets_body(&store, "fn:hello", 2000, SnippetMode::Auto);
+        assert!(
+            !fresh.contains("stale:"),
+            "an unmodified file must not be flagged: {fresh}"
+        );
+
+        // Two lines inserted above the symbol, no reindex: fn:hello is still
+        // recorded at 1..3 but now lives at 3..5, so the stored span no longer
+        // covers it.
+        std::fs::write(&src, format!("// added\n// added\n{original}")).unwrap();
+
+        let drifted = get_snippets_body(&store, "fn:hello", 2000, SnippetMode::Auto);
+        assert!(
+            drifted.contains("stale:"),
+            "a file edited since indexing must be disclosed, not answered \
+             silently from the stale span: {drifted}"
+        );
+    }
+
+    /// Mirrors `travsr-daemon`'s `hex_encode`: lowercase `{:02x}` over sha256.
+    fn sha256_hex_for_test(bytes: &[u8]) -> String {
+        use sha2::{Digest, Sha256};
+        Sha256::digest(bytes)
+            .iter()
+            .fold(String::with_capacity(64), |mut s, b| {
+                use std::fmt::Write;
+                let _ = write!(s, "{b:02x}");
+                s
+            })
     }
 
     #[test]
@@ -14522,19 +15195,17 @@ mod snippet_tests {
             "should name the unanalysed file: {out}"
         );
         assert!(
-            !out.contains("recorded no uses"),
+            !out.contains("No uses recorded"),
             "must not assert absence: {out}"
         );
     }
 
-    #[test]
-    fn find_references_keeps_definitive_zero_when_target_file_is_analyzed() {
-        // Converse of the above: the target's own file carries occurrence rows,
-        // so a zero for this symbol is a real zero and the existing confident
-        // wording must be preserved unchanged.
+    /// Shared fixture for the #864 gate tests: a target whose own file carries
+    /// occurrence rows (so the #450 per-file gate passes and we are testing the
+    /// repo-wide gate, nothing else).
+    fn store_with_analyzed_target() -> travsr_store::SqliteStore {
         use travsr_core::{Node, VName};
         let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
-
         let caller = Node::new(
             VName::new("", "", "src/svc.rs", "rust", "fn:caller"),
             "function",
@@ -14543,7 +15214,6 @@ mod snippet_tests {
             VName::new("", "", "src/svc.rs", "rust", "fn:callee"),
             "function",
         );
-        // Same file, analysed, but nothing references it.
         let unused = Node::new(
             VName::new("", "", "src/svc.rs", "rust", "fn:unused"),
             "function",
@@ -14555,15 +15225,302 @@ mod snippet_tests {
         store
             .record_edge_sites(&[(caller.id, callee.id, 5, None)])
             .unwrap();
+        store
+    }
+
+    #[test]
+    fn no_recorded_phase_b_failure_yields_a_definitive_zero() {
+        // Every phase_b_warnings class travsr-daemon writes must soften the zero
+        // for its language: the caller's partial-coverage gate handles crashed /
+        // emitter_*, phase_b_incomplete_reason handles the rest. Iterating the
+        // full daemon set, not a hand-picked subset, means a class added to the
+        // daemon without a decision here fails this test instead of silently
+        // earning a definitive zero. (travsr-daemon writes these as
+        // `<class>:{lang}`; version_mismatch carries `:{expected}:{got}` too.)
+        let daemon_classes = [
+            "crashed:rust",
+            "zero_nodes:rust",
+            "no_references:rust",
+            "version_mismatch:rust:1.0:2.0",
+            "needs_approval:rust",
+            "needs_consent:rust",
+            "skipped_unregistered:rust",
+            "untrusted_corpus:rust",
+            "skipped_no_analyzer:rust",
+            "skipped_no_compdb:rust",
+            "emitter_missing:rust",
+            "emitter_failed:rust",
+        ];
+        for warning in daemon_classes {
+            let mut store = store_with_analyzed_target();
+            store.set_meta("phase_b_warnings", warning).unwrap();
+            let out = find_references(&store, "unused", None);
+            assert!(
+                !out.contains("No uses recorded"),
+                "'{warning}' records that Phase B did not complete for rust, so \
+                 the zero must be softened rather than asserted: {out}"
+            );
+        }
+
+        // Control: a clean run still reaches the definitive zero, so the loop
+        // above cannot pass by hedging everything.
+        let mut clean = store_with_analyzed_target();
+        clean.set_meta("phase_b_warnings", "").unwrap();
+        clean.set_meta("rust_lsif_degraded", "").unwrap();
+        clean.set_meta("phase_b_dirty", "0").unwrap();
+        let out = find_references(&clean, "unused", None);
+        assert!(
+            out.contains("No uses recorded"),
+            "a clean index must still earn the definitive zero: {out}"
+        );
+    }
+
+    #[test]
+    fn find_references_softens_zero_when_phase_b_skipped_the_language() {
+        // A recorded fact that this language was not analysed: the softened
+        // answer must name the reason rather than assert absence.
+        let mut store = store_with_analyzed_target();
+        store
+            .set_meta("phase_b_warnings", "skipped_no_analyzer:rust")
+            .unwrap();
 
         let out = find_references(&store, "unused", None);
         assert!(
-            out.contains("recorded no uses"),
-            "analysed file should still give a definitive zero: {out}"
+            out.contains("not a definitive zero"),
+            "a language Phase B skipped must soften the claim: {out}"
+        );
+        assert!(
+            out.contains("no analyzer is installed"),
+            "should name the recorded reason: {out}"
+        );
+        assert!(
+            !out.contains("No uses of this symbol are recorded"),
+            "must not assert absence: {out}"
+        );
+    }
+
+    #[test]
+    fn find_references_softens_zero_for_another_languages_warning_only() {
+        // The warning is per-language and must be matched as such: a skipped
+        // Go analyzer says nothing about Rust coverage, so the Rust answer
+        // stays definitive. Guards against a substring match on the meta blob.
+        let mut store = store_with_analyzed_target();
+        store
+            .set_meta(
+                "phase_b_warnings",
+                "skipped_no_analyzer:go,zero_nodes:java,skipped_no_compdb:c",
+            )
+            .unwrap();
+
+        let out = find_references(&store, "unused", None);
+        assert!(
+            out.contains("No uses recorded"),
+            "another language's warning must not soften this one: {out}"
+        );
+
+        // And when the target's own language IS in the blob, it is the one
+        // picked out, not the first entry and not a second language.
+        store
+            .set_meta(
+                "phase_b_warnings",
+                "skipped_no_analyzer:go,needs_approval:rust,skipped_no_compdb:c",
+            )
+            .unwrap();
+        let out = find_references(&store, "unused", None);
+        assert!(
+            out.contains("'rust' was not analysed") && out.contains("waiting on approval"),
+            "must select the target language's own warning: {out}"
+        );
+        // The softening REASON is target-scoped: it must name rust and no other
+        // language. The repo-wide freshness banner appended after it
+        // (`with_phase_b_note` / `phase_b_unanalyzed_note`) lists every
+        // unanalysed language by design, so scope the leak check to the reason,
+        // ahead of that banner.
+        let reason = out.split("[note:").next().unwrap_or(&out);
+        assert!(
+            !reason.contains("go") && !reason.contains("compilation database"),
+            "the reason must not name another language: {out}"
+        );
+    }
+
+    #[test]
+    fn find_references_softens_zero_when_rust_lsif_degraded() {
+        // rust-analyzer never ran, so every Rust call edge is missing even
+        // though the target's own file has Phase A occurrence rows.
+        let mut store = store_with_analyzed_target();
+        store
+            .set_meta("rust_lsif_degraded", "sandbox_unavailable")
+            .unwrap();
+
+        let out = find_references(&store, "unused", None);
+        assert!(
+            out.contains("not a definitive zero") && out.contains("no OS sandbox"),
+            "a degraded Rust LSIF run must soften and explain: {out}"
+        );
+    }
+
+    #[test]
+    fn find_references_softens_zero_when_a_reindex_left_edges_dirty() {
+        // #583: a mid-edit reindex dropped call edges without moving HEAD.
+        let mut store = store_with_analyzed_target();
+        store.set_meta("phase_b_dirty", "1").unwrap();
+
+        let out = find_references(&store, "unused", None);
+        assert!(
+            out.contains("not a definitive zero") && out.contains("dropped call edges"),
+            "dropped edges must soften the claim: {out}"
+        );
+    }
+
+    #[test]
+    fn find_references_keeps_definitive_zero_on_a_healthy_index() {
+        // The property the #864 gate must preserve: on an index whose markers
+        // are all clean, the definitive zero is still REACHABLE. The previous
+        // occurrence-ratio gate failed exactly here — the manifest and external
+        // crate nodes below can never hold a `ref/call` row, so the ratio never
+        // read complete and this branch became dead code on every real repo.
+        use travsr_core::{Node, VName};
+        let mut store = store_with_analyzed_target();
+        // Every real Rust repo has these two. Neither can ever be "covered".
+        store
+            .put_node(&Node::new(
+                VName::new("", "", "crates/foo/Cargo.toml", "rust", "crate:foo"),
+                "crate",
+            ))
+            .unwrap();
+        store
+            .put_node(&Node::new(
+                VName::new("", "", "", "rust", "crate:serde"),
+                "crate",
+            ))
+            .unwrap();
+        // Analysed, simply nothing to call: indistinguishable from unanalysed
+        // in the occurrence ratio, which is why the ratio could not gate this.
+        store
+            .put_node(&Node::new(
+                VName::new("", "", "src/consts.rs", "rust", "const:K"),
+                "constant",
+            ))
+            .unwrap();
+        // Healthy markers, as a completed Phase B run leaves them.
+        store.set_meta("phase_b_warnings", "").unwrap();
+        store.set_meta("rust_lsif_degraded", "").unwrap();
+        store.set_meta("phase_b_dirty", "0").unwrap();
+
+        let out = find_references(&store, "unused", None);
+        assert!(
+            out.contains("No uses recorded"),
+            "a healthy index must still earn the definitive zero: {out}"
         );
         assert!(
             !out.contains("not a definitive zero"),
-            "should not soften when the file was analysed: {out}"
+            "must not hedge on a complete run: {out}"
+        );
+    }
+
+    #[test]
+    fn find_references_definitive_zero_names_only_surviving_recall_limits() {
+        // #864's repro: a uniquely-named constant used once, inside a Rust
+        // inline format capture the provider walks as a string literal. The old
+        // caveat offered only the name-collision reason, which did not apply,
+        // so a miss with a different cause read as an authoritative absence.
+        let store = store_with_analyzed_target();
+
+        let out = find_references(&store, "unused", None);
+        assert!(
+            out.contains("defined in more than one place"),
+            "the caveat must keep the name-collision limit: {out}"
+        );
+        assert!(
+            !out.contains("format"),
+            "inline format captures are recovered by the extractor now, so the \
+             caveat must not claim they are unindexed: {out}"
+        );
+    }
+
+    #[test]
+    fn find_references_structured_softens_note_but_keeps_total_zero() {
+        // The structured contract across the #864 gate: only `note` changes.
+        // `total` stays a real Some(0) per #755 Part B item 9, so a consumer
+        // keying on it is not handed a null it would read as "not counted".
+        let mut store = store_with_analyzed_target();
+        store
+            .set_meta("phase_b_warnings", "skipped_no_analyzer:rust")
+            .unwrap();
+
+        let got = find_references_structured(&store, "unused", None);
+        assert_eq!(got.status, "resolved");
+        assert_eq!(got.total, Some(0), "total must stay a counted zero");
+        assert!(got.references.is_empty());
+        let note = got.note.expect("softened answer must carry a note");
+        assert!(
+            note.contains("not a definitive zero") && note.contains("no analyzer is installed"),
+            "note should carry the softened wording: {note}"
+        );
+        assert!(
+            !note.starts_with("resolved:"),
+            "header belongs in resolved_to, not note: {note}"
+        );
+    }
+
+    /// Dogfooded on this repo (#895): `travsr references collect_global`
+    /// answered `0 reference(s). The index recorded no uses of this symbol.`
+    /// and then appended `[note: live overlay active: 11 references in the
+    /// files above detected but not resolved.]`. Both sentences described the
+    /// same file and could not both be true: the overlay had already detected
+    /// 11 uses the resolver declined to place.
+    ///
+    /// The zero is only definitive once nothing is still pending in the file
+    /// the answer names, which is exactly the scope `live_overlay_note` reports
+    /// its pending half over. Gating on the same set is what keeps the answer
+    /// and the note from contradicting each other.
+    #[test]
+    fn find_references_softens_zero_when_target_file_has_pending_refs() {
+        use travsr_core::{Node, VName};
+        use travsr_store::RefResolution;
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+
+        let caller = Node::new(
+            VName::new("", "", "src/svc.rs", "rust", "fn:caller"),
+            "function",
+        );
+        let callee = Node::new(
+            VName::new("", "", "src/svc.rs", "rust", "fn:callee"),
+            "function",
+        );
+        let unused = Node::new(
+            VName::new("", "", "src/svc.rs", "rust", "fn:unused"),
+            "function",
+        )
+        .with_line(20);
+        store.put_node(&caller).unwrap();
+        store.put_node(&callee).unwrap();
+        store.put_node(&unused).unwrap();
+        // The file is analysed, so every other softening gate stays shut.
+        store
+            .record_edge_sites(&[(caller.id, callee.id, 5, None)])
+            .unwrap();
+        // ...but one reference in it is detected and unresolved.
+        store
+            .upsert_ref_resolution_states(&[RefResolution {
+                src: caller.id,
+                ref_line: 7,
+                ref_col: 9,
+                name: "unused".to_string(),
+                state: "pending",
+                resolved_dst: None,
+            }])
+            .unwrap();
+
+        let out = find_references(&store, "unused", None);
+        assert!(
+            !out.contains("recorded no uses"),
+            "a pending reference in the target's own file makes a confident \
+             zero unsupportable: {out}"
+        );
+        assert!(
+            out.contains("not a definitive zero"),
+            "should soften while a reference in the file is unresolved: {out}"
         );
     }
 
@@ -16229,6 +17186,24 @@ mod issue_755_tests {
         assert!(note.contains("objectivec"), "got: {note}");
     }
 
+    /// #878: so is a TypeScript LSIF pass that never ran. The language kept its
+    /// tree-sitter call edges, so an answer here is short rather than empty,
+    /// and the note must not claim there are no call edges at all.
+    #[test]
+    fn a_skipped_lsif_emitter_produces_a_per_query_note() {
+        for warn in ["emitter_missing:typescript", "emitter_failed:typescript"] {
+            let store = with_warnings(warn);
+            let note =
+                phase_b_degraded_note(&store).unwrap_or_else(|| panic!("{warn} must be surfaced"));
+            assert!(note.contains("typescript"), "got: {note}");
+            assert!(
+                note.contains("or not all of them") && note.contains("short result"),
+                "a partial language must be described as partial, not empty; got: {note}"
+            );
+            assert!(note.contains("not authoritative"), "got: {note}");
+        }
+    }
+
     /// So are the two "waiting on the user" states.
     #[test]
     fn pending_approval_and_consent_produce_a_per_query_note() {
@@ -16368,8 +17343,10 @@ mod issue_755_tests {
         );
         store.put_node(&n).unwrap();
         let out = get_callers(&store, "describe", None);
+        // #878 widened the wording to "no call edges, or not all of them", so
+        // pin the language attribution and the verdict rather than one phrase.
         assert!(
-            out.contains("no call edges were produced for php"),
+            out.contains("were produced for php") && out.contains("not authoritative"),
             "an empty caller list must say why; got: {out}"
         );
     }

@@ -29,7 +29,8 @@ use travsr_retrieval::compute_kcore;
 use travsr_store::{BatchWriteCounts, FileGraph, SqliteStore, Store};
 
 pub use hook::{
-    changed_files_from_git, install_hook, tracked_files_from_git, try_dispatch_to_daemon,
+    changed_files_from_git, commit_is_ancestor_of_head, install_hook, tracked_files_from_git,
+    try_dispatch_to_daemon,
 };
 
 /// Set the process-level opt-in flag that allows `rust-analyzer` to run
@@ -55,6 +56,25 @@ pub use hook::{
 pub fn set_allow_unsandboxed_lsif(val: bool) {
     travsr_indexer::sandbox::set_cli_allow_unsandboxed(val);
 }
+
+/// Tracing target for the session lifecycle events that must survive whatever
+/// filter the log is written under: `daemon.session.start` and
+/// `daemon.session.exit`.
+///
+/// A log file has to be able to say which session produced it, under what
+/// filter, and why it stopped, or a reader cannot tell an empty file from a
+/// quiet one and will happily read the previous session's line as if it
+/// described this one. The subscriber setup appends a directive admitting this
+/// target unconditionally.
+///
+/// A high severity is not a substitute for the exemption. ERROR passes any bare
+/// level, but a targeted directive with no bare level (`RUST_LOG=some_crate=debug`)
+/// leaves `EnvFilter`'s unmatched default OFF, so an ERROR on the ordinary
+/// target is dropped. The exit line learned that the hard way.
+///
+/// The extension's `shortTarget` splits on `::`, so entries still render under
+/// `daemon` rather than growing a second name in the log view.
+pub const SESSION_LOG_TARGET: &str = "travsr_daemon::session";
 
 /// The user-facing product version, set once by the `travsr` binary at startup.
 static BUILD_VERSION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
@@ -91,6 +111,12 @@ pub struct InitStats {
     pub files_skipped_ignored: u64,
     /// Whether `.travsrignore` was freshly created on this run (first `travsr init`).
     pub travsrignore_scaffolded: bool,
+    /// #893: whether a `/.travsr/` entry was appended to `.gitignore` on this run.
+    pub gitignore_scaffolded: bool,
+    /// #893: git already tracks files under `.travsr/`, so the `.gitignore`
+    /// entry is inert and the user needs `git rm -r --cached .travsr` before
+    /// `git revert`/`git merge` will run again. Surfaced, never auto-fixed.
+    pub travsr_dir_tracked: bool,
     /// Net change in node count. `i64` to allow negative values if nodes are
     /// removed in the future (e.g. delete-by-file support); currently always >= 0.
     pub nodes_written: i64,
@@ -170,6 +196,54 @@ pub struct PhaseBReport {
     /// Shown to the user with a `travsr lang install <lang>` call-to-action.
     /// Tuple: (language, expected_version, got_version).
     pub version_mismatch: Vec<(String, u32, u32)>,
+    /// #878: the TypeScript LSIF pass was requested (a `tsconfig.json` is at the
+    /// repo root) but produced nothing, because `travsr-lsif-ts` could not be
+    /// started or failed. `typescript` still appears in `ran` (the native
+    /// tree-sitter pass did run), so without this the run read as a clean
+    /// success while the language was missing most of its `ref/call` edges.
+    pub lsif_skipped: Option<LsifSkip>,
+}
+
+/// #878: why the TypeScript LSIF pass produced no edges for a repo that asked
+/// for it (a `tsconfig.json` at the repo root).
+///
+/// Two classes, because they call for different fixes. `EmitterMissing` is a
+/// failure to *start* `travsr-lsif-ts` at all (discovery fell through, or an
+/// explicit `TRAVSR_LSIF_TS` names a missing file): the remedy is the install
+/// layout or the override. `EmitterFailed` is an emitter that ran and broke
+/// (non-zero exit, timeout, oversized output) or whose dump could not be
+/// ingested: the remedy is in its own stderr. Persisted to `phase_b_warnings`
+/// as `emitter_missing:typescript` / `emitter_failed:typescript` so `travsr
+/// status` and the MCP freshness notes disclose it the way a crashed sidecar
+/// is disclosed today.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LsifSkip {
+    pub reason: LsifSkipReason,
+    /// The underlying error, for the `init` summary. Not persisted: the meta
+    /// entry carries only the class, so free text (which may contain the `,`
+    /// and `:` the warning format is split on) never reaches it.
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LsifSkipReason {
+    /// `travsr-lsif-ts` could not be spawned (see `travsr_indexer::EmitterNotFound`).
+    EmitterMissing,
+    /// The emitter started but did not yield a usable dump.
+    EmitterFailed,
+}
+
+impl LsifSkip {
+    /// The `phase_b_warnings` class this skip is recorded under. Must stay in
+    /// step with the arms in `travsr-cli/src/status.rs` and
+    /// `travsr-mcp/src/observability.rs` (`phase_b_warning_classes_match_the_cli`
+    /// pins the set on the MCP side).
+    pub fn warning_class(&self) -> &'static str {
+        match self.reason {
+            LsifSkipReason::EmitterMissing => "emitter_missing",
+            LsifSkipReason::EmitterFailed => "emitter_failed",
+        }
+    }
 }
 
 /// Progress events emitted during [`init_repo_with_progress`] so a caller (the
@@ -533,6 +607,82 @@ fn scaffold_travsrignore(repo_root: &Path) -> anyhow::Result<bool> {
     std::fs::write(&path, DEFAULT_TRAVSRIGNORE)
         .with_context(|| format!("writing {}", path.display()))?;
     Ok(true)
+}
+
+/// Appended to `.gitignore` by [`scaffold_gitignore`].
+///
+/// Leading `/` anchors the rule to the repo root, the same reason `connect.rs`
+/// anchors every entry it generates: a slash-less pattern would also ignore a
+/// `.travsr` directory vendored at any depth. Trailing `/` matches the
+/// directory only.
+///
+/// The comment deliberately does not carry a `# travsr:` prefix: `connect.rs`
+/// finds its own managed block in this same file by substring-counting
+/// `# travsr:begin` / `# travsr:end`, and a sibling comment sharing that prefix
+/// is one careless edit to those markers away from being miscounted.
+const GITIGNORE_TRAVSR_ENTRY: &str =
+    "\n# travsr local code graph. Never commit it, the WAL file changes on every read.\n/.travsr/\n";
+
+/// Ensure git ignores `.travsr/`.
+///
+/// `init_repo` creates `.travsr/graph.db` plus its `-wal`/`-shm` sidecars and
+/// `init.lock` inside the repository. Untracked but un-ignored, the next
+/// `git add -A` commits them; the WAL then changes on every read, so the
+/// working tree is permanently dirty and `git revert` / `git merge` / `git
+/// rebase` refuse to run at all (#893). `travsr init` already takes
+/// responsibility for scaffolding `.travsrignore`, so the `.gitignore` entry
+/// belongs beside it rather than in a second owner.
+///
+/// Idempotency goes through `git check-ignore --no-index`, which answers "is a
+/// rule in effect" for every mechanism at once (repo `.gitignore`, nested
+/// `.gitignore`s, `.git/info/exclude`, the user's global excludes) instead of
+/// pattern-matching the file's text. `--no-index` is load-bearing: without it
+/// git reports an *already tracked* `.travsr/` as not-ignored no matter what
+/// rules exist, so every re-init on the repos this fix most needs to help would
+/// append a duplicate entry.
+///
+/// A git that cannot answer is treated as already-ignored, so init never
+/// appends blind to a user's `.gitignore`.
+///
+/// Returns whether an entry was appended.
+fn scaffold_gitignore(repo_root: &Path) -> anyhow::Result<bool> {
+    let ignored = std::process::Command::new("git")
+        .args(["check-ignore", "--no-index", "-q", ".travsr/"])
+        .current_dir(repo_root)
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(true);
+    if ignored {
+        return Ok(false);
+    }
+    let path = repo_root.join(".gitignore");
+    let mut text = std::fs::read_to_string(&path).unwrap_or_default();
+    // The entry leads with a blank line, so an existing file whose last line has
+    // no terminator would otherwise gain the comment on the end of that line.
+    if !text.is_empty() && !text.ends_with('\n') {
+        text.push('\n');
+    }
+    text.push_str(GITIGNORE_TRAVSR_ENTRY);
+    std::fs::write(&path, text).with_context(|| format!("writing {}", path.display()))?;
+    Ok(true)
+}
+
+/// Whether git already tracks anything under `.travsr/`.
+///
+/// A `.gitignore` entry has no effect on a path that is already in the index,
+/// so for a repo that committed `.travsr/` before this scaffold existed the
+/// entry alone changes nothing and the revert/merge deadlock survives. The
+/// caller reports that instead of claiming the problem is solved; untracking is
+/// left to the user because it rewrites their index, which `travsr init` has no
+/// mandate to do. Same call the `connect.rs` generated-file path makes for the
+/// same reason.
+fn travsr_dir_tracked(repo_root: &Path) -> bool {
+    std::process::Command::new("git")
+        .args(["ls-files", "--", ".travsr"])
+        .current_dir(repo_root)
+        .output()
+        .map(|o| o.status.success() && !o.stdout.is_empty())
+        .unwrap_or(false)
 }
 
 /// Top-level directory names that are well-known source roots, never dep/vendor dirs.
@@ -1434,6 +1584,15 @@ pub fn init_repo_with_progress(
         tracing::info!("wrote .travsrignore ({DEFAULT_TRAVSRIGNORE_RULE_COUNT} default rules)");
     }
 
+    // #893: and ensure git ignores the graph itself, for the same reason the
+    // walker reads `.travsrignore` before it starts — this is the run that
+    // created the files in question, so it is the run that must fence them off.
+    let gitignore_scaffolded = scaffold_gitignore(repo_root).unwrap_or(false);
+    if gitignore_scaffolded {
+        tracing::info!("added /.travsr/ to .gitignore");
+    }
+    let travsr_dir_tracked = travsr_dir_tracked(repo_root);
+
     let walker = WalkBuilder::new(repo_root)
         .hidden(false)
         .git_ignore(true)
@@ -1783,8 +1942,10 @@ pub fn init_repo_with_progress(
 
         // LSIF semantic pass — adds RefCall edges on top of structural edges.
         // DEBT(travsr-25): whole-project re-emit; file-level delta is Phase 3.
+        // #878: a skipped pass is carried into `write_phase_b_results` below,
+        // not just logged, so the summary and `travsr status` disclose it.
         let t_lsif = std::time::Instant::now();
-        run_lsif_pass(repo_root, &corpus, &mut store);
+        let lsif_skip = run_lsif_pass(repo_root, &corpus, &mut store);
         tracing::info!(
             elapsed_ms = t_lsif.elapsed().as_millis(),
             "TIMING: run_lsif_pass done"
@@ -1898,6 +2059,7 @@ pub fn init_repo_with_progress(
                 pb_refs,
                 pb_outcome,
                 (lsif_parsed, lsif_resolved),
+                lsif_skip.as_ref(),
             );
             // WS-2: flag Dart packages indexed without resolved dependencies.
             record_dart_resolution_state(&mut store, repo_root, present_languages.contains("dart"));
@@ -2071,6 +2233,8 @@ pub fn init_repo_with_progress(
         files_skipped_unchanged,
         files_skipped_ignored,
         travsrignore_scaffolded: scaffolded,
+        gitignore_scaffolded,
+        travsr_dir_tracked,
         nodes_written: nodes_after - nodes_before,
         edges_written,
         total_nodes: nodes_after as u64,
@@ -2963,6 +3127,7 @@ fn run_outcome(report: &PhaseBReport, made_progress: bool) -> phase_b_sched::Run
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn write_phase_b_results(
     store: &mut SqliteStore,
     corpus: &str,
@@ -2975,6 +3140,10 @@ fn write_phase_b_results(
     // Windows path bug where every ref parsed but none matched a Phase A node —
     // so `rust_lsif_degraded` reflects surviving edges, not just "did ra run".
     lsif_stats: (usize, usize),
+    // #878: `Some` when the TypeScript LSIF pass was due (tsconfig.json present)
+    // but `travsr-lsif-ts` could not run. Recorded in `phase_b_warnings` and on
+    // the report so the language is never reported as cleanly complete.
+    lsif_skip: Option<&LsifSkip>,
 ) -> (
     PhaseBReport,
     std::collections::HashMap<travsr_core::NodeId, travsr_core::NodeId>,
@@ -3167,6 +3336,13 @@ fn write_phase_b_results(
     for lang in &pb_outcome.skipped_no_compdb {
         warnings.push(format!("skipped_no_compdb:{lang}"));
     }
+    // #878: the TypeScript LSIF pass was due but `travsr-lsif-ts` never ran (or
+    // ran and failed). The native pass still ran, so `typescript` is in `ran`
+    // and the marker advances; this is what keeps `travsr status` from reading
+    // `complete` over an index missing most of the language's call edges.
+    if let Some(skip) = lsif_skip {
+        warnings.push(format!("{}:typescript", skip.warning_class()));
+    }
     // E6: surface SCIP def-unification misses (orphaned twins). Positional
     // span-containment makes this near-zero; a non-zero rate means Phase A
     // nodes the compiler defined were not matched, so their ref/call edges
@@ -3240,6 +3416,7 @@ fn write_phase_b_results(
         produced_no_nodes: pb_outcome.produced_no_nodes,
         produced_no_references: pb_outcome.produced_no_references,
         version_mismatch: pb_outcome.version_mismatch,
+        lsif_skipped: lsif_skip.cloned(),
     };
     (report, alias_map, dropped)
 }
@@ -4819,7 +4996,8 @@ fn run_background_phase_b_inner(
     // ── LSIF pass (TypeScript compiler — expensive, runs lock-free) ───────────
     // Collect edges into a Vec first; write them under the store lock below.
     // This mirrors the SCIP sidecar pattern and keeps queries warm throughout.
-    let lsif_edges = run_lsif_pass_collect(repo_root, &corpus);
+    // #878: a skipped pass is recorded, not just logged (see the inline path).
+    let (lsif_edges, lsif_skip) = run_lsif_pass_collect(repo_root, &corpus);
 
     // ── SCIP sidecar pass (all languages in parallel, lock-free) ─────────────
     // P6 (#329): single walk yields both present_languages and indexable_paths
@@ -4889,6 +5067,7 @@ fn run_background_phase_b_inner(
         pb_refs,
         pb_outcome,
         (lsif_parsed, lsif_resolved),
+        lsif_skip.as_ref(),
     );
     // WS-2: flag Dart packages indexed without resolved dependencies.
     record_dart_resolution_state(&mut s, repo_root, dart_present);
@@ -4966,6 +5145,9 @@ fn run_background_phase_b_inner(
         event = "phase_b.complete",
         ran = report.ran.len(),
         lsif_edges = lsif_edges.len(),
+        // #878: `lsif_edges = 0` alone cannot distinguish "no tsconfig" from
+        // "the emitter never ran"; the class says which.
+        lsif_skipped = report.lsif_skipped.as_ref().map(LsifSkip::warning_class),
         crashed = report.crashed.len(),
         write_failures = report.write_failures,
         outcome = ?outcome,
@@ -5508,46 +5690,72 @@ pub fn reindex_files(
 /// Used by the inline path (`--semantic` or no-commit repos). For the deferred
 /// path use [`run_lsif_pass_collect`] + write under the store lock.
 ///
-/// Failures (binary not on PATH, tsconfig absent, parse errors) are logged as
-/// warnings and silently skipped — they must never fail the overall index.
-fn run_lsif_pass(repo_root: &Path, corpus: &str, store: &mut SqliteStore) {
-    let edges = run_lsif_pass_collect(repo_root, corpus);
+/// Failures never fail the overall index, but they are not silent either:
+/// `Some(skip)` is returned when the pass was due and the emitter could not
+/// run, for the caller to hand to `write_phase_b_results` (#878).
+fn run_lsif_pass(repo_root: &Path, corpus: &str, store: &mut SqliteStore) -> Option<LsifSkip> {
+    let (edges, skip) = run_lsif_pass_collect(repo_root, corpus);
     for edge in &edges {
         if let Err(e) = store.put_edge_lsif(edge) {
             tracing::warn!("lsif edge write error: {e}");
         }
     }
     tracing::debug!("lsif pass: {} RefCall edges persisted", edges.len());
+    skip
 }
 
 /// Collect LSIF RefCall edges without holding the store lock.
 ///
-/// Returns an empty `Vec` when `tsconfig.json` is absent or the emitter fails.
-/// The caller writes the edges under the store lock. This split lets
-/// `run_background_phase_b` hold the lock only for the final write batch while
-/// the expensive TS compiler runs lock-free.
-fn run_lsif_pass_collect(repo_root: &Path, corpus: &str) -> Vec<travsr_core::Edge> {
+/// Returns `(edges, skip)`. `edges` is empty when `tsconfig.json` is absent or
+/// the emitter failed; `skip` is `Some` in the second case only, so a repo
+/// without a tsconfig is not reported as degraded (#878). The caller writes the
+/// edges under the store lock. This split lets `run_background_phase_b` hold
+/// the lock only for the final write batch while the expensive TS compiler
+/// runs lock-free.
+fn run_lsif_pass_collect(
+    repo_root: &Path,
+    corpus: &str,
+) -> (Vec<travsr_core::Edge>, Option<LsifSkip>) {
     let tsconfig = repo_root.join("tsconfig.json");
     if !tsconfig.exists() {
-        return Vec::new();
+        return (Vec::new(), None);
     }
 
     let dump = match run_lsif_emitter(&tsconfig) {
         Ok(d) => d,
         Err(e) => {
-            tracing::warn!("lsif emitter skipped: {e}");
-            return Vec::new();
+            // #878: this used to be the only trace of the skip, and only under
+            // RUST_LOG. The class is what the user-facing surfaces key on.
+            let reason = if travsr_indexer::emitter_missing(&e) {
+                LsifSkipReason::EmitterMissing
+            } else {
+                LsifSkipReason::EmitterFailed
+            };
+            tracing::warn!("lsif emitter skipped: {e:#}");
+            return (
+                Vec::new(),
+                Some(LsifSkip {
+                    reason,
+                    detail: format!("{e:#}"),
+                }),
+            );
         }
     };
 
     match ingest_lsif(&dump, corpus) {
         Ok(out) => {
             tracing::debug!("lsif pass: collected {} RefCall edges", out.edges.len());
-            out.edges
+            (out.edges, None)
         }
         Err(e) => {
-            tracing::warn!("lsif ingest error: {e}");
-            Vec::new()
+            tracing::warn!("lsif ingest error: {e:#}");
+            (
+                Vec::new(),
+                Some(LsifSkip {
+                    reason: LsifSkipReason::EmitterFailed,
+                    detail: format!("travsr-lsif-ts ran but its output could not be read: {e:#}"),
+                }),
+            )
         }
     }
 }
@@ -5674,6 +5882,116 @@ mod tests {
     use super::*;
     use std::process::Command as StdCommand;
     use std::sync::Mutex;
+
+    /// Run `body` under a subscriber filtered by `directive`, and return the
+    /// (target, level) of every event that actually reached it.
+    ///
+    /// Asserting on what a subscriber receives rather than on the directive
+    /// string is the whole point: an unknown word in a directive is read as a
+    /// target name rather than rejected, and severity alone does not carry an
+    /// event past a filter with no bare level.
+    fn capture_with_filter(directive: &str, body: impl FnOnce()) -> Vec<(String, tracing::Level)> {
+        use tracing_subscriber::layer::{Layer as _, SubscriberExt as _};
+
+        #[derive(Clone, Default)]
+        struct Seen(std::sync::Arc<Mutex<Vec<(String, tracing::Level)>>>);
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Seen {
+            fn on_event(
+                &self,
+                ev: &tracing::Event<'_>,
+                _: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                let m = ev.metadata();
+                self.0
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push((m.target().to_string(), *m.level()));
+            }
+        }
+
+        let seen = Seen::default();
+        let subscriber = tracing_subscriber::registry().with(seen.clone().with_filter(
+            tracing_subscriber::EnvFilter::try_new(directive).expect("our directive must parse"),
+        ));
+        tracing::subscriber::with_default(subscriber, body);
+        let out = seen.0.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        out
+    }
+
+    /// A targeted directive with no bare level leaves `EnvFilter`'s unmatched
+    /// default OFF, so severity alone does not get a line into the file: an
+    /// ERROR on the ordinary target is dropped. Both session lifecycle lines
+    /// have to ride the exempt target to survive it, and the exit line did not
+    /// at first, which silently defeated it under exactly the form the CLI's
+    /// troubleshooting text prints and which auto-starts a daemon.
+    #[test]
+    fn session_lifecycle_survives_a_targeted_rust_log() {
+        let directive = filter_directive_for("travsr_plugin_host=debug");
+        let seen = capture_with_filter(&directive, || {
+            tracing::info!(target: SESSION_LOG_TARGET, event = "daemon.session.start", "start");
+            tracing::error!(target: SESSION_LOG_TARGET, event = "daemon.session.exit", "exit");
+            // The same event on the ordinary target, which is what the exit
+            // line used to be and what this test exists to keep it from
+            // becoming again.
+            tracing::error!(event = "daemon.session.exit", "exit on the default target");
+        });
+        let on_exempt = seen.iter().filter(|(t, _)| t == SESSION_LOG_TARGET).count();
+        assert_eq!(
+            on_exempt, 2,
+            "both session lifecycle lines must survive a targeted directive; saw {seen:?}"
+        );
+        assert!(
+            !seen.iter().any(|(t, _)| t == "travsr_daemon"),
+            "an ERROR on the ordinary target is dropped here, which is why the exemption is needed; saw {seen:?}"
+        );
+    }
+
+    /// `log.level = error` has to still record errors, which is the whole point
+    /// of offering the level. Checked against a real `EnvFilter` rather than by
+    /// reading the directive string, because what matters is what the filter
+    /// admits, and an unknown word in a directive is silently read as a target
+    /// name rather than rejected.
+    #[test]
+    fn an_error_only_log_still_records_errors() {
+        let directive = filter_directive_for("error");
+        let got = capture_with_filter(&directive, || {
+            tracing::error!("boom");
+            tracing::warn!("noise");
+            tracing::info!(target: SESSION_LOG_TARGET, "daemon starting");
+        });
+        assert!(
+            got.iter().any(|(_, l)| *l == tracing::Level::ERROR),
+            "an error-only log that drops errors is not a log; saw {got:?}"
+        );
+        assert!(
+            !got.iter().any(|(_, l)| *l == tracing::Level::WARN),
+            "error means error, not warn and above; saw {got:?}"
+        );
+        assert!(
+            got.iter().any(|(t, _)| t == SESSION_LOG_TARGET),
+            "the session line is exempt so the file can identify itself; saw {got:?}"
+        );
+    }
+
+    /// `query.served` was INFO on every query, which made it 28 of about 130
+    /// lines in this repo's own log, most of them `elapsed_ms=0` cache hits.
+    /// The level now follows the content, so this pins where the line sits and
+    /// that the boundary is inclusive: a threshold read as "slower than" leaves
+    /// a band that is neither event nor commentary.
+    #[test]
+    fn only_a_slow_query_is_worth_an_info_line() {
+        assert!(!query_is_slow(0), "a cache hit is commentary");
+        assert!(!query_is_slow(SLOW_QUERY_MS - 1));
+        assert!(query_is_slow(SLOW_QUERY_MS), "the threshold itself counts");
+        assert!(query_is_slow(SLOW_QUERY_MS + 1));
+        // Comfortably above the 50 ms p95 the bench gate enforces, so a query
+        // at the edge of the budget does not log and one well past it does.
+        // Tightening this to the gate would put the log back where it was.
+        assert!(
+            !query_is_slow(50),
+            "a query inside the p95 budget must not log at info"
+        );
+    }
 
     /// #735: the embed tick body must be single-flight. A tick that fires
     /// while the previous body still runs used to start a second concurrent
@@ -7713,6 +8031,7 @@ mod tests {
             pb_refs,
             travsr_plugin_host::PhaseBOutcome::default(),
             (0, 0),
+            None,
         );
 
         // Literal repro from issue #449: "ClassA (Swift class instantiated via
@@ -7752,7 +8071,20 @@ mod tests {
     // this lock to prevent races on Windows and Linux multi-threaded test runs.
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
+    /// #893: `init_repo` registers its repo root in `~/.travsr/registry.json`
+    /// unless this is set, so an unguarded test in this module appends its
+    /// `tempfile` tempdir to the developer's real registry and leaves the entry
+    /// there after the directory is deleted. Called from `git_init` — the
+    /// arrangement step every test that reaches `init_repo` already performs —
+    /// so one call covers the whole module. `set_var` is process-global and
+    /// every caller writes the same value, so this is safe under the parallel
+    /// test runner. Same pattern as `tests/semantic_marker.rs::disable_registry`.
+    fn disable_registry() {
+        std::env::set_var("TRAVSR_DISABLE_REGISTRY", "1");
+    }
+
     fn git_init(dir: &std::path::Path) {
+        disable_registry();
         StdCommand::new("git")
             .args(["-c", "init.defaultBranch=main", "init", "-q"])
             .current_dir(dir)
@@ -8123,6 +8455,7 @@ mod tests {
             vec![],
             travsr_plugin_host::PhaseBOutcome::default(),
             (0, 0),
+            None,
         );
         assert!(
             !linked(&store),
@@ -8138,6 +8471,7 @@ mod tests {
             vec![],
             travsr_plugin_host::PhaseBOutcome::default(),
             (0, 0),
+            None,
         );
         assert!(
             linked(&store),
@@ -8179,6 +8513,7 @@ mod tests {
                 vec![],
                 travsr_plugin_host::PhaseBOutcome::default(),
                 stats,
+                None,
             );
         };
 
@@ -8493,19 +8828,29 @@ mod tests {
         std::fs::write(tmp.path().join("app.ts"), "export class App {}").unwrap();
 
         let home_tmp = tempfile::tempdir().unwrap();
+        let old_home = std::env::var_os("HOME");
         std::env::set_var("HOME", home_tmp.path());
         std::env::set_var("TRAVSR_DISABLE_REGISTRY", "1");
 
         let _ = init_repo(tmp.path()).unwrap();
 
         let registry_path = home_tmp.path().join(".travsr").join("registry.json");
+
+        // #893: restore HOME instead of removing it. With HOME unset,
+        // `travsr_store::registry::home_dir` falls back to `.`, so every later
+        // test in this binary that registers writes a `.travsr/registry.json`
+        // into the process's working directory. Leave TRAVSR_DISABLE_REGISTRY
+        // set: `git_init` sets it for the whole module and clearing it here
+        // reopens the leak for tests running in parallel with this one.
+        match old_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+
         assert!(
             !registry_path.exists(),
             "registry.json must not be created when TRAVSR_DISABLE_REGISTRY=1"
         );
-
-        std::env::remove_var("TRAVSR_DISABLE_REGISTRY");
-        std::env::remove_var("HOME");
     }
 
     #[test]
@@ -8524,9 +8869,7 @@ mod tests {
 
         std::fs::write(tmp.path().join("real.ts"), "export class Real {}").unwrap();
 
-        std::env::set_var("TRAVSR_DISABLE_REGISTRY", "1");
         let stats = init_repo(tmp.path()).unwrap();
-        std::env::remove_var("TRAVSR_DISABLE_REGISTRY");
 
         assert_eq!(
             stats.files_indexed, 1,
@@ -9828,9 +10171,8 @@ mod tests {
     /// drives it. `init_repo` would defer Phase B to the daemon and never reach the
     /// inline path under test.
     fn init_semantic(root: &std::path::Path, force: bool) {
-        std::env::set_var("TRAVSR_DISABLE_REGISTRY", "1");
+        disable_registry();
         let r = init_repo_with_progress(root, None, true, force, &mut |_| {});
-        std::env::remove_var("TRAVSR_DISABLE_REGISTRY");
         r.expect("init_repo_with_progress(semantic = true)");
     }
 
@@ -12838,20 +13180,81 @@ impl Daemon {
         // Bounded and lossy instead: under pressure the right thing to drop is
         // log lines, never indexing throughput. `non_blocking` reports what it
         // discarded, so the loss is visible rather than silent.
-        let (non_blocking, _appender_guard) =
+        let (non_blocking, appender_guard) =
             tracing_appender::non_blocking::NonBlockingBuilder::default()
                 .buffered_lines_limit(logfile::BUFFERED_LINES)
                 .lossy(true)
                 .finish(file_appender);
+        // Held in an Option so the fatal-exit paths below can flush it.
+        //
+        // Dropping the guard is what flushes the channel and joins the writer
+        // thread, and `std::process::exit` runs no destructors: a guard left to
+        // "drop at end of scope" never drops on those paths, so the last events
+        // written are still in the channel when the process dies. That silently
+        // cost the `daemon.session.exit` line this change added, and usually the
+        // session-start line with it. `.take()` rather than a move because two
+        // different select arms can reach the exit.
+        let mut appender_guard = Some(appender_guard);
         use tracing_subscriber::layer::SubscriberExt as _;
         use tracing_subscriber::util::SubscriberInitExt as _;
         // INFO, not WARN. At WARN the file held nothing a user would want: on
         // this repo, four days of logs were 136 lines, every one of them the
         // same repeated warning and not one lifecycle event. `travsr daemon
         // logs` on top of that would have been a working feature showing
-        // nothing. `RUST_LOG` still overrides in both directions.
-        let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
-            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+        // nothing.
+        //
+        // The level is now a stored setting (`log.level`), not only an
+        // inherited environment variable. `RUST_LOG` still overrides it; see
+        // `travsr_config::resolve_log_filter` for the precedence and why. The
+        // resolved directive is read once here and reported in the session's
+        // first line below, so a file that is unexpectedly quiet or unexpectedly
+        // enormous says which layer chose that.
+        let (log_directive, log_source) = travsr_config::resolve_log_filter(Some(&repo_root));
+        // The session line is exempt from the level it reports.
+        //
+        // It is emitted at INFO, so at `error` or `warn` the filter suppressed
+        // the one line that says which session wrote this file and at what
+        // level — a log that cannot describe itself, and worse, a reader that
+        // then finds the PREVIOUS session's line and believes it. That is
+        // exactly what happened: setting `error` and restarting left the Health
+        // panel reading a dead session's `log_level=info` and insisting
+        // forever that a restart was still owed.
+        //
+        // So it gets its own target, admitted unconditionally by an appended
+        // directive. One line per daemon start is a price worth paying at any
+        // level for a file that identifies itself. `shortTarget` in the
+        // extension splits on `::`, so this still renders as `daemon`.
+        //
+        // Appended whatever chose the directive, `RUST_LOG` included. Exempting
+        // the escape hatch reintroduced the stale-session bug through the one
+        // path that opted out: under `RUST_LOG=warn` no session line was
+        // written, so a reader found a previous session's line and believed it.
+        // Readers tell a `RUST_LOG` run apart by `log_level_from`, which needs
+        // a line to be written at all.
+        //
+        // What is reported is what was INSTALLED, not what was resolved. A
+        // malformed RUST_LOG falls back, and reporting the resolved pair there
+        // would have the line name a level the process is not filtering at. The
+        // fallback also has to go back through `filter_directive_for`, or it
+        // silently drops the session exemption the rest of this depends on.
+        let (env_filter, log_directive, log_source) =
+            match tracing_subscriber::EnvFilter::try_new(filter_directive_for(&log_directive)) {
+                Ok(filter) => (filter, log_directive, log_source),
+                Err(_) => {
+                    let fallback = filter_directive_for(travsr_config::DEFAULT_LOG_LEVEL);
+                    // Built from constants this crate owns, so it parses; the
+                    // `unwrap_or_else` keeps that from being an assertion.
+                    let filter =
+                        tracing_subscriber::EnvFilter::try_new(&fallback).unwrap_or_else(|_| {
+                            tracing_subscriber::EnvFilter::new(travsr_config::DEFAULT_LOG_LEVEL)
+                        });
+                    (
+                        filter,
+                        travsr_config::DEFAULT_LOG_LEVEL.to_string(),
+                        travsr_config::LogFilterSource::Default,
+                    )
+                }
+            };
         // JSON lines on disk. One line is one object, so every field is named
         // and typed rather than recovered by guessing at column positions, and
         // `jq`, Loki and Datadog all read it as-is. Nobody is asked to read JSON:
@@ -12887,10 +13290,19 @@ impl Daemon {
         // First event in every session, so a rotated file is interpretable on
         // its own: which build wrote it, which repo, which process.
         tracing::info!(
+            // See SESSION_LOG_TARGET: this one event outranks the level filter
+            // so the file always says who wrote it and at what level.
+            target: SESSION_LOG_TARGET,
             event = "daemon.session.start",
             version = build_version(),
             pid = std::process::id(),
             repo = %repo_root.display(),
+            // What this file will and will not contain, and who decided. Without
+            // it, "there are no debug lines in here" and "debug is off" are
+            // indistinguishable from the file itself, which is the only
+            // artifact left once the process is gone.
+            log_level = %log_directive,
+            log_level_from = log_source.label(),
             // No `foreground` field on purpose. A backgrounded daemon is a
             // re-exec of `daemon start --foreground`, so the flag is true in the
             // child either way: accurate for the process, and misleading to the
@@ -13426,9 +13838,38 @@ impl Daemon {
                         // C3: .travsr is in SKIP_DIRS so the file watcher never fires
                         // for graph.db deletions. Poll every 5 s as the only trigger.
                         if !db_path.exists() {
+                            // Logged, not only printed. A backgrounded daemon is
+                            // spawned with null stdio, so this `eprintln!` reached
+                            // nobody and the log simply stopped mid-session with no
+                            // reason in it: the one artifact left after the process
+                            // is gone said nothing about why it went. It stays on
+                            // stderr too, for `daemon start --foreground`.
+                            tracing::error!(
+                                // Same exempt target as the session-start line,
+                                // and for the same reason. ERROR passes any
+                                // bare level, but a targeted `RUST_LOG` with no
+                                // bare level leaves EnvFilter's unmatched
+                                // default OFF, so on the default target this
+                                // line was dropped under exactly the form the
+                                // CLI's troubleshooting text prints
+                                // (`RUST_LOG=travsr_plugin_host=debug`), which
+                                // auto-starts a daemon. The log then stopped
+                                // mid-session with no reason in it, which is
+                                // the failure this event exists to remove.
+                                target: SESSION_LOG_TARGET,
+                                event = "daemon.session.exit",
+                                reason = "graph_db_removed",
+                                db = %db_path.display(),
+                                "graph.db removed, daemon exiting; re-run `travsr init` to rebuild"
+                            );
                             eprintln!(
                                 "travsr daemon: graph.db removed, exiting. Re-run `travsr init` to rebuild."
                             );
+                            // Flush before leaving, or the line above never
+                            // reaches the file: `exit` runs no destructors, so
+                            // the guard would not drop and the non-blocking
+                            // writer would never be joined.
+                            drop(appender_guard.take());
                             std::process::exit(0);
                         }
                         // M9: .travsr is in SKIP_DIRS so the watcher never sees a
@@ -13571,9 +14012,38 @@ impl Daemon {
                     _ = phase_b_tick.tick() => {
                         // C3: poll every 5 s since .travsr is in SKIP_DIRS.
                         if !db_path.exists() {
+                            // Logged, not only printed. A backgrounded daemon is
+                            // spawned with null stdio, so this `eprintln!` reached
+                            // nobody and the log simply stopped mid-session with no
+                            // reason in it: the one artifact left after the process
+                            // is gone said nothing about why it went. It stays on
+                            // stderr too, for `daemon start --foreground`.
+                            tracing::error!(
+                                // Same exempt target as the session-start line,
+                                // and for the same reason. ERROR passes any
+                                // bare level, but a targeted `RUST_LOG` with no
+                                // bare level leaves EnvFilter's unmatched
+                                // default OFF, so on the default target this
+                                // line was dropped under exactly the form the
+                                // CLI's troubleshooting text prints
+                                // (`RUST_LOG=travsr_plugin_host=debug`), which
+                                // auto-starts a daemon. The log then stopped
+                                // mid-session with no reason in it, which is
+                                // the failure this event exists to remove.
+                                target: SESSION_LOG_TARGET,
+                                event = "daemon.session.exit",
+                                reason = "graph_db_removed",
+                                db = %db_path.display(),
+                                "graph.db removed, daemon exiting; re-run `travsr init` to rebuild"
+                            );
                             eprintln!(
                                 "travsr daemon: graph.db removed, exiting. Re-run `travsr init` to rebuild."
                             );
+                            // Flush before leaving, or the line above never
+                            // reaches the file: `exit` runs no destructors, so
+                            // the guard would not drop and the non-blocking
+                            // writer would never be joined.
+                            drop(appender_guard.take());
                             std::process::exit(0);
                         }
                         // Auto-arm when Phase B is pending (deferred init, or daemon
@@ -14065,6 +14535,83 @@ fn live_editor_sessions(
         .collect();
     live.sort_by_key(|(_, s)| std::cmp::Reverse(s.updated_at));
     live
+}
+
+/// The directive actually installed, given a resolved one.
+///
+/// Appends the session target so `daemon.session.start` survives whatever level
+/// it reports (see [`SESSION_LOG_TARGET`]).
+///
+/// Appended for `RUST_LOG` too, which it was not at first. The argument for
+/// exempting the escape hatch was that readers tell a `RUST_LOG` run apart by
+/// `log_level_from`, but that only holds if a line is written at all: under
+/// `RUST_LOG=warn` the daemon wrote no session line, so a reader landing on the
+/// same day's file found a *previous* session's line, believed it, and asked
+/// for a restart that could never clear, because every restart under that
+/// `RUST_LOG` writes no line either. That is precisely the stale-session bug
+/// the exemption exists to prevent, reintroduced through the one path that
+/// opted out of it.
+///
+/// One line per process start is a small enough imposition on an explicit
+/// `RUST_LOG` to be worth a file that always says what it is. Everything else
+/// in the directive is still honoured exactly as written.
+pub fn filter_directive_for(directive: &str) -> String {
+    format!("{directive},{SESSION_LOG_TARGET}=trace")
+}
+
+/// How long a query has to take before serving it is an event rather than
+/// commentary.
+///
+/// Four times the 50 ms p95 the bench gate enforces, so a query at the edge of
+/// the budget does not log and one well past it does. The point is a threshold
+/// that is quiet when things are normal; tightening it to the gate itself would
+/// put the log back where it was.
+pub(crate) const SLOW_QUERY_MS: u128 = 200;
+
+/// Whether serving a query at this speed is an event or commentary.
+///
+/// Inclusive at the threshold, so `SLOW_QUERY_MS` reads as "this slow counts"
+/// rather than leaving a one-millisecond band that is neither.
+pub(crate) fn query_is_slow(elapsed_ms: u128) -> bool {
+    elapsed_ms >= SLOW_QUERY_MS
+}
+
+/// The one `query.served` line, at the level its content earns.
+///
+/// This was unconditionally INFO, which made it the most frequent line in the
+/// file by a wide margin: 28 of about 130 lines in this repo's own log, most of
+/// them `elapsed_ms=0` cache hits. `logfile.rs` states the rule it broke, that a
+/// line is worth INFO where something happened a reader would count or chart,
+/// and not for the running commentary in between, and a line per query is the
+/// definition of commentary.
+///
+/// Dropping it to DEBUG outright would have cost the thing it was added for:
+/// "which query was slow" has to stay answerable without restarting the daemon
+/// at debug. So the level follows the content. A slow query is an event; a fast
+/// one is not. Same `event` key and the same fields either way, so anything
+/// selecting on `query.served` sees one shape, and `--level debug` still shows
+/// every query.
+///
+/// The same split is already the house pattern: `sidecar.version.checked` is
+/// DEBUG because healthy spawns must not flood, while `below_floor` is WARN.
+fn log_query_served(tool: &str, cached: bool, elapsed_ms: u128) {
+    if query_is_slow(elapsed_ms) {
+        tracing::info!(
+            event = "query.served",
+            tool = %tool,
+            cached,
+            elapsed_ms,
+            "query served"
+        );
+    } else {
+        tracing::debug!(
+            event = "query.served",
+            tool = %tool,
+            cached,
+            elapsed_ms,
+            "query served"
+        );
+    }
 }
 
 /// Returns `(response, should_shutdown)`.
@@ -14625,13 +15172,7 @@ fn handle_control_message(
             if let Some(versions) = versions {
                 let mut c = cache.lock().unwrap_or_else(|e| e.into_inner());
                 if let Some(cached) = c.get(&tool, &args, &last_commit, &phase_b_commit, versions) {
-                    tracing::info!(
-                        event = "query.served",
-                        tool = %tool,
-                        cached = true,
-                        elapsed_ms = started.elapsed().as_millis(),
-                        "query served"
-                    );
+                    log_query_served(&tool, true, started.elapsed().as_millis());
                     return (ControlResponse::query_result(cached), false);
                 }
             }
@@ -14648,19 +15189,12 @@ fn handle_control_message(
                             value.clone(),
                         );
                     }
-                    // The line that makes "which query was slow" answerable.
-                    // Without it a successful query logged nothing at all, so
-                    // the `req` correlation id had nothing on the happy path to
-                    // bind to and per-request timing did not exist. `cached`
-                    // distinguishes the two costs, which is usually the first
-                    // thing worth knowing about a slow one.
-                    tracing::info!(
-                        event = "query.served",
-                        tool = %tool,
-                        cached = false,
-                        elapsed_ms = started.elapsed().as_millis(),
-                        "query served"
-                    );
+                    // The line that makes "which query was slow" answerable, and
+                    // the anchor the `req` correlation id binds to on the happy
+                    // path. `cached` distinguishes the two costs, which is
+                    // usually the first thing worth knowing about a slow one.
+                    // See `log_query_served` for why the level is not fixed.
+                    log_query_served(&tool, false, started.elapsed().as_millis());
                     (ControlResponse::query_result(value), false)
                 }
                 Err(e) => {

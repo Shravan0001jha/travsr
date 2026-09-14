@@ -6,7 +6,7 @@
 # CLI release", and getting the direction of the comparison wrong in any of them
 # either lets a stale pin ship or deadlocks the release process. The logic lives
 # here, once, so all three agree and so the failure modes can be tested
-# (.github/scripts/tests/vscode-version-gate.test.sh) instead of only being
+# (.github/scripts/test-vscode-version-gate.sh) instead of only being
 # exercised by cutting a release.
 #
 # The four gates on the pin, and who owns which direction:

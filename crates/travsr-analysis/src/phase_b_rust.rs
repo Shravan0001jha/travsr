@@ -205,7 +205,7 @@ fn extract_cargo_deps(corpus: &str, root: &Path) -> anyhow::Result<(Vec<Node>, V
     let root_doc: toml::Value = root_text.parse().context("parsing root Cargo.toml")?;
 
     // Collect all member Cargo.toml paths
-    let cargo_paths: Vec<PathBuf> = if let Some(members) = root_doc
+    let mut cargo_paths: Vec<PathBuf> = if let Some(members) = root_doc
         .get("workspace")
         .and_then(|w| w.get("members"))
         .and_then(|m| m.as_array())
@@ -237,8 +237,15 @@ fn extract_cargo_deps(corpus: &str, root: &Path) -> anyhow::Result<(Vec<Node>, V
             })
             .collect()
     } else {
-        vec![root_cargo]
+        vec![root_cargo.clone()]
     };
+
+    // A workspace root may also declare its own [package] (#893 C2). Without
+    // this the root package is never parsed, so it is emitted with an empty
+    // path and is indistinguishable from an external dependency.
+    if root_doc.get("package").is_some() && !cargo_paths.contains(&root_cargo) {
+        cargo_paths.push(root_cargo);
+    }
 
     // Parse each Cargo.toml: (pkg_name, rel_cargo_path, dep_names)
     let pkg_data: Vec<(String, String, Vec<String>)> = cargo_paths
@@ -637,12 +644,155 @@ fn extract_macro_calls(
                 recv_type: None,
             });
         }
+
+        // #864: Rust inline format captures (`info!("{CONST} rules")`). The
+        // rust-analyzer LSIF path emits no occurrence for a name that appears
+        // only inside a format string, so such a symbol reads as a definitive
+        // zero from `find_references` even on a fully analysed index. The
+        // literal is right here in the token stream, so Phase A recovers what
+        // LSIF drops, under the same fail-closed contract as the call recovery
+        // above: the name is resolved against the real node table and anything
+        // that matches nothing is dropped, never guessed at.
+        //
+        // Known precision limit: this scans every string literal in the
+        // token_tree, not only format-string arguments, because the macro name
+        // is not in scope here (the top-level `macro_invocation` is several
+        // parents up) and a name-keyed allowlist would have to enumerate every
+        // format macro — `tracing::info!` included, which is this PR's own repro
+        // — and silently regress the fix whenever it missed one. So a data
+        // literal that happens to hold `{NAME}` (`vec!["{MAX_LEN}"]`) can
+        // fabricate a reference when `NAME` is a real const. This trades a narrow
+        // false-positive for not regressing the headline recall fix; the
+        // fail-closed drop only removes captures that resolve to nothing.
+        for child in &children {
+            // Raw strings are a distinct node kind but are ordinary format
+            // strings: `println!(r"{CONST}")`, common for path/regex messages
+            // that carry backslashes. `utf8_text` returns the whole node
+            // including the `r`/`r#"` prefix and `capture_position` measures from
+            // the node start, so the recovered offsets stay aligned with source.
+            if !matches!(child.kind(), "string_literal" | "raw_string_literal") {
+                continue;
+            }
+            let Ok(lit) = child.utf8_text(source) else {
+                continue;
+            };
+            let captures = format_captures(lit);
+            if captures.is_empty() {
+                continue;
+            }
+            let Some((caller_fn, caller_impl)) = find_enclosing_fn(*child, source) else {
+                continue;
+            };
+            let caller_id = match &caller_impl {
+                Some(t) => VName::new(
+                    corpus,
+                    "",
+                    vname_path,
+                    "rust",
+                    format!("method:{t}.{caller_fn}"),
+                )
+                .id(),
+                None => VName::new(corpus, "", vname_path, "rust", format!("fn:{caller_fn}")).id(),
+            };
+            for (offset, name) in captures {
+                let (line, col) = capture_position(lit, offset, child.start_position());
+                out.push(UnresolvedCall {
+                    src: caller_id,
+                    // Only a const or static can be named here and also be a
+                    // graph node: an inline capture takes a value, so a `fn`
+                    // item is not a candidate, and a local has no node at all.
+                    callee_sig: format!("const:{name}"),
+                    alt_callee_sig: Some(format!("static:{name}")),
+                    hint_crate: None,
+                    caller_line: line,
+                    caller_col: Some(col),
+                    is_method_call: false,
+                    recv_type: None,
+                });
+            }
+        }
     }
 
     let mut c = node.walk();
     for child in node.children(&mut c) {
         extract_macro_calls(child, source, corpus, vname_path, out);
     }
+}
+
+/// Identifiers captured inline by a Rust format string, as `(byte offset of the
+/// name within `lit`, name)`.
+///
+/// Rust's inline captures take a bare identifier and nothing else (`{name}`,
+/// `{name:?}`) — never an expression — so this is a literal scan rather than a
+/// parse: `{{` is an escaped brace, `{}` and `{0}` are positional and name
+/// nothing, and a name runs to the closing `}` or to the `:` that opens a
+/// format spec. Anything that does not fit that shape is skipped, not guessed.
+///
+/// Only names carrying an uppercase letter are returned. A capture can only
+/// resolve to a `const:` or `static:` node, and rustc's `non_upper_case_globals`
+/// lint makes those SCREAMING_SNAKE_CASE; an all-lowercase capture is a local,
+/// which has no node and would fail closed anyway. On this repo that is 3395 of
+/// 3487 captures (97%), so the filter is what keeps the extractor from emitting
+/// thousands of resolutions per index that cannot succeed. The cost is a
+/// lowercase `const`, which rustc warns about; such a use stays unrecorded,
+/// exactly as it is today.
+///
+/// O(n) over the literal.
+fn format_captures(lit: &str) -> Vec<(usize, &str)> {
+    let b = lit.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] != b'{' {
+            i += 1;
+            continue;
+        }
+        // `{{` is an escaped brace, and consuming both stops the second one
+        // from being read as the start of a capture.
+        if b.get(i + 1) == Some(&b'{') {
+            i += 2;
+            continue;
+        }
+        let start = i + 1;
+        let mut j = start;
+        while j < b.len() && (b[j].is_ascii_alphanumeric() || b[j] == b'_') {
+            j += 1;
+        }
+        let name = &lit[start..j];
+        // A capture name is a Rust identifier, so it cannot start with a digit:
+        // that is what separates `{name}` from the positional `{0}`.
+        if j > start
+            && !b[start].is_ascii_digit()
+            && matches!(b.get(j), Some(b'}') | Some(b':'))
+            && name.bytes().any(|c| c.is_ascii_uppercase())
+        {
+            out.push((start, name));
+        }
+        i = j.max(start);
+    }
+    out
+}
+
+/// 1-based line and 0-based byte column of the capture at `offset` inside a
+/// literal beginning at `start`.
+///
+/// Not simply the literal's own position: a format string wrapped with `\` line
+/// continuations is still a single `string_literal`, so a capture on its third
+/// line must report that line, or `find_references` hands back a `path:line`
+/// pointing at the wrong source. The column is offset from the literal's own
+/// start only on the first line; after a newline it is measured from that
+/// newline, matching tree-sitter's byte-based `Point::column`.
+fn capture_position(lit: &str, offset: usize, start: tree_sitter::Point) -> (u32, u32) {
+    let prefix = &lit.as_bytes()[..offset];
+    let newlines = prefix.iter().filter(|&&c| c == b'\n').count();
+    let col = match prefix.iter().rposition(|&c| c == b'\n') {
+        Some(nl) => offset - nl - 1,
+        None => start.column + offset,
+    };
+    (
+        start.row.saturating_add(newlines).saturating_add(1) as u32,
+        col as u32,
+    )
 }
 
 /// Walk up from `node` to the nearest enclosing `function_item` node itself
@@ -1070,6 +1220,147 @@ fn walk(root: &Path, dir: &Path, exts: &[&str], out: &mut Vec<(PathBuf, String)>
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    // ── #864: inline format captures ─────────────────────────────────────────
+
+    #[test]
+    fn format_captures_reads_plain_and_specced_names() {
+        assert_eq!(format_captures("\"{MAX_LEN}\""), vec![(2, "MAX_LEN")]);
+        assert_eq!(format_captures("\"{MAX_LEN:?}\""), vec![(2, "MAX_LEN")]);
+        assert_eq!(
+            format_captures("\"a {FIRST} b {SECOND} c\""),
+            vec![(4, "FIRST"), (14, "SECOND")]
+        );
+    }
+
+    #[test]
+    fn format_captures_skips_what_names_nothing() {
+        // Positional and empty carry no name; `{{` is an escaped brace, and the
+        // second `{` must not then be read as opening a capture.
+        assert!(format_captures("\"{}\"").is_empty());
+        assert!(format_captures("\"{0}\"").is_empty());
+        assert!(format_captures("\"{{MAX_LEN}}\"").is_empty());
+        assert!(
+            format_captures("\"{1MAX}\"").is_empty(),
+            "must not start with a digit"
+        );
+        assert!(format_captures("\"{unclosed\"").is_empty());
+        // All-lowercase is a local, which has no node: see the doc comment.
+        assert!(format_captures("\"{count} of {total}\"").is_empty());
+    }
+
+    #[test]
+    fn format_captures_offsets_point_at_the_name() {
+        let lit = "\"wrote ({RULE_COUNT} default rules)\"";
+        let got = format_captures(lit);
+        assert_eq!(got.len(), 1);
+        let (offset, name) = got[0];
+        assert_eq!(&lit[offset..offset + name.len()], "RULE_COUNT");
+    }
+
+    #[test]
+    fn capture_position_follows_a_wrapped_literal() {
+        // A `\`-continued format string is ONE string_literal, so a capture on
+        // its later lines must not report the literal's opening line.
+        let lit = "\"first \\\n     second {MAX_LEN} \\\n     third\"";
+        let offset = lit.find("MAX_LEN").unwrap();
+        let at = |o: usize| capture_position(lit, o, tree_sitter::Point { row: 9, column: 4 });
+        assert_eq!(at(offset).0, 11, "0-based row 9 + 2 newlines + 1");
+        assert_eq!(at(1).0, 10, "a capture on the opening line");
+        // The column is offset from the literal's own start only before a
+        // newline; after one it is measured from that newline.
+        assert_eq!(at(1).1, 5, "literal start column 4, plus 1");
+        assert_eq!(
+            at(offset).1,
+            (offset - lit[..offset].rfind('\n').unwrap() - 1) as u32
+        );
+    }
+
+    #[test]
+    fn macro_format_capture_becomes_an_unresolved_const_ref() {
+        // The #864 repro shape: a constant whose ONLY use is inside an inline
+        // format capture. Before this, rust-analyzer emitted no occurrence and
+        // the symbol reported a definitive zero.
+        let source = br#"
+const DEFAULT_RULE_COUNT: usize = 5;
+fn scaffold() {
+    tracing::info!("wrote .travsrignore ({DEFAULT_RULE_COUNT} default rules)");
+}
+"#;
+        let tree = parse_rust(source);
+        let mut out = Vec::new();
+        extract_macro_calls(tree.root_node(), source, "c", "src/lib.rs", &mut out);
+
+        let hit = out
+            .iter()
+            .find(|u| u.callee_sig == "const:DEFAULT_RULE_COUNT")
+            .expect("the format capture must be recovered as a reference");
+        assert_eq!(hit.caller_line, 4, "must point at the macro's line");
+        assert_eq!(
+            hit.alt_callee_sig.as_deref(),
+            Some("static:DEFAULT_RULE_COUNT"),
+            "a static is the other node kind a capture can name"
+        );
+        assert!(!hit.is_method_call);
+        assert_eq!(
+            hit.src,
+            VName::new("c", "", "src/lib.rs", "rust", "fn:scaffold").id(),
+            "attributed to the enclosing function"
+        );
+    }
+
+    #[test]
+    fn macro_format_capture_ignores_locals_and_escapes() {
+        // Locals dominate real code (97% of captures here) and can never
+        // resolve; emitting them would be pure waste. `{{ESCAPED}}` is a
+        // literal brace, not a use.
+        let source = br#"
+fn f(count: usize) {
+    tracing::info!("{count} items, literal {{BRACED}} here");
+}
+"#;
+        let tree = parse_rust(source);
+        let mut out = Vec::new();
+        extract_macro_calls(tree.root_node(), source, "c", "src/lib.rs", &mut out);
+        assert!(
+            !out.iter().any(|u| u.callee_sig.starts_with("const:")),
+            "no const refs expected, got {out:?}"
+        );
+    }
+
+    #[test]
+    fn macro_format_capture_is_recovered_from_a_raw_string() {
+        // Raw strings are a distinct tree-sitter node kind but are ordinary
+        // format strings, and are exactly how a format message carrying
+        // backslashes or quotes is written (`r"C:\{DIR}\x"`). The #864 defect is
+        // fully present for them until the scan accepts `raw_string_literal`.
+        let source = br##"
+fn scaffold() {
+    println!(r"C:\{RULE_DIR}\rules");
+    println!(r#"cache at {CACHE_DIR} now"#);
+}
+"##;
+        let tree = parse_rust(source);
+        let mut out = Vec::new();
+        extract_macro_calls(tree.root_node(), source, "c", "src/lib.rs", &mut out);
+
+        assert!(
+            out.iter().any(|u| u.callee_sig == "const:RULE_DIR")
+                && out.iter().any(|u| u.callee_sig == "const:CACHE_DIR"),
+            "both raw format strings must yield a capture, got {out:?}"
+        );
+
+        // The reported column indexes the name in the source line, so an
+        // off-by-prefix (the `r` / `r#"` prefix, included in the node text)
+        // cannot pass.
+        let line3 = "    println!(r\"C:\\{RULE_DIR}\\rules\");";
+        let rule = out
+            .iter()
+            .find(|u| u.callee_sig == "const:RULE_DIR")
+            .expect("RULE_DIR capture present");
+        let col = rule.caller_col.expect("capture carries a column") as usize;
+        assert_eq!(&line3[col..col + "RULE_DIR".len()], "RULE_DIR");
+    }
 
     fn parse_rust(source: &[u8]) -> tree_sitter::Tree {
         let language = tree_sitter::Language::new(tree_sitter_rust::LANGUAGE);
@@ -1535,6 +1826,81 @@ fn run() {
             out.is_empty(),
             "expected no calls, got {:?}",
             out.iter().map(|u| &u.callee_sig).collect::<Vec<_>>()
+        );
+    }
+
+    // ── Cargo dep anchoring (#893 C2) ─────────────────────────────────────────
+
+    /// Writes `Cargo.toml` files under a fresh temp dir and runs the extractor.
+    /// Returns (crate signature -> path) for every emitted `crate` node.
+    fn cargo_crate_paths(files: &[(&str, &str)]) -> HashMap<String, String> {
+        let dir = tempfile::tempdir().unwrap();
+        for (rel, body) in files {
+            let path = dir.path().join(rel);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            std::fs::write(&path, body).unwrap();
+        }
+        let (nodes, _edges) = extract_cargo_deps("c", dir.path()).unwrap();
+        nodes
+            .iter()
+            .filter(|n| n.kind == "crate")
+            .map(|n| (n.vname.signature.clone(), n.vname.path.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn cargo_deps_anchor_root_package_in_a_workspace_root() {
+        // A root Cargo.toml that declares BOTH [package] and [workspace] members
+        // must still anchor its own package to the root manifest (#893 C2).
+        let paths = cargo_crate_paths(&[
+            (
+                "Cargo.toml",
+                "[package]\nname = \"rootpkg\"\n\n[workspace]\nmembers = [\"sub\"]\n\n[dependencies]\nclap = \"4\"\n",
+            ),
+            (
+                "sub/Cargo.toml",
+                "[package]\nname = \"subpkg\"\n\n[dependencies]\nrootpkg = { path = \"..\" }\n",
+            ),
+        ]);
+        assert_eq!(
+            paths.get("crate:rootpkg").map(String::as_str),
+            Some("Cargo.toml"),
+            "root package lost its manifest anchor; got {paths:?}"
+        );
+        assert_eq!(
+            paths.get("crate:subpkg").map(String::as_str),
+            Some("sub/Cargo.toml"),
+            "member package anchor regressed; got {paths:?}"
+        );
+        assert_eq!(
+            paths.get("crate:clap").map(String::as_str),
+            Some(""),
+            "external dependency must stay unanchored; got {paths:?}"
+        );
+    }
+
+    #[test]
+    fn cargo_deps_virtual_workspace_emits_members_only() {
+        // A virtual workspace has no root [package], so no crate node may be
+        // anchored to the root manifest.
+        let paths = cargo_crate_paths(&[
+            ("Cargo.toml", "[workspace]\nmembers = [\"a\", \"b\"]\n"),
+            ("a/Cargo.toml", "[package]\nname = \"a\"\n"),
+            ("b/Cargo.toml", "[package]\nname = \"b\"\n"),
+        ]);
+        assert_eq!(
+            paths.get("crate:a").map(String::as_str),
+            Some("a/Cargo.toml")
+        );
+        assert_eq!(
+            paths.get("crate:b").map(String::as_str),
+            Some("b/Cargo.toml")
+        );
+        assert!(
+            !paths.values().any(|p| p == "Cargo.toml"),
+            "virtual workspace must not anchor anything to the root manifest; got {paths:?}"
         );
     }
 }
