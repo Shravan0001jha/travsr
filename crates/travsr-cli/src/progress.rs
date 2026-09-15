@@ -532,20 +532,22 @@ pub fn print_summary(stats: &InitStats, elapsed: Duration, quiet: bool, daemon_r
             // when the TypeScript LSIF pass was skipped: the language then lacks
             // most of its cross-file call edges. Say so right here, at default
             // verbosity, rather than only in a RUST_LOG warning.
-            if let Some(skip) = &report.lsif_skipped {
+            for skip in &report.lsif_skipped {
                 use travsr_daemon::LsifSkipReason;
+                let lang = &skip.language;
+                let analyzer = travsr_daemon::lsif_analyzer_name(lang);
                 let (what, fix) = match skip.reason {
                     LsifSkipReason::EmitterMissing => (
                         "could not be started",
-                        "set TRAVSR_LSIF_TS to the emitter's dist/index.js (or reinstall travsr so it sits beside the binary), then re-run `travsr init --semantic --force`",
+                        install_fix(lang),
                     ),
                     LsifSkipReason::EmitterFailed => (
                         "failed",
-                        "fix the emitter (its error is above), then re-run `travsr init --semantic --force`",
+                        "fix the analyzer (its error is above), then re-run `travsr init --semantic --force`",
                     ),
                 };
                 println!(
-                    "  {} typescript semantic analysis is incomplete: the TypeScript analyzer (travsr-lsif-ts) {what}, so cross-file call and reference edges are missing",
+                    "  {} {lang} semantic analysis is incomplete: {analyzer} {what}, so cross-file call and reference edges are missing",
                     pal.orange("⚠"),
                 );
                 println!("    {}", skip.detail);
@@ -822,6 +824,17 @@ pub fn fmt_dur(d: Duration) -> String {
 /// produces no call edges, surfacing only as the generic zero-node warning.
 /// Returns an actionable hint when running on macOS with a `bash` older than
 /// 4.4, else `None`.
+/// The "how to get this analyzer" line for the init summary, per language.
+/// The bundled emitters come with the binary, so their fix is the install
+/// layout; rust-analyzer is a toolchain component the user adds themselves.
+fn install_fix(language: &str) -> &'static str {
+    match language {
+        "rust" => "install rust-analyzer (`rustup component add rust-analyzer`), then re-run `travsr init --semantic --force`",
+        "python" => "reinstall travsr so the emitter sits beside the binary, then re-run `travsr init --semantic --force`",
+        _ => "set TRAVSR_LSIF_TS to the emitter's dist/index.js (or reinstall travsr so it sits beside the binary), then re-run `travsr init --semantic --force`",
+    }
+}
+
 pub(crate) fn macos_java_bash_hint() -> Option<String> {
     if !cfg!(target_os = "macos") {
         return None;

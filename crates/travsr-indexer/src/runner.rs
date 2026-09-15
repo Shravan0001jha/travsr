@@ -630,6 +630,49 @@ fn resolve_lsif_py_emitter() -> (String, Vec<String>) {
     ("travsr-lsif-py".to_string(), vec![])
 }
 
+/// Whether the bundled Node emitter for `language` actually resolves on this
+/// machine.
+///
+/// `travsr lang install` and `lang list` used to answer "is node installed?" for
+/// the three bundled languages and then assert "full cross-file analysis is on",
+/// on the assumption that the emitter always ships beside the binary. It did
+/// not: no release from v0.9.0 to v1.1.0 contained one, so `lang install
+/// typescript` reported success in the same repo where `travsr status` reported
+/// the analyzer could not be started. This resolves it the way the runners do,
+/// so the claim is checked rather than assumed.
+pub fn bundled_lsif_emitter_available(language: &str) -> bool {
+    let (program, args) = if language == "python" {
+        resolve_lsif_py_emitter()
+    } else {
+        resolve_lsif_emitter()
+    };
+    // Rungs 1-3 hand back a concrete file, either as the program itself or as
+    // node's script argument. Rung 4 is the bare PATH name, which is only real
+    // if PATH has it.
+    match args.last() {
+        Some(script) => Path::new(script).is_file(),
+        None => Path::new(&program).is_file() || on_path(&program),
+    }
+}
+
+/// Whether a bare command name resolves to a file on PATH. Only used by
+/// [`bundled_lsif_emitter_available`] for the bare-name fallback rung.
+fn on_path(program: &str) -> bool {
+    let Some(path) = std::env::var_os("PATH") else {
+        return false;
+    };
+    std::env::split_paths(&path).any(|dir| {
+        // `.cmd`/`.exe` because the npm shim on Windows is not extensionless.
+        [
+            program,
+            &format!("{program}.cmd"),
+            &format!("{program}.exe"),
+        ]
+        .iter()
+        .any(|name| dir.join(name).is_file())
+    })
+}
+
 /// Run `travsr-lsif-py --root <root>` and return the LSIF JSON-Lines dump.
 ///
 /// Returns:
@@ -659,15 +702,35 @@ pub fn run_lsif_py_emitter(root: &Path) -> anyhow::Result<Option<String>> {
                 "travsr-lsif-py not found, Python LSIF enrichment skipped \
                  (native phase_b tree-sitter edges still active)"
             );
+            // Recorded, not just logged at debug: this is the case that shipped
+            // in every release (the emitter was never in an artifact), and it
+            // reached no user-facing surface at all.
+            crate::sandbox::record_lsif_analyzer_skip(
+                "python",
+                crate::sandbox::LsifAnalyzerSkip::Missing,
+            );
             return Ok(None);
         }
     };
 
     let (exit_status, stdout_bytes, stderr) =
-        run_with_drain(child, lsif_node_timeout(), "travsr-lsif-py")?;
+        match run_with_drain(child, lsif_node_timeout(), "travsr-lsif-py") {
+            Ok(v) => v,
+            Err(e) => {
+                crate::sandbox::record_lsif_analyzer_skip(
+                    "python",
+                    crate::sandbox::LsifAnalyzerSkip::Failed,
+                );
+                return Err(e);
+            }
+        };
 
     if !exit_status.success() {
         let stderr_head = stderr.lines().take(5).collect::<Vec<_>>().join("\n");
+        crate::sandbox::record_lsif_analyzer_skip(
+            "python",
+            crate::sandbox::LsifAnalyzerSkip::Failed,
+        );
         anyhow::bail!("travsr-lsif-py exited with {exit_status}: {stderr_head}");
     }
 

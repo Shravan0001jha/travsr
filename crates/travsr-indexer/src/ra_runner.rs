@@ -17,8 +17,8 @@ use anyhow::Context as _;
 
 use crate::runner::run_with_drain;
 use crate::sandbox::{
-    build_sandboxed_command, record_ra_lsif_sandbox_skip, should_skip_unsandboxed, SandboxConfig,
-    SandboxStatus,
+    build_sandboxed_command, record_ra_lsif_sandbox_skip, should_skip_unsandboxed,
+    LsifAnalyzerSkip, SandboxConfig, SandboxStatus,
 };
 
 // ── Public API ────────────────────────────────────────────────────────────────
@@ -170,13 +170,24 @@ pub fn run_ra_lsif(repo_root: &Path, cfg: &SandboxConfig) -> anyhow::Result<Opti
         Some(p) => p,
         None => {
             tracing::info!("rust-analyzer not found, skipping Rust's full cross-file analysis");
+            // Recorded, not just logged: without this the whole language quietly
+            // fell back to tree-sitter heuristics while `travsr status` still
+            // printed `semantic: complete`.
+            crate::sandbox::record_lsif_analyzer_skip("rust", LsifAnalyzerSkip::Missing);
             return Ok(None);
         }
     };
     let ra_str = ra_path.to_string_lossy().into_owned();
     let repo_str = repo_root.to_string_lossy();
     let (cmd, status) = build_sandboxed_command(ra_str.as_str(), &["lsif", repo_str.as_ref()], cfg);
-    spawn_or_skip_ra(cmd, status, repo_root, cfg)
+    let out = spawn_or_skip_ra(cmd, status, repo_root, cfg);
+    // An `Ok(None)` here is the sandbox fail-closed skip, which already has its
+    // own `rust_lsif_degraded=sandbox_unavailable` disclosure, so only the
+    // error path is recorded: rust-analyzer ran and failed.
+    if out.is_err() {
+        crate::sandbox::record_lsif_analyzer_skip("rust", LsifAnalyzerSkip::Failed);
+    }
+    out
 }
 
 /// Guard + spawn logic for `run_ra_lsif`, extracted so tests can inject a

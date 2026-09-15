@@ -157,6 +157,76 @@ pub fn ra_lsif_sandbox_was_skipped() -> bool {
     RA_LSIF_SANDBOX_SKIPPED.load(Ordering::Relaxed)
 }
 
+/// Why a language's deep-analysis (LSIF) pass produced nothing.
+///
+/// The two classes call for different fixes, which is the same split #878 drew
+/// for the TypeScript emitter: `Missing` is a failure to *start* the analyzer
+/// (the remedy is the install layout), `Failed` is one that ran and broke (the
+/// remedy is in its own stderr).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LsifAnalyzerSkip {
+    /// The analyzer binary could not be started at all.
+    Missing,
+    /// The analyzer started and failed: non-zero exit, timeout, or a dump that
+    /// could not be read.
+    Failed,
+}
+
+/// Languages whose LSIF pass was due in the current Phase B run and produced
+/// nothing, recorded where the failure is actually observed.
+///
+/// This exists because those failures were swallowed: `run_ra_lsif` returning
+/// `Err` and `run_lsif_py_emitter` returning `Ok(None)` were logged and
+/// discarded, so a run that lost every semantic edge for the language still
+/// reported `semantic: complete` with no warning on any surface. The daemon
+/// drains this when it stamps `phase_b_warnings`, so the existing
+/// `emitter_missing:` / `emitter_failed:` disclosure covers rust and python too.
+///
+/// Same shape and the same per-run discipline as [`RA_LSIF_SANDBOX_SKIPPED`]
+/// above: [`reset_lsif_analyzer_skips`] MUST run before each Phase B pass, or a
+/// long-lived daemon reports the first repo's failure against every later one.
+static LSIF_ANALYZER_SKIPS: std::sync::Mutex<Vec<(&'static str, LsifAnalyzerSkip)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Record that `language`'s LSIF pass produced nothing in the current run.
+///
+/// Called from the analyzer runners themselves so a new call site cannot forget
+/// it. Re-recording the same language is idempotent, and `Failed` wins over
+/// `Missing`: a runner that reports both is one that found an analyzer and then
+/// could not use it, which is the more specific of the two remedies.
+pub fn record_lsif_analyzer_skip(language: &'static str, skip: LsifAnalyzerSkip) {
+    let Ok(mut skips) = LSIF_ANALYZER_SKIPS.lock() else {
+        return;
+    };
+    match skips.iter_mut().find(|(l, _)| *l == language) {
+        Some(existing) => {
+            if skip == LsifAnalyzerSkip::Failed {
+                existing.1 = skip;
+            }
+        }
+        None => skips.push((language, skip)),
+    }
+}
+
+/// Reset the per-Phase-B-run LSIF skip list. Must be called once before each
+/// Phase B pass, for the reason spelled out on [`LSIF_ANALYZER_SKIPS`].
+pub fn reset_lsif_analyzer_skips() {
+    if let Ok(mut skips) = LSIF_ANALYZER_SKIPS.lock() {
+        skips.clear();
+    }
+}
+
+/// The LSIF skips recorded during the current Phase B run, language-sorted so
+/// the resulting `phase_b_warnings` string is deterministic.
+pub fn lsif_analyzer_skips() -> Vec<(&'static str, LsifAnalyzerSkip)> {
+    let Ok(skips) = LSIF_ANALYZER_SKIPS.lock() else {
+        return Vec::new();
+    };
+    let mut out = skips.clone();
+    out.sort_unstable_by_key(|(l, _)| *l);
+    out
+}
+
 // ── Status ────────────────────────────────────────────────────────────────────
 
 /// Whether a sandbox was successfully applied to the returned [`Command`].

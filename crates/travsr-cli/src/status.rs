@@ -190,6 +190,18 @@ fn warned_langs(payload: &StatusPayload, kind: &str) -> Vec<String> {
         .collect()
 }
 
+/// The install-layout remedy for a language whose LSIF analyzer could not be
+/// started. Per language because the analyzers are installed differently:
+/// travsr-lsif-ts/py ship beside the binary, rust-analyzer is a toolchain
+/// component the user installs themselves.
+fn emitter_remedy(language: &str) -> &'static str {
+    match language {
+        "rust" => "Install rust-analyzer (`rustup component add rust-analyzer`), then re-run `travsr init --semantic --force`",
+        "python" => "This happens when the travsr binary is run from outside its install layout. Reinstall travsr so the emitter sits beside the binary, then re-run `travsr init --semantic --force`",
+        _ => "This happens when the travsr binary is run from outside its install layout. Set TRAVSR_LSIF_TS to the emitter's dist/index.js (or reinstall travsr), then re-run `travsr init --semantic --force`",
+    }
+}
+
 /// #825: render the unreconciled SCIP definitions behind the E6 miss warning.
 ///
 /// The miss set is deterministic, so the actionable information is *which*
@@ -481,12 +493,24 @@ pub fn run() -> anyhow::Result<()> {
                     // the travsr binary, so a binary copied out of its build or
                     // install layout loses it and the language silently kept only
                     // its tree-sitter call edges. Name the two fixes that exist.
-                    ["emitter_missing", lang] => eprintln!(
-                        "warning: full '{lang}' analysis is incomplete: the TypeScript analyzer (travsr-lsif-ts) could not be started, so cross-file call and reference edges are missing. This happens when the travsr binary is run from outside its install layout. Set TRAVSR_LSIF_TS to the emitter's dist/index.js (or reinstall travsr), then re-run `travsr init --semantic --force`"
-                    ),
-                    ["emitter_failed", lang] => eprintln!(
-                        "warning: full '{lang}' analysis is incomplete: the TypeScript analyzer (travsr-lsif-ts) started but failed, so cross-file call and reference edges are missing. Re-run `RUST_LOG=travsr_daemon=warn travsr init --semantic --force` to see its error"
-                    ),
+                    // The analyzer is named per language: the same two classes
+                    // now cover rust-analyzer and travsr-lsif-py, and telling a
+                    // Rust user to reinstall a TypeScript emitter is worse than
+                    // saying nothing. The remedy differs too, so it is chosen
+                    // from the language rather than shared.
+                    ["emitter_missing", lang] => {
+                        let analyzer = travsr_daemon::lsif_analyzer_name(lang);
+                        let remedy = emitter_remedy(lang);
+                        eprintln!(
+                            "warning: full '{lang}' analysis is incomplete: {analyzer} could not be started, so cross-file call and reference edges are missing. {remedy}"
+                        )
+                    }
+                    ["emitter_failed", lang] => {
+                        let analyzer = travsr_daemon::lsif_analyzer_name(lang);
+                        eprintln!(
+                            "warning: full '{lang}' analysis is incomplete: {analyzer} started but failed, so cross-file call and reference edges are missing. Re-run `RUST_LOG=travsr_daemon=warn,travsr_plugin_host=warn travsr init --semantic --force` to see its error"
+                        )
+                    }
                     // E6: SCIP definitions that did not unify onto their Phase A
                     // tree-sitter node — their references attribute to an orphaned
                     // duplicate node instead. `rate` is missed/attempted.
@@ -792,6 +816,45 @@ mod tests {
         let mut p = payload("abc", "abc", false);
         p.phase_b_warnings = Some("skipped_no_analyzer:php,needs_consent:go".into());
         assert_eq!(phase_b_state(&p), "partial (not run: php, go)");
+    }
+
+    /// The same two classes now describe rust-analyzer and travsr-lsif-py, so
+    /// the downgrade must fire for them and the message must name the analyzer
+    /// the user actually has to fix. Telling a Rust user to reinstall a
+    /// TypeScript emitter is the failure this guards.
+    #[test]
+    fn lsif_emitter_disclosure_covers_rust_and_python() {
+        let mut p = payload("abc", "abc", false);
+        p.phase_b_warnings = Some("emitter_failed:rust,emitter_missing:python".into());
+        // `warned_langs` reads the missing class before the failed one.
+        assert_eq!(phase_b_state(&p), "partial (incomplete: python, rust)");
+
+        assert_eq!(
+            travsr_daemon::lsif_analyzer_name("rust"),
+            "rust-analyzer",
+            "the rust warning must name rust-analyzer"
+        );
+        assert_eq!(
+            travsr_daemon::lsif_analyzer_name("python"),
+            "the Python analyzer (travsr-lsif-py)",
+            "the python warning must name travsr-lsif-py"
+        );
+        assert_eq!(
+            travsr_daemon::lsif_analyzer_name("typescript"),
+            "the TypeScript analyzer (travsr-lsif-ts)",
+            "typescript keeps the #878 wording"
+        );
+        // The remedy is per language: rust-analyzer is a toolchain component,
+        // not a file that ships beside the binary.
+        assert!(
+            emitter_remedy("rust").contains("rustup component add rust-analyzer"),
+            "rust must be told how to install rust-analyzer, got {:?}",
+            emitter_remedy("rust")
+        );
+        assert!(
+            emitter_remedy("typescript").contains("TRAVSR_LSIF_TS"),
+            "typescript keeps its override remedy"
+        );
     }
 
     #[test]
