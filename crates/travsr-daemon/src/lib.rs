@@ -11226,6 +11226,89 @@ mod tests {
         );
     }
 
+    /// SEC-002: the targets request now indexes the file it is asked about, so
+    /// its caller-supplied `file` has to be validated before it is joined onto
+    /// the repo root.
+    ///
+    /// `reindex_files_reporting` falls back to the joined path when
+    /// `strip_prefix(repo_root)` fails, so an unguarded `../outside/secret.rs`
+    /// is parsed into the graph: the outside file becomes nodes, and a file row
+    /// appears under the escaping path. Reading such a path was harmless before
+    /// this request started writing.
+    #[test]
+    fn a_target_request_for_a_path_outside_the_repo_indexes_nothing() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        git_init(&repo);
+        std::fs::write(
+            repo.join("inside.rs"),
+            "pub fn inside_the_repo() -> u32 {\n    1\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            outside.join("secret.rs"),
+            "pub fn totally_outside_the_repo_marker() -> u32 {\n    42\n}\n",
+        )
+        .unwrap();
+
+        std::env::set_var("TRAVSR_DISABLE_REGISTRY", "1");
+        init_repo(&repo).unwrap();
+        std::env::remove_var("TRAVSR_DISABLE_REGISTRY");
+
+        let db_path = repo.join(".travsr/graph.db");
+        let store = std::sync::Mutex::new(travsr_store::SqliteStore::open(&db_path).unwrap());
+        let before = store
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .node_count()
+            .unwrap();
+        let read_store = std::sync::Mutex::new(travsr_store::SqliteStore::open(&db_path).unwrap());
+        let cache = std::sync::Mutex::new(query_cache::QueryCache::new(8));
+        let phase_b_scheduler =
+            phase_b_sched::PhaseBScheduler::new(std::time::Duration::from_secs(30));
+        let (index_tx, _index_rx) =
+            std::sync::mpsc::sync_channel::<watcher::WatchEvent>(INDEX_QUEUE_CAP);
+        let sessions = std::sync::Mutex::new(EditorPlane::default());
+
+        let msg =
+            serde_json::to_string(&travsr_ipc::ControlMessage::RequestLiveResolutionTargets {
+                repo_root: repo.to_string_lossy().into_owned(),
+                session: "sec".to_string(),
+                file: "../outside/secret.rs".to_string(),
+                buffer_version: 1,
+            })
+            .unwrap();
+        let (resp, _shutdown) = handle_control_message(
+            &msg,
+            &repo,
+            &store,
+            &read_store,
+            &cache,
+            &phase_b_scheduler,
+            &index_tx,
+            &sessions,
+        );
+        assert!(
+            !resp.ok,
+            "an escaping file argument must be refused: {resp:?}"
+        );
+
+        let s = store.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(
+            s.get_file_hash("../outside/secret.rs").unwrap().is_none(),
+            "no file row may be recorded for a path outside the repo"
+        );
+        assert_eq!(
+            s.node_count().unwrap(),
+            before,
+            "no node from outside the repo may reach the graph"
+        );
+    }
+
     /// The lexical floor is native-only (section 8.3): the generic detector
     /// recovers no receiver type and builds no signature key, so there is
     /// nothing for it to match on and the save path must not parse the file to
@@ -14881,6 +14964,31 @@ fn handle_control_message(
             if reported != travsr_ipc::normalize_repo_root(repo_root) {
                 return (
                     ControlResponse::err("request is for a different repo".to_string()),
+                    false,
+                );
+            }
+
+            // SEC-002: `file` is caller-supplied and is joined onto the repo
+            // root below, so it is validated here, before anything reads or
+            // writes with it. The same guard the MCP tools apply to a `file`
+            // argument (`get_dependencies`), applied at the point the string
+            // enters rather than inside `process_saved_file`, whose other caller
+            // is the watcher and is handed paths from its own walk of the repo.
+            // It has to be here and not further down because this arm now both
+            // reads that path and indexes it: `reindex_files_reporting` falls
+            // back to the joined path when `strip_prefix(repo_root)` fails, so
+            // `../outside/secret.rs` would otherwise be parsed into the graph.
+            // Purely lexical, so unlike a canonicalizing containment test it
+            // cannot reject a legitimate request because the repo root is a
+            // symlink or is spelled non-canonically.
+            if let Err(reason) = travsr_mcp::validate_mcp_arg(&file) {
+                tracing::warn!(
+                    event = "live.targets.rejected",
+                    session = %session,
+                    "live resolution targets rejected an invalid file argument: {reason}"
+                );
+                return (
+                    ControlResponse::err("invalid file argument".to_string()),
                     false,
                 );
             }
