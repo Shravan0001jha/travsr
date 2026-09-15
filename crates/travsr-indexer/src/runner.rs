@@ -197,7 +197,9 @@ fn run_with_drain_capped(
 ///    that names the variable (#878), so a stale override never falls through to
 ///    a different emitter, or to the bare-PATH fallback, without saying so.
 /// 2. Sibling of `current_exe` named `travsr-lsif-ts` — npm global install layout where
-///    both binaries land in the same `bin/` directory.
+///    both binaries land in the same `bin/` directory — or `travsr-lib/travsr-lsif-ts`
+///    beside it, which is the bundle the release tarball ships
+///    (scripts/bundle-emitters.sh).
 /// 3. Walk up from `current_exe` directory looking for
 ///    `packages/travsr-lsif-ts/dist/index.js` — monorepo / `cargo build` dev layout.
 /// 4. `travsr-lsif-ts` on PATH — legacy fallback. Steps 2 and 3 are anchored on
@@ -221,6 +223,22 @@ fn resolve_lsif_emitter() -> (String, Vec<String>) {
             let sibling = exe_dir.join("travsr-lsif-ts");
             if sibling.is_file() {
                 return (sibling.to_string_lossy().into_owned(), vec![]);
+            }
+
+            // 2b. Bundled payload from the release tarball
+            //     (scripts/bundle-emitters.sh), kept in its own directory so
+            //     the Python emitter's adjacent node_modules is not scattered
+            //     into a PATH dir. Both emitters ship there together.
+            //
+            //     Invoked through `node` rather than executed directly: the
+            //     bundle is an extensionless shebang script, which Windows
+            //     cannot spawn as a program. Step 1 resolves the same way.
+            let bundled = exe_dir.join("travsr-lib").join("travsr-lsif-ts");
+            if bundled.is_file() {
+                return (
+                    "node".to_string(),
+                    vec![bundled.to_string_lossy().into_owned()],
+                );
             }
 
             // 3. Walk up from exe_dir looking for the monorepo layout.
@@ -547,7 +565,9 @@ fn read_scip_output_capped(output: &Path, cap: u64) -> anyhow::Result<Vec<u8>> {
 ///
 /// Resolution order (identical to [`resolve_lsif_emitter`] for TypeScript):
 /// 1. `TRAVSR_LSIF_PY` env var — absolute path to the JS entry point.
-/// 2. Sibling of `current_exe` named `travsr-lsif-py` — npm global install layout.
+/// 2. Sibling of `current_exe` named `travsr-lsif-py` — npm global install layout —
+///    or `travsr-lib/travsr-lsif-py` beside it, the bundle the release tarball
+///    ships, with its native addons in `travsr-lib/node_modules`.
 /// 3. Walk up from `current_exe` to find `packages/travsr-lsif-py/dist/index.js`.
 /// 4. `travsr-lsif-py` on PATH — final fallback.
 ///
@@ -568,6 +588,23 @@ fn resolve_lsif_py_emitter() -> (String, Vec<String>) {
             let sibling = exe_dir.join("travsr-lsif-py");
             if sibling.is_file() {
                 return (sibling.to_string_lossy().into_owned(), vec![]);
+            }
+
+            // 2b. Bundled payload from the release tarball
+            //     (scripts/bundle-emitters.sh). It lives in its own directory
+            //     rather than directly beside the binary because the Python
+            //     emitter needs its native addons in an adjacent node_modules,
+            //     and an install into a PATH dir must not scatter those there.
+            //
+            //     Invoked through `node` for the same reason as the TypeScript
+            //     bundle: an extensionless shebang script is not spawnable on
+            //     Windows.
+            let bundled = exe_dir.join("travsr-lib").join("travsr-lsif-py");
+            if bundled.is_file() {
+                return (
+                    "node".to_string(),
+                    vec![bundled.to_string_lossy().into_owned()],
+                );
             }
 
             // 3. Walk up from exe_dir looking for the monorepo dev layout.
