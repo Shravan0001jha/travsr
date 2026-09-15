@@ -537,9 +537,12 @@ pub fn print_summary(stats: &InitStats, elapsed: Duration, quiet: bool, daemon_r
                 let lang = &skip.language;
                 let analyzer = travsr_daemon::lsif_analyzer_name(lang);
                 let (what, fix) = match skip.reason {
+                    // EmitterMissing is TypeScript-only (rust and python record a
+                    // failure, never a plain absence), so its remedy is the
+                    // TypeScript one #878 wrote.
                     LsifSkipReason::EmitterMissing => (
                         "could not be started",
-                        install_fix(lang),
+                        "set TRAVSR_LSIF_TS to the emitter's dist/index.js (or reinstall travsr so it sits beside the binary), then re-run `travsr init --semantic --force`",
                     ),
                     LsifSkipReason::EmitterFailed => (
                         "failed",
@@ -824,17 +827,6 @@ pub fn fmt_dur(d: Duration) -> String {
 /// produces no call edges, surfacing only as the generic zero-node warning.
 /// Returns an actionable hint when running on macOS with a `bash` older than
 /// 4.4, else `None`.
-/// The "how to get this analyzer" line for the init summary, per language.
-/// The bundled emitters come with the binary, so their fix is the install
-/// layout; rust-analyzer is a toolchain component the user adds themselves.
-fn install_fix(language: &str) -> &'static str {
-    match language {
-        "rust" => "install rust-analyzer (`rustup component add rust-analyzer`), then re-run `travsr init --semantic --force`",
-        "python" => "reinstall travsr so the emitter sits beside the binary, then re-run `travsr init --semantic --force`",
-        _ => "set TRAVSR_LSIF_TS to the emitter's dist/index.js (or reinstall travsr so it sits beside the binary), then re-run `travsr init --semantic --force`",
-    }
-}
-
 pub(crate) fn macos_java_bash_hint() -> Option<String> {
     if !cfg!(target_os = "macos") {
         return None;

@@ -17,8 +17,8 @@ use anyhow::Context as _;
 
 use crate::runner::run_with_drain;
 use crate::sandbox::{
-    build_sandboxed_command, record_ra_lsif_sandbox_skip, should_skip_unsandboxed,
-    LsifAnalyzerSkip, SandboxConfig, SandboxStatus,
+    build_sandboxed_command, record_ra_lsif_sandbox_skip, should_skip_unsandboxed, SandboxConfig,
+    SandboxStatus,
 };
 
 // ── Public API ────────────────────────────────────────────────────────────────
@@ -169,11 +169,11 @@ pub fn run_ra_lsif(repo_root: &Path, cfg: &SandboxConfig) -> anyhow::Result<Opti
     let ra_path = match ra_binary_path() {
         Some(p) => p,
         None => {
+            // Not recorded as a failure: an absent rust-analyzer is a missing
+            // prerequisite, which `travsr lang list` already reports as
+            // `partial` for rust. Only an analyzer that ran and broke is a
+            // failure to disclose here.
             tracing::info!("rust-analyzer not found, skipping Rust's full cross-file analysis");
-            // Recorded, not just logged: without this the whole language quietly
-            // fell back to tree-sitter heuristics while `travsr status` still
-            // printed `semantic: complete`.
-            crate::sandbox::record_lsif_analyzer_skip("rust", LsifAnalyzerSkip::Missing);
             return Ok(None);
         }
     };
@@ -182,10 +182,16 @@ pub fn run_ra_lsif(repo_root: &Path, cfg: &SandboxConfig) -> anyhow::Result<Opti
     let (cmd, status) = build_sandboxed_command(ra_str.as_str(), &["lsif", repo_str.as_ref()], cfg);
     let out = spawn_or_skip_ra(cmd, status, repo_root, cfg);
     // An `Ok(None)` here is the sandbox fail-closed skip, which already has its
-    // own `rust_lsif_degraded=sandbox_unavailable` disclosure, so only the
-    // error path is recorded: rust-analyzer ran and failed.
-    if out.is_err() {
-        crate::sandbox::record_lsif_analyzer_skip("rust", LsifAnalyzerSkip::Failed);
+    // own `rust_lsif_degraded=sandbox_unavailable` disclosure, so only the error
+    // path is recorded: rust-analyzer ran and failed.
+    //
+    // Gated on the pass being DUE, exactly as #878 gates the TypeScript one on a
+    // root `tsconfig.json`. `rust-analyzer lsif` exits non-zero with "no
+    // projects" on a directory that merely contains `.rs` files, and a repo that
+    // is not a cargo project is not a broken analyzer: reporting `semantic:
+    // partial (incomplete: rust)` there would name a remedy that cannot help.
+    if out.is_err() && repo_root.join("Cargo.toml").is_file() {
+        crate::sandbox::record_lsif_analyzer_failure("rust");
     }
     out
 }

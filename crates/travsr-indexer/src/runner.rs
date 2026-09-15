@@ -702,13 +702,10 @@ pub fn run_lsif_py_emitter(root: &Path) -> anyhow::Result<Option<String>> {
                 "travsr-lsif-py not found, Python LSIF enrichment skipped \
                  (native phase_b tree-sitter edges still active)"
             );
-            // Recorded, not just logged at debug: this is the case that shipped
-            // in every release (the emitter was never in an artifact), and it
-            // reached no user-facing surface at all.
-            crate::sandbox::record_lsif_analyzer_skip(
-                "python",
-                crate::sandbox::LsifAnalyzerSkip::Missing,
-            );
+            // Not recorded as a failure: an emitter that is not there is an
+            // install-layout question, which `travsr lang list` already reports
+            // as `partial` for python. Only an emitter that ran and broke is a
+            // failure to disclose.
             return Ok(None);
         }
     };
@@ -717,20 +714,14 @@ pub fn run_lsif_py_emitter(root: &Path) -> anyhow::Result<Option<String>> {
         match run_with_drain(child, lsif_node_timeout(), "travsr-lsif-py") {
             Ok(v) => v,
             Err(e) => {
-                crate::sandbox::record_lsif_analyzer_skip(
-                    "python",
-                    crate::sandbox::LsifAnalyzerSkip::Failed,
-                );
+                crate::sandbox::record_lsif_analyzer_failure("python");
                 return Err(e);
             }
         };
 
     if !exit_status.success() {
         let stderr_head = stderr.lines().take(5).collect::<Vec<_>>().join("\n");
-        crate::sandbox::record_lsif_analyzer_skip(
-            "python",
-            crate::sandbox::LsifAnalyzerSkip::Failed,
-        );
+        crate::sandbox::record_lsif_analyzer_failure("python");
         anyhow::bail!("travsr-lsif-py exited with {exit_status}: {stderr_head}");
     }
 

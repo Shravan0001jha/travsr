@@ -1983,7 +1983,7 @@ pub fn init_repo_with_progress(
             // skip on another repo doesn't produce a false degradation flag for
             // this repo's write_phase_b_results call.
             travsr_indexer::sandbox::reset_ra_lsif_sandbox_skip();
-            travsr_indexer::sandbox::reset_lsif_analyzer_skips();
+            travsr_indexer::sandbox::reset_lsif_analyzer_failures();
             let phase_b_indexer = travsr_plugin_host::PluginIndexer::new(&corpus);
             // #755 item 3: live per-language view of the fan-out, polled by the
             // heartbeat thread below so the progress line keeps ticking while
@@ -5037,7 +5037,7 @@ fn run_background_phase_b_inner(
     let dart_present = present_languages.contains("dart");
     // R1: reset per-Phase-B skip latch before the run (same as init_repo_with_progress).
     travsr_indexer::sandbox::reset_ra_lsif_sandbox_skip();
-    travsr_indexer::sandbox::reset_lsif_analyzer_skips();
+    travsr_indexer::sandbox::reset_lsif_analyzer_failures();
     let indexer = travsr_plugin_host::PluginIndexer::new(&corpus);
     let inputs = travsr_plugin_host::PhaseBInputs {
         repo_root,
@@ -5797,26 +5797,23 @@ fn run_lsif_pass_collect(
     }
 }
 
-/// Merge the TypeScript LSIF skip with the rust/python ones recorded by their
-/// runners during this Phase B pass.
+/// Merge the TypeScript LSIF skip with the rust/python analyzer failures
+/// recorded by their runners during this Phase B pass.
 ///
 /// The two sources exist because the passes do: TypeScript's runs here in the
 /// daemon (so it is handed in), while rust-analyzer and travsr-lsif-py are
-/// invoked from travsr-indexer, which latches its skips for exactly this drain.
+/// invoked from travsr-indexer, which latches its failures for exactly this
+/// drain.
 fn collect_lsif_skips(ts_skip: Option<&LsifSkip>) -> Vec<LsifSkip> {
     let mut out: Vec<LsifSkip> = ts_skip.into_iter().cloned().collect();
-    for (language, skip) in travsr_indexer::sandbox::lsif_analyzer_skips() {
-        let reason = match skip {
-            travsr_indexer::sandbox::LsifAnalyzerSkip::Missing => LsifSkipReason::EmitterMissing,
-            travsr_indexer::sandbox::LsifAnalyzerSkip::Failed => LsifSkipReason::EmitterFailed,
-        };
+    for language in travsr_indexer::sandbox::lsif_analyzer_failures() {
         let detail = format!(
-            "{} produced no cross-file edges for {language}",
+            "{} ran and failed, so {language} kept only its structural call edges",
             lsif_analyzer_name(language)
         );
         out.push(LsifSkip {
             language: language.to_string(),
-            reason,
+            reason: LsifSkipReason::EmitterFailed,
             detail,
         });
     }
@@ -8547,13 +8544,14 @@ mod tests {
     /// classes the TypeScript path uses, so `travsr status` downgrades
     /// `semantic: complete` and names the analyzer.
     ///
-    /// Before this, `run_ra_lsif` returning `Err` and `run_lsif_py_emitter`
-    /// returning `Ok(None)` were logged and dropped: the language kept only its
-    /// tree-sitter heuristics while every surface reported a clean success.
+    /// Before this, `run_ra_lsif` returning `Err` was logged and dropped: the
+    /// language kept only its tree-sitter heuristics while every surface
+    /// reported a clean success. An analyzer that is merely absent is NOT
+    /// recorded here; that is a capability question `lang list` answers.
     #[test]
     fn write_phase_b_results_records_rust_and_python_lsif_skips() {
         travsr_indexer::sandbox::reset_ra_lsif_sandbox_skip();
-        travsr_indexer::sandbox::reset_lsif_analyzer_skips();
+        travsr_indexer::sandbox::reset_lsif_analyzer_failures();
 
         let tmp = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(tmp.path().join(".travsr")).unwrap();
@@ -8580,14 +8578,8 @@ mod tests {
             "a cycle whose analyzers all ran must not be flagged"
         );
 
-        travsr_indexer::sandbox::record_lsif_analyzer_skip(
-            "rust",
-            travsr_indexer::sandbox::LsifAnalyzerSkip::Failed,
-        );
-        travsr_indexer::sandbox::record_lsif_analyzer_skip(
-            "python",
-            travsr_indexer::sandbox::LsifAnalyzerSkip::Missing,
-        );
+        travsr_indexer::sandbox::record_lsif_analyzer_failure("rust");
+        travsr_indexer::sandbox::record_lsif_analyzer_failure("python");
         let (report, _, _) = write_phase_b_results(
             &mut store,
             "test",
@@ -8609,8 +8601,8 @@ mod tests {
             "a failed rust-analyzer must be disclosed, got {warnings:?}"
         );
         assert!(
-            classes.contains(&"emitter_missing:python"),
-            "a missing travsr-lsif-py must be disclosed, got {warnings:?}"
+            classes.contains(&"emitter_failed:python"),
+            "a travsr-lsif-py that ran and broke must be disclosed, got {warnings:?}"
         );
         // The report drives the `init` summary, so it must carry both too.
         let reported: Vec<&str> = report
@@ -8623,7 +8615,7 @@ mod tests {
             "the init summary must see both skips, got {reported:?}"
         );
 
-        travsr_indexer::sandbox::reset_lsif_analyzer_skips();
+        travsr_indexer::sandbox::reset_lsif_analyzer_failures();
     }
 
     /// #738: the `rust_lsif_degraded` flag must reflect surviving edges, not just
@@ -8637,7 +8629,7 @@ mod tests {
         // The flag is gated on `!ra_lsif_sandbox_was_skipped()`; reset the
         // process-global latch so a prior run cannot force `sandbox_unavailable`.
         travsr_indexer::sandbox::reset_ra_lsif_sandbox_skip();
-        travsr_indexer::sandbox::reset_lsif_analyzer_skips();
+        travsr_indexer::sandbox::reset_lsif_analyzer_failures();
 
         let tmp = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(tmp.path().join(".travsr")).unwrap();
@@ -8653,7 +8645,7 @@ mod tests {
 
         let run = |store: &mut travsr_store::SqliteStore, stats: (usize, usize)| {
             travsr_indexer::sandbox::reset_ra_lsif_sandbox_skip();
-            travsr_indexer::sandbox::reset_lsif_analyzer_skips();
+            travsr_indexer::sandbox::reset_lsif_analyzer_failures();
             write_phase_b_results(
                 store,
                 "test",

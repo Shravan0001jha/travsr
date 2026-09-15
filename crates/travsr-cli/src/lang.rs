@@ -741,7 +741,17 @@ fn cmd_install(
         // (rust → rust-analyzer) is NOT bundled, so it falls through to the
         // install path below instead of short-circuiting to a false "active"
         // without ever fetching the analyzer.
-        bundled_analyzer_ready(entry)
+        // Deliberately NOT `bundled_analyzer_ready`, which also checks that the
+        // emitter resolves. That check belongs in the capability view and in the
+        // message below, not in this flag: `full_ready` drives
+        // `InstallStatus::WrapperOnly`, which exits 2 and is documented as
+        // "wrapper installed but underlying SCIP tool missing". A bundled
+        // analyzer has no second tool for the user to fetch, and the work
+        // `lang install` actually does here (register the language, grant this
+        // repo's corpus) has already succeeded, so turning an unbuilt emitter
+        // into a failed install would break enabling a language in any tree that
+        // has not built it yet.
+        entry.runtime_driver.map_or(true, tool_available)
     } else if wrapper_installed && (reinstall || !analyzer_command_present(entry)) {
         // UX-4: `--reinstall` must re-run the underlying SCIP tool install even when
         // it is already on PATH, not just the wrapper. Otherwise a user following the
@@ -817,24 +827,6 @@ fn cmd_install(
     // the honest "set up, but analyzer not installed"; the repo trust grant was
     // recorded either way.
     if !full_ready {
-        // A bundled analyzer is not something the user installs: it ships beside
-        // the binary. The catalog's `scip_install` for these languages names an
-        // npm package that was never published, so the generic branches below
-        // would send the user somewhere that cannot help. Say what is actually
-        // wrong, with the same remedy `travsr status` gives.
-        if entry.analyzer_bundled()
-            && !travsr_indexer::bundled_lsif_emitter_available(entry.language)
-        {
-            println!(
-                "'{language}' isn't fully set up yet: the analyzer that ships with travsr \
-                 ('{}') was not found next to the travsr binary, so full cross-file analysis \
-                 stays off. Basic analysis still runs.\n\
-                 Reinstall travsr so the analyzer sits beside the binary, then re-run \
-                 `travsr init --semantic --force`.",
-                entry.command
-            );
-            return Ok(InstallStatus::WrapperOnly);
-        }
         // The most common "not ready" cause across every platform (go/npm/dotnet
         // missing) collapses to one line instead of stacking the generic
         // "analyzer not installed yet" paragraph on top of it — the driver is the
@@ -918,7 +910,23 @@ fn cmd_install(
         return Ok(InstallStatus::FullyReady);
     }
 
-    if enabled_here {
+    // The claim is checked, not asserted. `lang install typescript` used to
+    // print "is active, full cross-file analysis is on" in the very repo where
+    // `travsr status` reported the analyzer could not be started, because
+    // nothing here had looked for the emitter. The registration itself did
+    // succeed, so this reports the analyzer state rather than failing the
+    // command, and the remedy is the install layout: a bundled analyzer is not
+    // a package the user fetches.
+    if entry.analyzer_bundled() && !travsr_indexer::bundled_lsif_emitter_available(entry.language) {
+        println!(
+            "'{language}' is set up for this repository, but the analyzer that ships with \
+             travsr ('{}') was not found next to the travsr binary, so full cross-file \
+             analysis stays off and basic analysis still runs.\n\
+             Reinstall travsr so the analyzer sits beside the binary, then re-run \
+             `travsr init --semantic --force`.",
+            entry.command
+        );
+    } else if enabled_here {
         println!("'{language}' is active, full cross-file analysis is on for this repository.");
     } else {
         println!("'{language}' is active, full cross-file analysis is on.");
