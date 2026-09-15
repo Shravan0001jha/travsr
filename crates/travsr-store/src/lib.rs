@@ -3217,6 +3217,38 @@ impl SqliteStore {
                 }
             }
 
+            // The (src,dst) pairs the delete below is about to drop, held in a
+            // temp table the same way `_preserved_src` is, and for the same
+            // reason: the changed-occurrence capture further down needs to know
+            // which occurrences had a committed EDGE, and by then they are gone.
+            //
+            // Without this the capture enumerated every occurrence row, and
+            // `edge_sites` holds `ref/call` rows for references that are not
+            // calls: the `Store` in `Store::new()`, or the type name in a struct
+            // literal, are recorded as sites with no edge behind them. The live
+            // lane offered those as call targets and then created a real
+            // `ref/call` edge from a function to a type, which Phase B had never
+            // derived and the ratification sweep deleted.
+            //
+            // The pair test rather than the dst node's kind: a tuple struct is
+            // genuinely callable (`Point(7)` does produce `ref/call` ->
+            // `struct:Point`), so "dst is a struct" would drop a real edge. Only
+            // "did an edge exist here" separates the two, which is also exactly
+            // the standard the sweep applies.
+            tx.execute_batch(
+                "CREATE TEMP TABLE IF NOT EXISTS _dropped_edge_pairs(src INTEGER, dst INTEGER); \
+                 DELETE FROM _dropped_edge_pairs;",
+            )
+            .context("creating _dropped_edge_pairs temp table")?;
+            tx.execute(
+                "INSERT INTO _dropped_edge_pairs(src, dst) \
+                 SELECT src, dst FROM edges \
+                 WHERE src IN (SELECT id FROM nodes WHERE corpus=?1 AND path=?2) \
+                   AND src NOT IN (SELECT id FROM _preserved_src)",
+                params![corpus, path],
+            )
+            .context("recording dropped edge pairs for reindex_replace")?;
+
             // Delete only OWNED (outbound) edges — inbound edges from other files
             // retained. RFC-027 #813: an owned edge whose src is a preserved
             // definition is committed truth still valid after a pure body edit, so
@@ -3285,10 +3317,18 @@ impl SqliteStore {
                 // no node (external synthetic) cannot be named, so it is skipped.
                 let mut stmt = tx
                     .prepare(
+                        // Only occurrences whose committed edge this save
+                        // actually dropped: those are the ones the live lane has
+                        // something to restore. An occurrence row with no edge
+                        // behind it is a reference Phase B recorded but never
+                        // turned into an edge, and enumerating it made the lane
+                        // fabricate one.
                         "SELECT es.src, es.line, es.col, es.kind, n.signature \
                          FROM edge_sites es JOIN nodes n ON n.id = es.dst \
                          WHERE es.src IN (SELECT id FROM nodes WHERE corpus=?1 AND path=?2) \
-                           AND es.src NOT IN (SELECT id FROM _preserved_src)",
+                           AND es.src NOT IN (SELECT id FROM _preserved_src) \
+                           AND EXISTS (SELECT 1 FROM _dropped_edge_pairs p \
+                                       WHERE p.src = es.src AND p.dst = es.dst)",
                     )
                     .context("preparing changed-def occurrence capture")?;
                 let rows: Vec<travsr_core::ChangedOccurrence> = stmt
@@ -6519,6 +6559,20 @@ LIMIT ?4",
     /// wrong — Phase B has recall gaps of its own, and the code can change
     /// between the edit and the commit.
     ///
+    /// Agreement additionally requires Phase B to have derived the **edge**, not
+    /// merely an occurrence row at that position. `edge_sites` carries `ref/call`
+    /// rows for references that are not calls (the `Store` in `Store::new()`, a
+    /// type name in a struct literal), so a site match alone scored a claim as
+    /// agreement while the ratification sweep, which asks for the edge, deleted
+    /// the edge that claim had produced. One run read `agree=9 disagree=0
+    /// precision=1.0` and `swept=2` in the same breath.
+    ///
+    /// Such a claim is scored `disagree`, not `unverifiable`: Phase B did look at
+    /// that exact position (it recorded a site there) and declined to derive the
+    /// edge. That is evidence of absence, not absence of evidence, and the lane
+    /// asserted an edge anyway. `unverifiable` is reserved for a position Phase B
+    /// said nothing about at all.
+    ///
     /// `SCIP wins all ties` (section 12) falls out of the ordering rather than
     /// needing a rule here: by the time this runs, Phase B has already written
     /// its answer over any co-located live row.
@@ -6534,7 +6588,10 @@ LIMIT ?4",
                                WHERE s.src = r.src AND s.line = r.ref_line) AS has_site, \
                        EXISTS (SELECT 1 FROM edge_sites s \
                                WHERE s.src = r.src AND s.line = r.ref_line \
-                                 AND s.dst = r.resolved_dst) AS matches \
+                                 AND s.dst = r.resolved_dst \
+                                 AND EXISTS (SELECT 1 FROM edges e \
+                                             WHERE e.src = r.src \
+                                               AND e.dst = r.resolved_dst)) AS matches \
                      FROM ref_resolution_state r \
                      WHERE r.state = 'resolved' AND r.resolved_dst IS NOT NULL",
                 )
@@ -6582,7 +6639,10 @@ LIMIT ?4",
                                WHERE s.src = r.src AND s.line = r.ref_line) AS has_site, \
                        EXISTS (SELECT 1 FROM edge_sites s \
                                WHERE s.src = r.src AND s.line = r.ref_line \
-                                 AND s.dst = r.resolved_dst) AS matches \
+                                 AND s.dst = r.resolved_dst \
+                                 AND EXISTS (SELECT 1 FROM edges e \
+                                             WHERE e.src = r.src \
+                                               AND e.dst = r.resolved_dst)) AS matches \
                      FROM ref_resolution_state r \
                      JOIN nodes n ON n.id = r.src \
                      WHERE r.state = 'resolved' AND r.resolved_dst IS NOT NULL",
@@ -11985,489 +12045,130 @@ mod tests {
         assert!(store.language_has_edge_sites("rust").unwrap());
     }
 
+    /// The meter must not score a claim as agreement when Phase B recorded an
+    /// occurrence at that position but derived no edge for it.
+    ///
+    /// `edge_sites` carries `ref/call` rows for references that are not calls
+    /// (the `Store` in `Store::new()`, a type name in a struct literal). Scoring
+    /// on the site alone read `precision=1.0` for a live edge the ratification
+    /// sweep then deleted, which is the one thing this meter exists to catch.
     #[test]
-    fn language_occurrence_coverage_counts_distinct_files_across_all_kinds() {
-        // Context metric, not the gate. Must count every kind: restricting to
-        // callables inflated the ratio by excluding type-only files, which is
-        // what #551 review caught (161/169 = 95% vs 161/221 = 72% on the real
-        // graph).
+    fn live_precision_needs_a_derived_edge_not_just_an_occurrence() {
         let mut store = SqliteStore::open_in_memory().unwrap();
-        let a = travsr_core::Node::new(
-            travsr_core::VName::new("c", "", "a.rs", "rust", "fn:a"),
+        let caller = travsr_core::Node::new(
+            travsr_core::VName::new("c", "", "s.rs", "rust", "fn:run"),
             "function",
         );
-        let b = travsr_core::Node::new(
-            travsr_core::VName::new("c", "", "b.rs", "rust", "fn:b"),
-            "function",
+        let method = travsr_core::Node::new(
+            travsr_core::VName::new("c", "", "s.rs", "rust", "method:Store.new"),
+            "method",
         );
-        // Two symbols in one file must not count that file twice.
-        let b2 = travsr_core::Node::new(
-            travsr_core::VName::new("c", "", "b.rs", "rust", "fn:b2"),
-            "function",
-        );
-        // Type-only file: no callable, still part of the language's surface.
-        let t = travsr_core::Node::new(
-            travsr_core::VName::new("c", "", "t.rs", "rust", "struct:T"),
+        let ty = travsr_core::Node::new(
+            travsr_core::VName::new("c", "", "s.rs", "rust", "struct:Store"),
             "struct",
         );
-        for n in [&a, &b, &b2, &t] {
+        for n in [&caller, &method, &ty] {
             store.put_node(n).unwrap();
         }
-        store.record_edge_sites(&[(a.id, b.id, 3, None)]).unwrap();
-
-        // a.rs and b.rs carry occurrences; t.rs does not. Three distinct files.
-        let (with_occ, total) = store.language_occurrence_coverage("rust").unwrap();
-        assert_eq!(with_occ, 2, "a.rs and b.rs, each counted once");
-        assert_eq!(
-            total, 3,
-            "type-only t.rs must be visible in the denominator"
-        );
-
-        // A language with no nodes yields (0, 0) rather than dividing by zero.
-        assert_eq!(store.language_occurrence_coverage("go").unwrap(), (0, 0));
-        // Empty language matches language_has_edge_sites' treatment.
-        assert_eq!(store.language_occurrence_coverage("").unwrap(), (0, 0));
-    }
-
-    #[test]
-    fn fn_nodes_by_leaf_name_matches_bare_and_qualified_leaves() {
-        // #299 R1: the daemon leaf-name fallback recovers a qualified
-        // fn:Type.method / method:Type.method node from a bare leaf, restricts
-        // to callable kinds, and escapes LIKE metacharacters so `_` is literal.
-        let mut store = SqliteStore::open_in_memory().unwrap();
-        let nodes = [
-            ("a.rs", "fn:describe", "function"),
-            ("a.rs", "fn:Animal.describe", "function"),
-            ("b.rs", "method:Zoo.add", "method"),
-            ("c.rs", "fn:Zoo.announce_all", "method"),
-            // `_` must be escaped: an `X` in the same slot must NOT be matched
-            // when searching the underscore name.
-            ("c.rs", "fn:Zoo.announceXall", "method"),
-            // Non-callable kind with a matching leaf must be excluded.
-            ("d.rs", "class:describe", "class"),
-        ];
-        for (path, sig, kind) in nodes {
-            let n =
-                travsr_core::Node::new(travsr_core::VName::new("c", "", path, "rust", sig), kind);
-            store.put_node(&n).unwrap();
-        }
-
-        let mut got: Vec<String> = store
-            .fn_nodes_by_leaf_name(&["describe".to_string(), "add".to_string()])
-            .unwrap()
-            .into_iter()
-            .map(|(_, sig, _, _)| sig)
-            .collect();
-        got.sort();
-        assert_eq!(
-            got,
-            vec![
-                "fn:Animal.describe".to_string(),
-                "fn:describe".to_string(),
-                "method:Zoo.add".to_string(),
-            ]
-        );
-
-        // `announce_all` matches only the literal underscore node, never the
-        // `announceXall` wildcard trap -> proves the LIKE `_` is escaped.
-        let hit: Vec<String> = store
-            .fn_nodes_by_leaf_name(&["announce_all".to_string()])
-            .unwrap()
-            .into_iter()
-            .map(|(_, sig, _, _)| sig)
-            .collect();
-        assert_eq!(hit, vec!["fn:Zoo.announce_all".to_string()]);
-
-        // Empty input short-circuits with no query.
-        assert!(store.fn_nodes_by_leaf_name(&[]).unwrap().is_empty());
-    }
-
-    #[test]
-    fn record_edge_sites_skips_zero_line() {
-        // line == 0 means "unknown occurrence line" and must not be stored.
-        let mut store = SqliteStore::open_in_memory().unwrap();
-        let caller = travsr_core::Node::new(
-            travsr_core::VName::new("c", "", "a.rs", "rust", "file"),
-            "file",
-        );
-        let callee = travsr_core::Node::new(
-            travsr_core::VName::new("c", "", "b.rs", "rust", "fn:f"),
-            "fn",
-        );
-        store.put_node(&caller).unwrap();
-        store.put_node(&callee).unwrap();
+        // Phase B recorded BOTH occurrences on line 5, but derived an edge only
+        // for the method. This is exactly what a `Store::new()` call looks like.
         store
             .record_edge_sites(&[
-                (caller.id, callee.id, 0, None),
-                (caller.id, callee.id, 5, None),
+                (caller.id, method.id, 5, Some(27)),
+                (caller.id, ty.id, 5, Some(20)),
             ])
             .unwrap();
-        let sites = store.reference_sites(callee.id).unwrap();
-        assert_eq!(
-            sites,
-            vec![travsr_core::RefSite {
-                path: "a.rs".into(),
-                line: 5,
-                heuristic: false,
-                live: false
-            }]
-        );
-    }
-
-    #[test]
-    fn record_edge_sites_skips_self_loop() {
-        // #299 F8: a site whose src == dst has no backing ref/call edge (edges
-        // drop self-loops), so recording it would diverge find_references from
-        // get_callers. It must be skipped.
-        let mut store = SqliteStore::open_in_memory().unwrap();
-        let n = travsr_core::Node::new(
-            travsr_core::VName::new("c", "", "a.rs", "rust", "fn:f"),
-            "function",
-        );
-        store.put_node(&n).unwrap();
-        store.record_edge_sites(&[(n.id, n.id, 5, None)]).unwrap();
-        assert!(store.reference_sites(n.id).unwrap().is_empty());
-    }
-
-    #[test]
-    fn language_has_edge_sites_is_evidence_based_not_marker_based() {
-        // #299 F6: "index built for a language" must require an actual occurrence
-        // row, not merely that Phase B was invoked. A sidecar can run to
-        // completion yet produce nothing when its analyzer tool is missing
-        // (e.g. scip-php absent) — that language must read false so
-        // find_references says "unavailable", not a confident "0 references".
-        let mut store = SqliteStore::open_in_memory().unwrap();
-        let caller = travsr_core::Node::new(
-            travsr_core::VName::new("c", "", "main.go", "go", "fn:main"),
-            "function",
-        );
-        let callee = travsr_core::Node::new(
-            travsr_core::VName::new("c", "", "svc.go", "go", "fn:Charge"),
-            "function",
-        );
-        store.put_node(&caller).unwrap();
-        store.put_node(&callee).unwrap();
         store
-            .record_edge_sites(&[(caller.id, callee.id, 7, None)])
-            .unwrap();
-        // go has a real occurrence row -> built.
-        assert!(store.language_has_edge_sites("go").unwrap());
-        // php produced no occurrence rows (analyzer absent) -> not built,
-        // regardless of whether its Phase B sidecar "ran".
-        assert!(!store.language_has_edge_sites("php").unwrap());
-    }
-
-    #[test]
-    fn language_has_edge_sites_detects_via_src_when_dst_language_empty() {
-        // #299 F6: an occurrence whose `dst` definition node carries an empty
-        // language must still count for the calling file's language, since the
-        // enclosing `src` node reliably carries it (fixes the empty-dst
-        // false-negative). And querying the empty language itself is always false.
-        let mut store = SqliteStore::open_in_memory().unwrap();
-        let caller = travsr_core::Node::new(
-            travsr_core::VName::new("c", "", "a.rs", "rust", "fn:caller"),
-            "function",
-        );
-        // Def node with an empty language (file_node_for_attribution style).
-        let blank = travsr_core::Node::new(
-            travsr_core::VName::new("c", "", "b.rs", "", "fn:f"),
-            "function",
-        );
-        store.put_node(&caller).unwrap();
-        store.put_node(&blank).unwrap();
-        store
-            .record_edge_sites(&[(caller.id, blank.id, 4, None)])
-            .unwrap();
-        // rust is detected via the src endpoint even though dst language is empty.
-        assert!(store.language_has_edge_sites("rust").unwrap());
-        // The empty language itself is never "built".
-        assert!(!store.language_has_edge_sites("").unwrap());
-    }
-
-    #[test]
-    fn fn_nodes_by_leaf_name_includes_fn_kind_and_chunks() {
-        // #299 F11: the `fn` kind (some Phase A parsers) must be matched, and a
-        // names slice larger than one chunk must still resolve every name.
-        let mut store = SqliteStore::open_in_memory().unwrap();
-        let fnkind = travsr_core::Node::new(
-            travsr_core::VName::new("c", "", "a.rs", "rust", "fn:Zoo.feed"),
-            "fn",
-        );
-        store.put_node(&fnkind).unwrap();
-        // 350 distinct leaf names (> NAMES_PER_CHUNK) including the real one.
-        let mut names: Vec<String> = (0..350).map(|i| format!("leaf{i}")).collect();
-        names.push("feed".to_string());
-        let got: Vec<String> = store
-            .fn_nodes_by_leaf_name(&names)
-            .unwrap()
-            .into_iter()
-            .map(|(_, sig, _, _)| sig)
-            .collect();
-        assert_eq!(got, vec!["fn:Zoo.feed".to_string()]);
-    }
-
-    #[test]
-    fn reindex_replace_purges_owned_edge_sites() {
-        // #299 F7: re-indexing a file clears its OWNED occurrence rows (src in the
-        // file) but preserves inbound sites (references from other files).
-        let mut store = SqliteStore::open_in_memory().unwrap();
-        let owned_src = travsr_core::Node::new(
-            travsr_core::VName::new("c", "", "a.rs", "rust", "fn:caller"),
-            "function",
-        );
-        let callee = travsr_core::Node::new(
-            travsr_core::VName::new("c", "", "a.rs", "rust", "fn:target"),
-            "function",
-        );
-        let external = travsr_core::Node::new(
-            travsr_core::VName::new("c", "", "b.rs", "rust", "fn:ext"),
-            "function",
-        );
-        store.put_node(&owned_src).unwrap();
-        store.put_node(&callee).unwrap();
-        store.put_node(&external).unwrap();
-        // Owned site (src in a.rs) + inbound site (src in b.rs → dst in a.rs).
-        store
-            .record_edge_sites(&[
-                (owned_src.id, callee.id, 3, None),
-                (external.id, callee.id, 9, None),
-            ])
+            .put_edge(&travsr_core::Edge::new(
+                caller.id,
+                method.id,
+                travsr_core::EdgeKind::RefCall,
+            ))
             .unwrap();
 
-        // Re-index a.rs with the same nodes.
         store
-            .reindex_replace(
+            .replace_ref_resolution_states(
                 "c",
-                "a.rs",
-                &[owned_src.clone(), callee.clone()],
-                &[],
-                "hash1",
-                None,
+                "s.rs",
+                &[
+                    RefResolution {
+                        src: caller.id,
+                        ref_line: 5,
+                        ref_col: 0,
+                        name: "new".to_string(),
+                        state: "resolved",
+                        resolved_dst: Some(method.id),
+                    },
+                    RefResolution {
+                        src: caller.id,
+                        ref_line: 5,
+                        ref_col: 1,
+                        name: "Store".to_string(),
+                        state: "resolved",
+                        resolved_dst: Some(ty.id),
+                    },
+                ],
             )
             .unwrap();
 
-        let sites = store.reference_sites(callee.id).unwrap();
-        // The owned a.rs:3 site is gone; the inbound b.rs:9 site survives.
+        let sample = store.live_precision_sample().unwrap();
         assert_eq!(
-            sites,
-            vec![travsr_core::RefSite {
-                path: "b.rs".into(),
-                line: 9,
-                heuristic: false,
-                live: false
-            }]
+            (sample.agree, sample.disagree, sample.unverifiable),
+            (1, 1, 0),
+            "the edge-backed claim agrees; the site-only one is a disagreement,              not agreement and not unverifiable"
         );
     }
 
+    /// An occurrence row with no committed EDGE behind it must not be captured
+    /// for the live lane.
+    ///
+    /// `edge_sites` records references that are not calls (`Store` in
+    /// `Store::new()`, the type name in a struct literal) as `ref/call` rows
+    /// with no edge. Enumerating those made the editor resolve them and the
+    /// daemon create a real `ref/call` edge from a function to a type, which the
+    /// ratification sweep then deleted. The test pairs both shapes on one line so
+    /// the edge-backed one is still captured: the filter must be "did an edge
+    /// exist", not "is the dst a type" (a tuple struct is genuinely callable).
     #[test]
-    fn write_file_graphs_batch_purges_owned_edge_sites() {
-        // The incremental write path deletes a re-parsed file's owned edges but
-        // used to leave its occurrence rows behind. `reference_sites` LEFT JOINs
-        // `edges`, so an orphaned row came back `heuristic = false`, i.e. a stale
-        // line served as resolved fact. Same ownership rule as
-        // `reindex_replace_purges_owned_edge_sites`: owned rows go, inbound rows
-        // stay.
+    fn reindex_replace_skips_occurrences_with_no_committed_edge() {
         let mut store = SqliteStore::open_in_memory().unwrap();
-        let mk = |path: &str, sig: &str| {
-            travsr_core::Node::new(
-                travsr_core::VName::new("c", "", path, "rust", sig),
-                "function",
-            )
+        let mk = |sig: &str, kind: &str, line: u32, end: u32| {
+            travsr_core::Node::new(travsr_core::VName::new("c", "", "a.rs", "rust", sig), kind)
+                .with_line(line)
+                .with_end_line(end)
         };
-        let owned_src = mk("a.rs", "fn:caller");
-        let callee = mk("a.rs", "fn:target");
-        let external = mk("b.rs", "fn:ext");
-        for node in [&owned_src, &callee, &external] {
-            store.put_node(node).unwrap();
-        }
+        let a = mk("fn:a", "function", 1, 2);
+        let keep = mk("fn:b", "function", 4, 5);
+        let callee = mk("method:S.make", "method", 7, 8);
+        let ty = mk("struct:S", "struct", 10, 11);
+        let nodes = vec![a.clone(), keep.clone(), callee.clone(), ty.clone()];
+        // Phase B derived an edge for the method only. The type mention on the
+        // same line gets a site and no edge, exactly like `Store::new()`.
+        let ts_edges = vec![Edge::new(a.id, callee.id, EdgeKind::RefCall)];
+        let v1 = "fn a() {\n  S::make();\n}\n\nfn b() {\n}\n\nfn make() {\n}\n\nfn s() {\n}\n";
         store
-            .record_edge_sites(&[
-                // Owned: src lives in the file being re-parsed.
-                (owned_src.id, callee.id, 3, None),
-                // Inbound: src lives in another file, dst in this one.
-                (external.id, callee.id, 9, None),
-            ])
-            .unwrap();
-
-        let batch = vec![FileGraph {
-            vname_path: "a.rs".into(),
-            new_hash: "hash1".into(),
-            nodes: vec![owned_src.clone(), callee.clone()],
-            edges: vec![],
-            source: None,
-        }];
-        store.write_file_graphs_batch(&batch, false).unwrap();
-
-        assert_eq!(
-            store.reference_sites(callee.id).unwrap(),
-            vec![travsr_core::RefSite {
-                path: "b.rs".into(),
-                line: 9,
-                heuristic: false,
-                live: false
-            }],
-            "owned a.rs:3 site must be purged, inbound b.rs:9 site must survive"
-        );
-    }
-
-    // ── RFC-027 #813: scope-aware preservation (Mechanism A) ──────────────────
-
-    /// Provenance of a specific edge, or `None` if the edge is absent. Tests
-    /// read `store.conn` directly, as the reconcile/index tests above do.
-    fn edge_provenance(store: &SqliteStore, src: NodeId, dst: NodeId) -> Option<String> {
-        store
-            .conn
-            .query_row(
-                "SELECT provenance FROM edges WHERE src=?1 AND dst=?2",
-                params![node_id_to_i64(src), node_id_to_i64(dst)],
-                |r| r.get::<_, String>(0),
-            )
-            .optional()
-            .unwrap()
-    }
-
-    /// Two callers (`a`, `b`) in one file, each with a committed `lsif` edge to a
-    /// target. A pure body edit that changes only `a`'s body must leave `b`'s
-    /// committed edge exactly as it was — same row, same `lsif` provenance,
-    /// occurrence site intact — while `a`'s edge is purged so the live lane can
-    /// re-resolve it. This is the ~71% -> ~99% win, and it is proven by `b`'s
-    /// edge keeping `lsif` rather than being re-derived as `tree-sitter`.
-    #[test]
-    fn reindex_replace_preserves_unchanged_definition_committed_edges() {
-        let mut store = SqliteStore::open_in_memory().unwrap();
-        let mk = |sig: &str, line: u32, end: u32| {
-            travsr_core::Node::new(
-                travsr_core::VName::new("c", "", "a.rs", "rust", sig),
-                "function",
-            )
-            .with_line(line)
-            .with_end_line(end)
-        };
-        // a: lines 1-2, b: lines 4-5, plus two callee targets.
-        let a = mk("fn:a", 1, 2);
-        let b = mk("fn:b", 4, 5);
-        let x = mk("fn:x", 7, 8);
-        let y = mk("fn:y", 10, 11);
-        let nodes = vec![a.clone(), b.clone(), x.clone(), y.clone()];
-        let ts_edges = vec![
-            Edge::new(a.id, x.id, EdgeKind::RefCall),
-            Edge::new(b.id, y.id, EdgeKind::RefCall),
-        ];
-
-        let content_v1 =
-            "fn a() {\n  x();\n}\n\nfn b() {\n  y();\n}\n\nfn x() {\n}\n\nfn y() {\n}\n";
-        store
-            .reindex_replace("c", "a.rs", &nodes, &ts_edges, "h1", Some(content_v1))
-            .unwrap();
-
-        // Commit ratification would relabel these as semantic truth; simulate it.
-        store
-            .put_edge_lsif(&Edge::new(a.id, x.id, EdgeKind::RefCall))
+            .reindex_replace("c", "a.rs", &nodes, &ts_edges, "h1", Some(v1))
             .unwrap();
         store
-            .put_edge_lsif(&Edge::new(b.id, y.id, EdgeKind::RefCall))
-            .unwrap();
-        store
-            .record_edge_sites(&[(a.id, x.id, 2, None), (b.id, y.id, 5, None)])
-            .unwrap();
-        assert_eq!(edge_provenance(&store, a.id, x.id).as_deref(), Some("lsif"));
-        assert_eq!(edge_provenance(&store, b.id, y.id).as_deref(), Some("lsif"));
-
-        // v2: edit only a's body (line 2). b, x, y are byte-identical. The new
-        // parse no longer sees a's call (a's body changed), but still sees b's.
-        let content_v2 =
-            "fn a() {\n  z();\n}\n\nfn b() {\n  y();\n}\n\nfn x() {\n}\n\nfn y() {\n}\n";
-        let ts_edges_v2 = vec![Edge::new(b.id, y.id, EdgeKind::RefCall)];
-        store
-            .reindex_replace("c", "a.rs", &nodes, &ts_edges_v2, "h2", Some(content_v2))
+            .record_edge_sites(&[(a.id, callee.id, 2, Some(5)), (a.id, ty.id, 2, Some(2))])
             .unwrap();
 
-        // b unchanged: its committed edge is preserved, not re-derived — proven
-        // by the provenance staying `lsif` rather than being rebuilt as
-        // `tree-sitter`.
-        assert_eq!(
-            edge_provenance(&store, b.id, y.id).as_deref(),
-            Some("lsif"),
-            "b's committed edge must be preserved with its lsif provenance"
-        );
-        // RFC-027 #813 P2: b did not move (delta 0), so its occurrence row is
-        // re-recorded on its current line rather than dropped, keeping
-        // `find_references` correct mid-edit.
-        assert_eq!(
-            store.reference_sites(y.id).unwrap(),
-            vec![travsr_core::RefSite {
-                path: "a.rs".into(),
-                line: 5,
-                heuristic: false,
-                live: false
-            }],
-            "a preserved definition's occurrence is remapped onto its current line"
-        );
-        // a changed: its committed edge is purged so the live lane re-resolves it.
-        assert_eq!(
-            edge_provenance(&store, a.id, x.id),
-            None,
-            "the edited definition's stale edge must be purged"
-        );
-    }
-
-    /// RFC-027 #813 P2: on a body edit, `reindex_replace` captures the CHANGED
-    /// definition's committed occurrences (for the live lane to enumerate as
-    /// editor targets) and NOT the preserved definitions', carrying each
-    /// occurrence's column and the reference's leaf name, never the stale dst.
-    #[test]
-    fn reindex_replace_captures_changed_def_occurrences_for_the_live_lane() {
-        let mut store = SqliteStore::open_in_memory().unwrap();
-        let mk = |sig: &str, line: u32, end: u32| {
-            travsr_core::Node::new(
-                travsr_core::VName::new("c", "", "a.rs", "rust", sig),
-                "function",
-            )
-            .with_line(line)
-            .with_end_line(end)
-        };
-        let a = mk("fn:a", 1, 2);
-        let b = mk("fn:b", 4, 5);
-        let x = mk("fn:x", 7, 8);
-        let y = mk("fn:y", 10, 11);
-        let nodes = vec![a.clone(), b.clone(), x.clone(), y.clone()];
-        let ts_edges = vec![
-            Edge::new(a.id, x.id, EdgeKind::RefCall),
-            Edge::new(b.id, y.id, EdgeKind::RefCall),
-        ];
-        let content_v1 =
-            "fn a() {\n  x();\n}\n\nfn b() {\n  y();\n}\n\nfn x() {\n}\n\nfn y() {\n}\n";
-        store
-            .reindex_replace("c", "a.rs", &nodes, &ts_edges, "h1", Some(content_v1))
-            .unwrap();
-        // Committed occurrences, each with a byte column.
-        store
-            .record_edge_sites(&[(a.id, x.id, 2, Some(2)), (b.id, y.id, 5, Some(2))])
-            .unwrap();
-
-        // Edit only a's body; b, x, y stay byte-identical (preserved). The x
-        // call itself stays on line 2 at col 2 (a trailing comment changes the
-        // body hash without moving the reference), so the occurrence is still a
-        // live target to enumerate.
-        let content_v2 =
-            "fn a() {\n  x(); // edit\n}\n\nfn b() {\n  y();\n}\n\nfn x() {\n}\n\nfn y() {\n}\n";
+        let v2 =
+            "fn a() {\n  S::make(); // edit\n}\n\nfn b() {\n}\n\nfn make() {\n}\n\nfn s() {\n}\n";
         let report = store
-            .reindex_replace("c", "a.rs", &nodes, &[], "h2", Some(content_v2))
+            .reindex_replace("c", "a.rs", &nodes, &[], "h2", Some(v2))
             .unwrap();
 
-        // Only a's occurrence is captured (b, x, y are preserved). a did not
-        // move (delta 0) and the x call is still on line 2, so it is captured on
-        // line 2 with its column and the callee's leaf name, not the stale dst.
         assert_eq!(
             report.changed_occurrences,
             vec![travsr_core::ChangedOccurrence {
                 src: a.id,
                 line: 2,
-                col: Some(2),
+                col: Some(5),
                 kind: "ref/call".into(),
-                name: "x".into(),
+                name: "make".into(),
             }],
-            "the changed definition's occurrence must be captured with col and name"
+            "only the occurrence whose committed edge was dropped is captured"
         );
     }
 
@@ -12494,8 +12195,19 @@ mod tests {
         let x1 = mk("fn:x", 8, 9);
         let nodes_v1 = vec![a1.clone(), b1.clone(), x1.clone()];
         let content_v1 = "fn a() {\n  x();\n}\n\nfn b() {\n}\n\nfn x() {\n}\n";
+        // The call edge, not just its occurrence row: the capture now enumerates
+        // only occurrences whose committed edge the save drops, and a real `x()`
+        // call always has one. Without it this models the site-with-no-edge shape
+        // (a type mention), which is deliberately not captured.
         store
-            .reindex_replace("c", "a.rs", &nodes_v1, &[], "h1", Some(content_v1))
+            .reindex_replace(
+                "c",
+                "a.rs",
+                &nodes_v1,
+                &[Edge::new(a1.id, x1.id, EdgeKind::RefCall)],
+                "h1",
+                Some(content_v1),
+            )
             .unwrap();
         store
             .record_edge_sites(&[(a1.id, x1.id, 2, Some(2))])
@@ -14066,6 +13778,15 @@ mod tests {
             .unwrap();
         store
             .record_edge_sites(&[(caller.id, callee.id, 4, None)])
+            .unwrap();
+        // Agreement now needs the derived edge, not just an occurrence at the
+        // position, so Phase B's edge has to be here for this claim to agree.
+        store
+            .put_edge(&travsr_core::Edge::new(
+                caller.id,
+                callee.id,
+                travsr_core::EdgeKind::RefCall,
+            ))
             .unwrap();
 
         assert_eq!(store.live_precision_sample().unwrap().agree, 1);
