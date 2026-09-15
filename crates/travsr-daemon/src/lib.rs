@@ -14486,6 +14486,29 @@ fn process_saved_file(
                 .find(|(f, _)| *f == saved_vname)
                 .map(|(_, set)| set);
             live_resolve_file(&mut s, &corpus, repo_root, path, scope);
+            // RFC-027 sections 7.3c and 9.2: an abstention is recorded, not
+            // dropped. The lexical lane above records its own, but only for the
+            // references the native extractor hands it, and the extractor
+            // discards some by design (`NOISE_NAMES` drops `new`, `from`,
+            // `clone`). `Store::new()` therefore lost its committed edge to this
+            // save and appeared in no state at all: not resolved, not pending.
+            // The changed-occurrence set is exactly the occurrences whose
+            // committed edge this save dropped, so anything in it the lane did
+            // not re-resolve is precisely an unaccounted abstention.
+            let saved_occ: &[travsr_core::ChangedOccurrence] = changed_occ
+                .iter()
+                .find(|(f, _)| *f == saved_vname)
+                .map_or(&[], |(_, o)| o.as_slice());
+            match s.record_pending_changed_occurrences(saved_occ) {
+                Ok(n) if n > 0 => tracing::debug!(
+                    event = "live.pending.unresolved",
+                    path = %saved_vname,
+                    pending = n,
+                    "recorded abstentions for dropped committed references"
+                ),
+                Ok(_) => {}
+                Err(e) => tracing::debug!(error = %e, "live pending record failed"),
+            }
             // Dependents were not reindexed by this event, so their whole
             // file is re-resolved (no scope) exactly as before.
             for dependent in callers.iter().take(LIVE_CLOSURE_FILE_CAP) {
@@ -14505,7 +14528,7 @@ fn process_saved_file(
                 let mut plane = lsp_sessions.lock().unwrap_or_else(|e| e.into_inner());
                 let occ = changed_occ
                     .into_iter()
-                    .find(|(f, _)| *f == saved_vname)
+                    .find(|(f, _)| f.as_str() == saved_vname.as_str())
                     .map(|(_, o)| o)
                     .unwrap_or_default();
                 let scope_owned = changed_defs
