@@ -11,23 +11,31 @@
 #
 # Output layout, staged under $OUT_DIR and unpacked beside the binary:
 #
-#   travsr-lib/travsr-lsif-ts        single-file bundle, no runtime deps
-#   travsr-lib/travsr-lsif-py        single-file bundle, native deps external
-#   travsr-lib/node_modules/...      tree-sitter + tree-sitter-python prebuilds
+#   travsr-lib/travsr-lsif-ts          single-file bundle
+#   travsr-lib/travsr-lsif-py          single-file bundle
+#   travsr-lib/tree-sitter.wasm        tree-sitter runtime, loaded by the above
+#   travsr-lib/tree-sitter-python.wasm Python grammar
 #
-# The Python emitter keeps its two native addons external because node-gyp-build
-# resolves the prebuild at runtime from the package directory, which a bundler
-# cannot see. Only the prebuild matching $NODE_PLATFORM is kept, so the payload
-# stays near 1 MB rather than carrying all six.
+# Nothing here is platform specific. The Python emitter parses through
+# web-tree-sitter rather than the native tree-sitter addon, so the payload is
+# the same bytes on every target: no prebuild to select, no libstdc++ or libc
+# floor to clear, and it runs under a musl node as happily as a glibc one.
+# (tree-sitter's own linux prebuilds need GLIBCXX_3.4.31, which Ubuntu 22.04,
+# Debian 12 and RHEL 9 do not have, and it ships no musl build at all.)
 #
-# Usage: scripts/bundle-emitters.sh <node-platform> <out-dir>
-#   node-platform: prebuild directory name, e.g. darwin-arm64, linux-x64
+# Staged payload is ~10 MB, 1.7 MB gzipped. 9.5 MB of that is travsr-lsif-ts,
+# which inlines the TypeScript compiler; the Python side is 866 KB all in.
+#
+# Usage: scripts/bundle-emitters.sh <out-dir>
 set -euo pipefail
 
-NODE_PLATFORM="${1:?usage: bundle-emitters.sh <node-platform> <out-dir>}"
-OUT_DIR="${2:?usage: bundle-emitters.sh <node-platform> <out-dir>}"
+OUT_DIR="${1:?usage: bundle-emitters.sh <out-dir>}"
 
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
+# build_one cds into each package, so every path handed to esbuild has to be
+# absolute; release.yml passes a relative "dist".
+mkdir -p "${OUT_DIR}"
+OUT_DIR="$(cd "${OUT_DIR}" && pwd)"
 lib_dir="${OUT_DIR}/travsr-lib"
 mkdir -p "${lib_dir}"
 
@@ -57,33 +65,38 @@ build_one() {
 }
 
 build_one travsr-lsif-ts travsr-lsif-ts
-build_one travsr-lsif-py travsr-lsif-py \
-  --external:tree-sitter --external:tree-sitter-python
+build_one travsr-lsif-py travsr-lsif-py
 
-# Node resolves these from travsr-lib/node_modules because the bundle sits in
-# travsr-lib/. Only the four packages the Python emitter loads at runtime are
-# copied; the rest of its node_modules is build-time only.
-py_modules="${repo_root}/packages/travsr-lsif-py/node_modules"
-mkdir -p "${lib_dir}/node_modules"
-for dep in tree-sitter tree-sitter-python node-gyp-build; do
-  cp -R "${py_modules}/${dep}" "${lib_dir}/node_modules/${dep}"
+# The Python bundle loads both .wasm files from its own directory, so they ride
+# beside it. `npm run build` already placed them in dist/ for the same reason.
+for wasm in tree-sitter.wasm tree-sitter-python.wasm; do
+  cp "${repo_root}/packages/travsr-lsif-py/dist/${wasm}" "${lib_dir}/${wasm}"
 done
 
-# Drop every prebuild except this target's, and the sources node-gyp would need
-# only if it had to compile, which it never does when the prebuild is present.
-for dep in tree-sitter tree-sitter-python; do
-  prebuilds="${lib_dir}/node_modules/${dep}/prebuilds"
-  [ -d "${prebuilds}" ] || continue
-  for d in "${prebuilds}"/*; do
-    [ "$(basename "$d")" = "${NODE_PLATFORM}" ] || rm -rf "$d"
-  done
-  if [ ! -d "${prebuilds}/${NODE_PLATFORM}" ]; then
-    echo "ERROR: ${dep} ships no prebuild for ${NODE_PLATFORM}" >&2
+# Smoke the bundles from the staging directory, which is the relocated layout a
+# user gets: no node_modules to fall back through. A bundle that builds but
+# cannot load is exactly the failure this script exists to prevent, and it is
+# the one thing the release job's `test -f` cannot tell you. Each emitter's own
+# fixture is reused rather than a new one invented here.
+dump="$(mktemp)"
+trap 'rm -f "${dump}"' EXIT
+
+smoke() {
+  name="$1"
+  shift
+  if ! node "${lib_dir}/${name}" "$@" > "${dump}" 2>&1; then
+    echo "ERROR: ${name} failed to run from ${lib_dir}:" >&2
+    head -5 "${dump}" >&2
     exit 1
   fi
-  rm -rf "${lib_dir}/node_modules/${dep}/src" \
-         "${lib_dir}/node_modules/${dep}/build" \
-         "${lib_dir}/node_modules/${dep}/vendor"
-done
+  # Cross-file edges are the whole point of the emitter; a dump carrying only
+  # the metaData and project vertices means it loaded but resolved nothing.
+  if ! grep -q '"label":"referenceResult"' "${dump}"; then
+    echo "ERROR: ${name} ran but emitted no reference edges" >&2
+    exit 1
+  fi
+}
+smoke travsr-lsif-py --root "${repo_root}/packages/travsr-lsif-py/fixtures/simple"
+smoke travsr-lsif-ts --project "${repo_root}/packages/travsr-lsif-ts/fixtures/tsconfig.json"
 
 echo "==> staged $(du -sh "${lib_dir}" | cut -f1) in ${lib_dir}"

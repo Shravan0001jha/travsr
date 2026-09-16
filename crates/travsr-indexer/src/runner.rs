@@ -567,7 +567,7 @@ fn read_scip_output_capped(output: &Path, cap: u64) -> anyhow::Result<Vec<u8>> {
 /// 1. `TRAVSR_LSIF_PY` env var — absolute path to the JS entry point.
 /// 2. Sibling of `current_exe` named `travsr-lsif-py` — npm global install layout —
 ///    or `travsr-lib/travsr-lsif-py` beside it, the bundle the release tarball
-///    ships, with its native addons in `travsr-lib/node_modules`.
+///    ships, with its two `.wasm` files in the same directory.
 /// 3. Walk up from `current_exe` to find `packages/travsr-lsif-py/dist/index.js`.
 /// 4. `travsr-lsif-py` on PATH — final fallback.
 ///
@@ -593,8 +593,9 @@ fn resolve_lsif_py_emitter() -> (String, Vec<String>) {
             // 2b. Bundled payload from the release tarball
             //     (scripts/bundle-emitters.sh). It lives in its own directory
             //     rather than directly beside the binary because the Python
-            //     emitter needs its native addons in an adjacent node_modules,
-            //     and an install into a PATH dir must not scatter those there.
+            //     emitter loads tree-sitter.wasm and tree-sitter-python.wasm
+            //     from its own directory, and an install into a PATH dir must
+            //     not scatter those there.
             //
             //     Invoked through `node` for the same reason as the TypeScript
             //     bundle: an extensionless shebang script is not spawnable on
