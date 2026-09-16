@@ -40,7 +40,7 @@ const _: () = {
 //   - vendor/ directories skipped by the daemon WalkBuilder (not this parser)
 //   - Generic type parameters dropped: `func Foo[T any]()` → sig="fn:Foo"
 //   - `import "C"` (cgo pseudo-package) emitted and then filtered in link_imports_go
-//   - Call/ref edges deferred to Phase 4 (Go LSIF / pyright-equivalent)
+//   - Call/ref edges deferred to Phase B (scip-go)
 //   - Multi-value var blocks: only first name in each spec is indexed
 //   - Methods on generic types (*Stack[T]) silently dropped — DEBT-020
 //   - Co-package edges only refreshed on `travsr init`, not per-commit — DEBT-024
