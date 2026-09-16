@@ -14993,18 +14993,21 @@ fn handle_control_message(
 
             // SEC-002: `file` is caller-supplied and is joined onto the repo
             // root below, so it is validated here, before anything reads or
-            // writes with it. The same guard the MCP tools apply to a `file`
-            // argument (`get_dependencies`), applied at the point the string
-            // enters rather than inside `process_saved_file`, whose other caller
-            // is the watcher and is handed paths from its own walk of the repo.
-            // It has to be here and not further down because this arm now both
-            // reads that path and indexes it: `reindex_files_reporting` falls
-            // back to the joined path when `strip_prefix(repo_root)` fails, so
-            // `../outside/secret.rs` would otherwise be parsed into the graph.
-            // Purely lexical, so unlike a canonicalizing containment test it
-            // cannot reject a legitimate request because the repo root is a
-            // symlink or is spelled non-canonically.
-            if let Err(reason) = travsr_mcp::validate_mcp_arg(&file) {
+            // writes with it. Shares the MCP `file`-argument guard rather than
+            // copying it, applied at the point the string enters rather than
+            // inside `process_saved_file`, whose other caller is the watcher and
+            // is handed paths from its own walk of the repo. It has to be here
+            // and not further down because this arm now both reads that path and
+            // indexes it: `reindex_files_reporting` falls back to the joined
+            // path when `strip_prefix(repo_root)` fails, so `../outside/secret.rs`
+            // would otherwise be parsed into the graph. The file variant keeps
+            // every containment guard (`../`, absolute paths, null bytes, length)
+            // but allows `%`: this path is joined verbatim and never URL-decoded,
+            // so `%` stays a literal filename byte (`docs/100%.md`) rather than a
+            // traversal after decoding. Purely lexical, so unlike a canonicalizing
+            // containment test it cannot reject a legitimate request because the
+            // repo root is a symlink or is spelled non-canonically.
+            if let Err(reason) = travsr_mcp::validate_mcp_file_arg(&file) {
                 tracing::warn!(
                     event = "live.targets.rejected",
                     session = %session,
