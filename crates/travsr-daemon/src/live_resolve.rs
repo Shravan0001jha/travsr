@@ -552,21 +552,44 @@ fn lexical_one(
     locally_bound: &std::collections::HashSet<String>,
 ) -> Option<Edge> {
     let edge = lexical_edge_kind(call);
+    // A bare free-function or constructor call: the two gates below apply to
+    // this shape only, because a method or field reference resolves through a
+    // recovered receiver *type* rather than through a repo-wide name lookup.
+    let bare_identifier = !call.is_method_call && !call.callee_sig.starts_with("field:");
     // Section 7.3 step 1: a bare identifier that this file also binds to a local
     // or a parameter is not a free reference, so no repo-wide lookup is entitled
-    // to answer it. Only the bare-identifier shape is gated: a method or field
-    // reference resolves through a recovered receiver *type*, which a local
-    // binding of the member name cannot shadow.
-    if !call.is_method_call
-        && !call.callee_sig.starts_with("field:")
-        && locally_bound.contains(travsr_core::ident::leaf_of(&call.callee_sig))
-    {
+    // to answer it. A local binding of a member name cannot shadow a method or
+    // field reference, which is why that shape is exempt.
+    if bare_identifier && locally_bound.contains(travsr_core::ident::leaf_of(&call.callee_sig)) {
         return None;
     }
     let dst = candidate_signatures(call)
         .into_iter()
         .find_map(|sig| unique_definition(store, &sig, edge))?;
+    // #815: uniqueness across the whole corpus is the wrong scope for a bare
+    // identifier, because a name is only a name *in a language*. `set(...)` in
+    // Python is a builtin, resolved externally and carried by no repo node, yet
+    // it is the one `fn`-kind definition of that name in a Rust crate next door,
+    // so the exactly-one gate passed and the floor emitted a Python-to-Rust call
+    // edge. A genuine cross-language call is an FFI edge that the RFC-005 path
+    // resolves; the lexical floor never legitimately produces one, so refusing
+    // them here cannot lose a correct edge.
+    if bare_identifier && !same_language(store, call.src, dst) {
+        return None;
+    }
     edge_if_sound(store, call.src, dst, edge)
+}
+
+/// Whether both endpoints are written in the same language (#815).
+///
+/// Abstains when either node cannot be read: this lane is precision-first, and
+/// an unknown language is not evidence of a match.
+fn same_language(store: &SqliteStore, src: NodeId, dst: NodeId) -> bool {
+    let (Ok(Some(src_node)), Ok(Some(dst_node))) = (store.get_node(src), store.get_node(dst))
+    else {
+        return false;
+    };
+    src_node.vname.language == dst_node.vname.language
 }
 
 /// The edge kind a native call-site record resolves to. The extractor encodes a
@@ -1717,6 +1740,45 @@ mod tests {
             )
             .as_deref(),
             Some("live")
+        );
+    }
+
+    /// #815: a bare identifier means what it means *in the calling language*.
+    /// A name that is a builtin there carries no repo node of its own, so the
+    /// single same-named definition in another language passes the exactly-one
+    /// gate and the floor used to emit a wrong cross-language edge.
+    #[test]
+    fn a_bare_call_does_not_resolve_to_another_language() {
+        let mut store = store_with(&[("src/order.ts", "fn:placeOrder", "function", 10, 30)]);
+        // The graph's only `fn:set` is Rust; the caller is TypeScript.
+        let rust_set = VName::new(CORPUS, "", "src/config.rs", "rust", "fn:set");
+        let mut node = Node::new(rust_set.clone(), "function");
+        node.line = Some(5);
+        node.end_line = Some(9);
+        store.put_node(&node).expect("put_node");
+
+        let src = node_id("src/order.ts", "fn:placeOrder");
+        let out = resolve_unambiguous_lexical(
+            &mut store,
+            CORPUS,
+            "src/order.ts",
+            &[call(src, "fn:set", 18)],
+            &[],
+            &no_locals(),
+        );
+
+        assert_eq!(
+            out,
+            LiveOutcome {
+                emitted: 0,
+                pending: 1
+            }
+        );
+        assert_eq!(
+            provenance_of(&store, src, rust_set.id()),
+            None,
+            "a builtin in the caller's language must not resolve to a same-named \
+             definition in another language",
         );
     }
 
