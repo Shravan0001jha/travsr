@@ -138,8 +138,24 @@ jobs:
         run: npm test
 
   emitter-bundle:
-    name: emitter bundle (build + smoke)
-    runs-on: ubuntu-latest
+    name: emitter bundle (build + smoke) (${{ matrix.os }})
+    # release.yml runs the bundle step on all five release targets, so the
+    # script has to work on every runner OS, not just Linux. Matrixed here for
+    # the same reason `test` is: a tag build is the wrong place to discover
+    # that Git Bash on windows-latest cannot run part of the script.
+    #
+    # Do not put an `if:` on this job. A skipped matrix job reports its name
+    # with the expression un-interpolated, and release.yml's preflight matches
+    # the three rendered names with `grep -qxF`, so a skip breaks the release
+    # gate with three check names that do not exist anywhere.
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+          - windows-latest
+    runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -149,19 +165,33 @@ jobs:
         with:
           node-version: '20'
 
+      # shell: bash on the run steps below because the default on
+      # windows-latest is pwsh, which reports only the last command's exit code
+      # in a multi-line run and would let an npm failure here pass as green. It
+      # also brings `-eo pipefail`, so no `set` line is needed.
       - name: travsr-lsif-py build + test
         working-directory: packages/travsr-lsif-py
+        shell: bash
         run: |
           npm ci
-          npm audit --audit-level=high
           npm run build
           npm test
+
+      # Linux only: the audit reads the same lockfile on every runner and only
+      # esbuild's platform optionals differ, so the other two legs would buy no
+      # signal and would triple the exposure to a registry hiccup.
+      - name: Audit npm dependencies
+        if: runner.os == 'Linux'
+        working-directory: packages/travsr-lsif-py
+        shell: bash
+        run: npm audit --audit-level=high
 
       # release.yml only runs on a tag push, so before this job nothing ever
       # exercised the bundling step on a PR: a release could ship a travsr-lib
       # that did not load. The script smoke-runs both bundles from the staged
       # directory, which is the relocated layout an installed binary sees.
       - name: Bundle both emitters and smoke them
+        shell: bash
         run: bash scripts/bundle-emitters.sh dist
 
       # The bundle runs under the user's own node, so the two ways a payload
@@ -169,7 +199,10 @@ jobs:
       # glibc/libstdc++ and musl. bullseye is below every libstdc++ floor an
       # LTS distro ships and alpine is musl; the images are pulled the same way
       # install-sh-alpine already does rather than through a container: job.
+      # Linux only: both images are Linux, and the hosted macOS and Windows
+      # runners have no usable Docker daemon.
       - name: Smoke the bundle on an old glibc and on musl
+        if: runner.os == 'Linux'
         run: |
           set -euo pipefail
           for image in node:20-bullseye-slim node:20-alpine; do
