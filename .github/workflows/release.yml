@@ -140,6 +140,7 @@ jobs:
             "test (macos-latest)"
             "test (windows-latest)"
             "lsif-ts (build + test)"
+            "emitter bundle (build + smoke)"
             "MSRV (rust 1.88)"
             "cargo-deny"
             "plugin-hashes.lock"
@@ -179,6 +180,10 @@ jobs:
         # (#576, #691); checked in CI by .github/scripts/check-target-maps.mjs.
         include:
           # musl = statically linked, runs on any Linux regardless of glibc version
+          #
+          # No node_platform key: the emitter bundle that travsr-lib carries is
+          # the same bytes on every target (scripts/bundle-emitters.sh), so the
+          # matrix does not have to describe the user's node to it.
           - target: x86_64-unknown-linux-musl
             artifact: x86_64-unknown-linux-gnu
             os: ubuntu-latest
@@ -230,6 +235,15 @@ jobs:
         if: matrix.cross == true
         run: cross build --release -p travsr-cli --target ${{ matrix.target }}
 
+      - name: Set up Node (LSIF emitters)
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Bundle LSIF emitters
+        shell: bash
+        run: bash scripts/bundle-emitters.sh dist
+
       - name: Package
         shell: bash
         run: |
@@ -243,8 +257,14 @@ jobs:
           if [[ "$RUST_TARGET" == *windows* ]]; then BIN_EXT=".exe"; fi
           mkdir -p dist
           cp "target/${RUST_TARGET}/release/travsr${BIN_EXT}" "dist/travsr${BIN_EXT}"
-          tar -czf "dist/${STAGE}.tar.gz" -C dist "travsr${BIN_EXT}"
-          rm "dist/travsr${BIN_EXT}"
+          # travsr-lib carries the TypeScript/JavaScript and Python emitters,
+          # staged by the previous step. Without them those three languages
+          # resolve no emitter on an installed binary and produce no cross-file
+          # edges, which is what every published release before this did.
+          test -f "dist/travsr-lib/travsr-lsif-ts" || { echo "ERROR: emitter bundle missing" >&2; exit 1; }
+          test -f "dist/travsr-lib/travsr-lsif-py" || { echo "ERROR: emitter bundle missing" >&2; exit 1; }
+          tar -czf "dist/${STAGE}.tar.gz" -C dist "travsr${BIN_EXT}" travsr-lib
+          rm -rf "dist/travsr${BIN_EXT}" "dist/travsr-lib"
           # shasum exists on macOS+Linux but not Git Bash on windows-latest;
           # sha256sum ships with Git for Windows and on Linux runners but not macOS.
           if command -v sha256sum >/dev/null 2>&1; then
