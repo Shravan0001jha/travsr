@@ -165,10 +165,12 @@ jobs:
         with:
           node-version: '20'
 
-      # shell: bash on the run steps below because the default on
-      # windows-latest is pwsh, which reports only the last command's exit code
-      # in a multi-line run and would let an npm failure here pass as green. It
-      # also brings `-eo pipefail`, so no `set` line is needed.
+      # shell: bash on every run step that can execute on windows-latest,
+      # where the default is pwsh: pwsh reports only the last command's exit
+      # code in a multi-line run, so an npm failure here would pass as green.
+      # It also brings `-eo pipefail`, so no `set` line is needed. The docker
+      # step below is the exception, being Linux-only and already setting its
+      # own `set -euo pipefail`.
       - name: travsr-lsif-py build + test
         working-directory: packages/travsr-lsif-py
         shell: bash
@@ -177,9 +179,11 @@ jobs:
           npm run build
           npm test
 
-      # Linux only: the audit reads the same lockfile on every runner and only
-      # esbuild's platform optionals differ, so the other two legs would buy no
-      # signal and would triple the exposure to a registry hiccup.
+      # Linux only: npm audit reads the lockfile, not the installed tree, so
+      # on every runner it audits all 32 entries including the 24 @esbuild
+      # platform packages, only one of which is ever installed. The result is
+      # identical on all three legs, so the other two would buy no signal while
+      # tripling the exposure to a registry hiccup.
       - name: Audit npm dependencies
         if: runner.os == 'Linux'
         working-directory: packages/travsr-lsif-py
@@ -213,14 +217,24 @@ jobs:
             grep -q '"label":"referenceResult"' dump.lsif
           done
 
-      # tree-sitter-python is a devDependency because copy-wasm.mjs only reads
-      # a .wasm file out of it at build time (see that script). Nothing else
-      # installs this package with --omit=dev, so without this step the
-      # classification is a comment rather than a rule and the next person to
-      # add a runtime require() puts the prebuilt .node binaries back into the
-      # production tree. Runs last because it leaves node_modules prod-only.
+      # Asserts one narrow thing: the --omit=dev tree carries no native addon.
+      # That is what keeps tree-sitter-python a devDependency, since
+      # copy-wasm.mjs only reads a .wasm file out of it at build time and
+      # nothing else here installs this package with --omit=dev. It is not a
+      # check on the manifest: a runtime require() added without moving the
+      # entry back still passes, and a dependency shipping a plain executable
+      # rather than a .node (esbuild) would not be seen either.
+      #
+      # Not Linux-only like the audit above, though today that buys nothing:
+      # the prod tree is the single pure-JS web-tree-sitter and is identical
+      # on all three runners. --omit=dev does resolve per-platform optionals,
+      # so the answer can start differing by runner the moment a prod
+      # dependency ships them (sharp and swc do), and these three are every
+      # platform npm installs on in this repo anyway, since release.yml builds
+      # its five artifacts on the same three. The concrete thing it buys now
+      # is putting `find` under Git Bash on trial. Costs about a second.
+      # Runs last because it leaves node_modules prod-only.
       - name: Runtime dependencies must stay addon-free
-        if: runner.os == 'Linux'
         working-directory: packages/travsr-lsif-py
         shell: bash
         run: |
