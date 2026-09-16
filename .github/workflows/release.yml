@@ -140,6 +140,7 @@ jobs:
             "test (macos-latest)"
             "test (windows-latest)"
             "lsif-ts (build + test)"
+            "emitter bundle (build + smoke)"
             "MSRV (rust 1.88)"
             "cargo-deny"
             "plugin-hashes.lock"
@@ -180,36 +181,29 @@ jobs:
         include:
           # musl = statically linked, runs on any Linux regardless of glibc version
           #
-          # node_platform: the prebuild directory the bundled Python emitter's
-          # native addons are pruned to (scripts/bundle-emitters.sh). It names
-          # the platform the USER's node runs on, which is why both musl targets
-          # map to the glibc-built linux prebuilds: the .node files are loaded by
-          # the user's own node, not by our statically linked binary.
+          # No node_platform key: the emitter bundle that travsr-lib carries is
+          # the same bytes on every target (scripts/bundle-emitters.sh), so the
+          # matrix does not have to describe the user's node to it.
           - target: x86_64-unknown-linux-musl
             artifact: x86_64-unknown-linux-gnu
             os: ubuntu-latest
             cross: false
-            node_platform: linux-x64
           - target: aarch64-unknown-linux-musl
             artifact: aarch64-unknown-linux-gnu
             os: ubuntu-latest
             cross: true
-            node_platform: linux-arm64
           - target: x86_64-apple-darwin
             artifact: x86_64-apple-darwin
             os: macos-latest
             cross: false
-            node_platform: darwin-x64
           - target: aarch64-apple-darwin
             artifact: aarch64-apple-darwin
             os: macos-latest
             cross: false
-            node_platform: darwin-arm64
           - target: x86_64-pc-windows-msvc
             artifact: x86_64-pc-windows-msvc
             os: windows-latest
             cross: false
-            node_platform: win32-x64
     runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout
@@ -248,7 +242,7 @@ jobs:
 
       - name: Bundle LSIF emitters
         shell: bash
-        run: bash scripts/bundle-emitters.sh "${{ matrix.node_platform }}" dist
+        run: bash scripts/bundle-emitters.sh dist
 
       - name: Package
         shell: bash
