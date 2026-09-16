@@ -213,6 +213,25 @@ jobs:
             grep -q '"label":"referenceResult"' dump.lsif
           done
 
+      # tree-sitter-python is a devDependency because copy-wasm.mjs only reads
+      # a .wasm file out of it at build time (see that script). Nothing else
+      # installs this package with --omit=dev, so without this step the
+      # classification is a comment rather than a rule and the next person to
+      # add a runtime require() puts the prebuilt .node binaries back into the
+      # production tree. Runs last because it leaves node_modules prod-only.
+      - name: Runtime dependencies must stay addon-free
+        if: runner.os == 'Linux'
+        working-directory: packages/travsr-lsif-py
+        shell: bash
+        run: |
+          npm ci --omit=dev
+          found=$(find node_modules \( -name '*.node' -o -name binding.gyp \) -print)
+          if [ -n "$found" ]; then
+            echo "ERROR: the --omit=dev tree contains a native addon:" >&2
+            echo "$found" >&2
+            exit 1
+          fi
+
   msrv:
     name: MSRV (rust 1.88)
     runs-on: ubuntu-latest
