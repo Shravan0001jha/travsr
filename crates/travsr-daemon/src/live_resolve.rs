@@ -563,9 +563,6 @@ fn lexical_one(
     if bare_identifier && locally_bound.contains(travsr_core::ident::leaf_of(&call.callee_sig)) {
         return None;
     }
-    let dst = candidate_signatures(call)
-        .into_iter()
-        .find_map(|sig| unique_definition(store, &sig, edge))?;
     // #815: uniqueness across the whole corpus is the wrong scope for a bare
     // identifier, because a name is only a name *in a language*. `set(...)` in
     // Python is a builtin, resolved externally and carried by no repo node, yet
@@ -574,9 +571,19 @@ fn lexical_one(
     // edge. A genuine cross-language call is an FFI edge that the RFC-005 path
     // resolves; the lexical floor never legitimately produces one, so refusing
     // them here cannot lose a correct edge.
-    if bare_identifier && !same_language(store, call.src, dst) {
-        return None;
-    }
+    //
+    // This is a filter on the candidates rather than a test of the winner, the
+    // ordering `resolve_unresolved_calls` (E4) already uses: a foreign node
+    // sharing the name must not be counted by the uniqueness gate at all, or
+    // its mere presence suppresses the correct same-language edge.
+    let src_node = store.get_node(call.src).ok().flatten()?;
+    // E4's #I3 guard, copied: an empty language would filter every candidate
+    // away and silently drop a real call, so it degrades to unfiltered instead.
+    let language = (bare_identifier && !src_node.vname.language.is_empty())
+        .then_some(src_node.vname.language.as_str());
+    let dst = candidate_signatures(call)
+        .into_iter()
+        .find_map(|sig| unique_definition(store, &sig, edge, language))?;
     // The same collision inside one language, so #815's gate cannot see it: the
     // standard library is not in the graph, so `std::fs::write(...)` has no repo
     // node of its own, and a repo that happens to hold exactly one `fn:write`
@@ -584,10 +591,10 @@ fn lexical_one(
     // qualifier is the evidence that settles it, and the extractor already
     // carries it (`hint_crate` is `Some("fs")` here, `None` for a genuine bare
     // local call), so the fix is to spend it.
-    if bare_identifier && !hint_crate_reaches(store, call.hint_crate.as_deref(), dst) {
+    if bare_identifier && !hint_crate_reaches(call.hint_crate.as_deref(), &dst) {
         return None;
     }
-    edge_if_sound(store, call.src, dst, edge)
+    edge_if_sound(store, call.src, dst.id, edge)
 }
 
 /// Whether a qualified call's qualifier is consistent with the definition the
@@ -602,17 +609,21 @@ fn lexical_one(
 /// An unqualified call (`hint_crate` is `None`) carries no such evidence and is
 /// left to the gates around it, so a bare builtin that collides with a
 /// same-language repo definition is still out of reach here.
-///
-/// Abstains when the node cannot be read, matching [`same_language`]: this lane
-/// is precision-first, and an unreadable target is not evidence of a match.
-fn hint_crate_reaches(store: &SqliteStore, hint: Option<&str>, dst: NodeId) -> bool {
+fn hint_crate_reaches(hint: Option<&str>, dst: &travsr_core::Node) -> bool {
     let Some(hint) = hint else {
         return true;
     };
-    let Ok(Some(node)) = store.get_node(dst) else {
-        return false;
-    };
-    let path = &node.vname.path;
+    // Rust's module-relative path keywords are lowercase, so the extractor's
+    // "lowercase qualifier is a crate or module name" branch files them as a
+    // crate hint like any other. They name a position in the module tree rather
+    // than a path segment, so no definition path can ever contain one and the
+    // substring test below would abstain on every `super::`/`self::`/`crate::`
+    // call in the repo. The qualifier is real but carries no path evidence, so
+    // it is left to the gates around it exactly as a bare call is.
+    if matches!(hint, "self" | "super" | "crate") {
+        return true;
+    }
+    let path = &dst.vname.path;
     path.contains(hint) || path.contains(&hint.replace('_', "-"))
 }
 
@@ -1030,6 +1041,14 @@ fn inheritance_edge(
         return None;
     }
     let dst = unique_base_definition(store, base_name)?;
+    // #815 on this lane. `extract_unresolved_inheritance` runs for TypeScript
+    // and Python alike, so a base resolved externally in the caller's language
+    // (no repo node of its own) would otherwise bind to the one same-named
+    // class in another language's file. Inheritance never crosses a language
+    // boundary, so refusing these cannot lose a correct edge.
+    if !same_language(store, src, dst) {
+        return None;
+    }
     edge_if_sound(store, src, dst, EdgeKind::IsImplementation)
 }
 
@@ -1109,15 +1128,26 @@ fn candidate_signatures(call: &UnresolvedCall) -> Vec<String> {
 /// disambiguate". Candidates whose kind is not valid for `edge` are filtered out
 /// first, so the count is over real targets. Ambiguity abstains, which is the
 /// whole precision guarantee of section 7.3a.
-fn unique_definition(store: &SqliteStore, signature: &str, edge: EdgeKind) -> Option<NodeId> {
+///
+/// `language`, when set, scopes the candidate set to one language *before* the
+/// count is taken (#815), so a foreign node sharing the name neither wins nor
+/// suppresses the real match. Returns the node itself so the gates that follow
+/// read its path without a second point lookup.
+fn unique_definition(
+    store: &SqliteStore,
+    signature: &str,
+    edge: EdgeKind,
+    language: Option<&str>,
+) -> Option<travsr_core::Node> {
     let candidates = store.lookup_nodes_exact(signature, None).ok()?;
     let kinds = target_kinds(edge);
-    let defs: Vec<&travsr_core::Node> = candidates
-        .iter()
+    let mut defs: Vec<travsr_core::Node> = candidates
+        .into_iter()
         .filter(|n| kinds.contains(&n.kind.as_str()))
+        .filter(|n| language.map_or(true, |lang| n.vname.language == lang))
         .collect();
-    match defs.as_slice() {
-        [only] => Some(only.id),
+    match defs.len() {
+        1 => defs.pop(),
         _ => None,
     }
 }
@@ -1818,6 +1848,55 @@ mod tests {
         );
     }
 
+    /// #815's language scope is a filter on the candidates, not a test of the
+    /// winner, which is the ordering `resolve_unresolved_calls` (E4) already
+    /// uses. A foreign node sharing the name must not be counted by the
+    /// uniqueness gate: counting it made the exactly-one test fail and
+    /// suppressed the correct same-language edge, so the collision cost recall
+    /// rather than merely being excluded.
+    #[test]
+    fn a_foreign_same_named_definition_does_not_suppress_the_real_one() {
+        let mut store = store_with(&[
+            ("src/order.ts", "fn:placeOrder", "function", 10, 30),
+            // The caller's own language, and the edge this lane exists to find.
+            ("src/parse.ts", "fn:parse", "function", 1, 8),
+        ]);
+        // A same-named Python definition, unrelated and unreachable from TS.
+        let py_parse = VName::new(CORPUS, "", "src/parse.py", "python", "fn:parse");
+        let mut node = Node::new(py_parse.clone(), "function");
+        node.line = Some(1);
+        node.end_line = Some(4);
+        store.put_node(&node).expect("put_node");
+
+        let src = node_id("src/order.ts", "fn:placeOrder");
+        let out = resolve_unambiguous_lexical(
+            &mut store,
+            CORPUS,
+            "src/order.ts",
+            &[call(src, "fn:parse", 18)],
+            &[],
+            &no_locals(),
+        );
+
+        assert_eq!(
+            out,
+            LiveOutcome {
+                emitted: 1,
+                pending: 0
+            },
+        );
+        assert_eq!(
+            provenance_of(&store, src, node_id("src/parse.ts", "fn:parse")).as_deref(),
+            Some("live"),
+            "the TypeScript caller must reach the TypeScript `parse`",
+        );
+        assert_eq!(
+            provenance_of(&store, src, py_parse.id()),
+            None,
+            "and must not reach the Python one",
+        );
+    }
+
     /// The #815 collision inside one language: the standard library is not in
     /// the graph, so `std::fs::write(...)` resolves to nothing of its own, and a
     /// repo holding exactly one `fn:write` used to receive the edge. The
@@ -1889,6 +1968,59 @@ mod tests {
             Some("live"),
             "an unqualified call to the repo's own `write` must still resolve",
         );
+    }
+
+    /// `super::`, `self::` and `crate::` are lowercase, so the Rust extractor
+    /// files them under the same lowercase-qualifier branch that produces a
+    /// crate hint (`phase_b_rust.rs`). They name a position in the module tree,
+    /// never a path segment, so a path substring test can never match one and
+    /// the hint gate would abstain on every module-relative call in the repo.
+    #[test]
+    fn a_module_relative_qualifier_is_not_treated_as_a_crate_hint() {
+        for keyword in ["super", "self", "crate"] {
+            let mut store = store_with(&[]);
+            let caller = VName::new(CORPUS, "", "src/probe.rs", "rust", "fn:probe");
+            let mut node = Node::new(caller.clone(), "function");
+            node.line = Some(1);
+            node.end_line = Some(9);
+            store.put_node(&node).expect("put_node");
+            // The repo's own unique `fn:helper`, in a sibling module. No path
+            // here contains "super"/"self"/"crate".
+            let helper = VName::new(CORPUS, "", "src/sibling.rs", "rust", "fn:helper");
+            let mut node = Node::new(helper.clone(), "function");
+            node.line = Some(20);
+            node.end_line = Some(24);
+            store.put_node(&node).expect("put_node");
+
+            let src = caller.id();
+            let qualified = UnresolvedCall {
+                hint_crate: Some(keyword.to_string()),
+                ..call(src, "fn:helper", 5)
+            };
+            let out = resolve_unambiguous_lexical(
+                &mut store,
+                CORPUS,
+                "src/probe.rs",
+                &[qualified],
+                &[],
+                &no_locals(),
+            );
+
+            assert_eq!(
+                out,
+                LiveOutcome {
+                    emitted: 1,
+                    pending: 0
+                },
+                "`{keyword}::helper()` must still resolve to the repo's unique `fn:helper`",
+            );
+            assert_eq!(
+                provenance_of(&store, src, helper.id()).as_deref(),
+                Some("live"),
+                "`{keyword}::` names a module position, not a path segment, so it \
+                 must not be spent as a crate hint",
+            );
+        }
     }
 
     /// Section 7.3a's precision guarantee: two definitions sharing a signature
@@ -2833,6 +2965,51 @@ mod tests {
             )
             .as_deref(),
             Some("live"),
+        );
+    }
+
+    /// #815 on the inheritance lane, which is the same shape as the `fn:set`
+    /// call case: `extract_unresolved_inheritance` runs for both TypeScript and
+    /// Python, so a Python base that is resolved externally (stdlib or a third
+    /// party, carried by no repo node) used to bind to the one same-named class
+    /// in a TypeScript or Rust file next door. A genuine cross-language base
+    /// class does not exist; refusing them cannot lose a correct edge.
+    #[test]
+    fn a_base_in_another_language_does_not_resolve() {
+        let mut store = store_with(&[]);
+        let py_class = VName::new(CORPUS, "", "src/worker.py", "python", "class:Worker");
+        let mut node = Node::new(py_class.clone(), "class");
+        node.line = Some(3);
+        node.end_line = Some(20);
+        store.put_node(&node).expect("put_node");
+        // The graph's only `Handler`, and it is TypeScript. The Python
+        // `Handler` the class actually extends is external and has no node.
+        let ts_handler = VName::new(CORPUS, "", "src/handler.ts", "typescript", "class:Handler");
+        let mut node = Node::new(ts_handler.clone(), "class");
+        node.line = Some(1);
+        node.end_line = Some(10);
+        store.put_node(&node).expect("put_node");
+
+        let out = resolve_unambiguous_lexical(
+            &mut store,
+            CORPUS,
+            "src/worker.py",
+            &[],
+            &[inherit("Handler", 3)],
+            &no_locals(),
+        );
+
+        assert_eq!(
+            out,
+            LiveOutcome {
+                emitted: 0,
+                pending: 1
+            },
+        );
+        assert_eq!(
+            provenance_of(&store, py_class.id(), ts_handler.id()),
+            None,
+            "a Python class must not inherit from a TypeScript class",
         );
     }
 
