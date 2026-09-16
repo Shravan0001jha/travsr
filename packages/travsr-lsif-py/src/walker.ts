@@ -25,12 +25,9 @@
 
 import * as fs from 'fs';
 import * as path from 'path';
-import Parser from 'tree-sitter';
-import Python from 'tree-sitter-python';
+import { Language, Parser, type Node as SyntaxNode } from 'web-tree-sitter';
 import { Emitter } from './emitter';
 import { assertPathsContained, isUnderRoot, resolveRoot } from './security';
-
-type SyntaxNode = Parser.SyntaxNode;
 
 interface SymbolInfo {
   resultSetId: number;
@@ -72,7 +69,29 @@ const SKIP_DIRS = new Set([
   'eggs',
 ]);
 
+// web-tree-sitter types namedChildren as (Node | null)[], mirroring the C API.
+// Dropping the nulls here keeps every walk site free of a guard.
+function namedChildren(node: SyntaxNode): SyntaxNode[] {
+  return node.namedChildren.filter((c): c is SyntaxNode => c !== null);
+}
+
 // ── Public entry point ────────────────────────────────────────────────────────
+
+let parser: Parser | null = null;
+
+/**
+ * Load the tree-sitter WASM runtime and the Python grammar.  Must be awaited
+ * once before walk(); both .wasm files sit beside this file (see
+ * scripts/copy-wasm.mjs).
+ */
+export async function init(): Promise<void> {
+  if (parser !== null) return;
+  await Parser.init({ locateFile: () => path.join(__dirname, 'tree-sitter.wasm') });
+  const python = await Language.load(path.join(__dirname, 'tree-sitter-python.wasm'));
+  const p = new Parser();
+  p.setLanguage(python);
+  parser = p;
+}
 
 export function walk(rootDir: string, emitter: Emitter): void {
   const repoRoot = resolveRoot(rootDir);
@@ -101,8 +120,8 @@ export function walk(rootDir: string, emitter: Emitter): void {
   }
   emitter.emitContains(projectId, Array.from(documentIds.values()));
 
-  const parser = new Parser();
-  parser.setLanguage(Python);
+  const py = parser;
+  if (py === null) throw new Error('init() must be awaited before walk()');
 
   const defMap: DefMap = new Map();
 
@@ -115,7 +134,8 @@ export function walk(rootDir: string, emitter: Emitter): void {
     const source = safeReadFile(absPath);
     if (source === null) continue;
 
-    const tree = parser.parse(source);
+    const tree = py.parse(source);
+    if (tree === null) continue;
     const defRangeIds: number[] = [];
     visitDefs(tree.rootNode, relPath, null, docId, defMap, emitter, defRangeIds);
     emitter.emitContains(docId, defRangeIds);
@@ -130,7 +150,8 @@ export function walk(rootDir: string, emitter: Emitter): void {
     const source = safeReadFile(absPath);
     if (source === null) continue;
 
-    const tree = parser.parse(source);
+    const tree = py.parse(source);
+    if (tree === null) continue;
     const refRangeIds: number[] = [];
     const fileDir = path.dirname(relPath).replace(/\\/g, '/');
     const importTable = buildImportTable(tree.rootNode, fileDir, defMap);
@@ -233,7 +254,7 @@ function visitDefs(
   // PY-H2: guard against pathologically nested Python ASTs (e.g. deeply nested
   // class definitions in generated code) that could overflow the JS call stack.
   if (depth >= MAX_AST_DEPTH) return;
-  for (const child of node.namedChildren) {
+  for (const child of namedChildren(node)) {
     visitDefsNode(child, relPath, enclosingClass, docId, defMap, emitter, defRangeIds, depth + 1);
   }
 }
@@ -345,9 +366,9 @@ function buildImportTable(
 ): Map<string, ImportEntry> {
   const table = new Map<string, ImportEntry>();
 
-  for (const child of rootNode.namedChildren) {
+  for (const child of namedChildren(rootNode)) {
     if (child.type === 'import_statement') {
-      for (const importedNode of child.namedChildren) {
+      for (const importedNode of namedChildren(child)) {
         if (importedNode.type === 'dotted_name') {
           const modulePath = importedNode.text;
           // `import a.b.c` — only the first segment is in scope as a name.
@@ -398,13 +419,16 @@ function extractImportedNames(
 ): Array<{ localName: string; importedName: string }> {
   const results: Array<{ localName: string; importedName: string }> = [];
 
-  for (const child of importFromNode.namedChildren) {
-    if (child === moduleNameNode) continue;
+  for (const child of namedChildren(importFromNode)) {
+    // Compare by node id, not by reference: every web-tree-sitter accessor
+    // hands back a fresh wrapper, so `===` would never skip the module name
+    // and `from socket import X` would rebind `socket` itself.
+    if (child.id === moduleNameNode.id) continue;
     if (child.type === 'wildcard_import') return []; // skip *
 
     if (child.type === 'import_list') {
       // Parenthesized list: from x import (y, z)
-      for (const item of child.namedChildren) {
+      for (const item of namedChildren(child)) {
         const entry = extractSingleName(item);
         if (entry) results.push(entry);
       }
@@ -506,7 +530,7 @@ function visitRefs(
       ? (node.childForFieldName('name')?.text ?? enclosingClass)
       : enclosingClass;
 
-  for (const child of node.namedChildren) {
+  for (const child of namedChildren(node)) {
     visitRefs(
       child,
       docId,
@@ -548,7 +572,7 @@ function buildLocalTypes(
         }
       }
     }
-    for (const child of node.namedChildren) visit(child, depth + 1);
+    for (const child of namedChildren(node)) visit(child, depth + 1);
   };
   visit(rootNode);
   return types;
