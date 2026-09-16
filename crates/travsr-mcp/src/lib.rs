@@ -49,6 +49,14 @@ pub use tools::phase_b_degraded_note;
 // only be checked from that side; without it a future edit to the daemon's list
 // silently widens `find_pattern` past the graph's file set.
 pub use tools::SKIP_DIRS;
+// SEC-002: exported so `travsr-daemon`'s control socket applies the same
+// argument guard the MCP tools do. The socket takes a caller-supplied `file`
+// and joins it onto the repo root, which is the case this validator exists for;
+// a second copy of it in the daemon would be one more place for the two to
+// drift apart. The daemon joins the path verbatim (never URL-decoded), so it
+// uses the file variant, which keeps every containment guard but allows the `%`
+// that is legal in a real filename.
+pub use sanitize::validate_mcp_file_arg;
 // RFC-021 P5: model distribution. The daemon auto-fetches on warm; the
 // `travsr rerank` CLI subcommand drives the same install path. The rest of
 // `rerank` stays private (query-path internals).
