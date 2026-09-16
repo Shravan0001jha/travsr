@@ -32,7 +32,7 @@
 
 use travsr_core::{Edge, EdgeKind, InheritanceRef, NodeId, UnresolvedCall};
 use travsr_ipc::message::{LiveResolution, LiveResolutionTarget};
-use travsr_store::{SqliteStore, Store};
+use travsr_store::{SqliteStore, Store, NODE_EXACT_LOOKUP_LIMIT};
 
 /// What one live-resolution pass did, for logging and the Phase 3 precision
 /// meter. `pending` is not a failure: it is the fail-closed path working.
@@ -552,9 +552,14 @@ fn lexical_one(
     locally_bound: &std::collections::HashSet<String>,
 ) -> Option<Edge> {
     let edge = lexical_edge_kind(call);
-    // A bare free-function or constructor call: the two gates below apply to
-    // this shape only, because a method or field reference resolves through a
-    // recovered receiver *type* rather than through a repo-wide name lookup.
+    // A bare free-function or constructor call. The local-binding and qualifier
+    // gates below apply to this shape only: a local binding of a member name
+    // cannot shadow a member reference, and a method call carries no crate
+    // qualifier to spend. The language scope is *not* one of those two, because
+    // a method reference is resolved by a repo-wide exact-signature lookup just
+    // like a bare one: `candidate_signatures` builds `method:{recv}.{leaf}`, so
+    // the recovered receiver type narrows the signature string, never the search
+    // scope, and a lone same-named definition in another language wins it.
     let bare_identifier = !call.is_method_call && !call.callee_sig.starts_with("field:");
     // Section 7.3 step 1: a bare identifier that this file also binds to a local
     // or a parameter is not a free reference, so no repo-wide lookup is entitled
@@ -579,8 +584,8 @@ fn lexical_one(
     let src_node = store.get_node(call.src).ok().flatten()?;
     // E4's #I3 guard, copied: an empty language would filter every candidate
     // away and silently drop a real call, so it degrades to unfiltered instead.
-    let language = (bare_identifier && !src_node.vname.language.is_empty())
-        .then_some(src_node.vname.language.as_str());
+    let language =
+        (!src_node.vname.language.is_empty()).then_some(src_node.vname.language.as_str());
     let dst = candidate_signatures(call)
         .into_iter()
         .find_map(|sig| unique_definition(store, &sig, edge, language))?;
@@ -609,6 +614,18 @@ fn lexical_one(
 /// An unqualified call (`hint_crate` is `None`) carries no such evidence and is
 /// left to the gates around it, so a bare builtin that collides with a
 /// same-language repo definition is still out of reach here.
+///
+/// The test is on whole path segments. A raw substring match failed open on
+/// every short std qualifier: `fs` is a substring of `fsck.rs`, `io` of
+/// `actions.rs`, and the gate waved through the exact false edge it exists to
+/// stop.
+///
+/// It is still a *path* test, so it abstains on a module whose name is not in
+/// its file path: an inline `mod helpers` in `main.rs`, or a `#[path = ...]`
+/// module, loses its live edge until the next commit ratifies it. Locating
+/// those needs the module tree rather than the path string, which this lane
+/// does not have; the gap is recorded rather than papered over, the same way
+/// the bare-builtin gap above is.
 fn hint_crate_reaches(hint: Option<&str>, dst: &travsr_core::Node) -> bool {
     let Some(hint) = hint else {
         return true;
@@ -623,20 +640,15 @@ fn hint_crate_reaches(hint: Option<&str>, dst: &travsr_core::Node) -> bool {
     if matches!(hint, "self" | "super" | "crate") {
         return true;
     }
-    let path = &dst.vname.path;
-    path.contains(hint) || path.contains(&hint.replace('_', "-"))
-}
-
-/// Whether both endpoints are written in the same language (#815).
-///
-/// Abstains when either node cannot be read: this lane is precision-first, and
-/// an unknown language is not evidence of a match.
-fn same_language(store: &SqliteStore, src: NodeId, dst: NodeId) -> bool {
-    let (Ok(Some(src_node)), Ok(Some(dst_node))) = (store.get_node(src), store.get_node(dst))
-    else {
-        return false;
-    };
-    src_node.vname.language == dst_node.vname.language
+    // A qualifier names one segment of the path (a crate directory, a module
+    // file, or a module directory), so compare it against segments rather than
+    // against the whole string. Cargo renders an underscore in a crate name as a
+    // hyphen in its directory, which is the one equivalence worth keeping.
+    let dashed = hint.replace('_', "-");
+    dst.vname
+        .path
+        .split(['/', '.'])
+        .any(|seg| seg == hint || seg == dashed)
 }
 
 /// The edge kind a native call-site record resolves to. The extractor encodes a
@@ -1040,15 +1052,22 @@ fn inheritance_edge(
     if locally_bound.contains(base_name) {
         return None;
     }
-    let dst = unique_base_definition(store, base_name)?;
     // #815 on this lane. `extract_unresolved_inheritance` runs for TypeScript
     // and Python alike, so a base resolved externally in the caller's language
     // (no repo node of its own) would otherwise bind to the one same-named
     // class in another language's file. Inheritance never crosses a language
     // boundary, so refusing these cannot lose a correct edge.
-    if !same_language(store, src, dst) {
-        return None;
-    }
+    //
+    // Scoped as a filter on the candidates, not a test of the winner, for the
+    // same reason the call floor is: a foreign same-named class counted by the
+    // uniqueness gate makes it fail and suppresses the correct same-language
+    // base, so a collision would cost recall rather than merely be excluded.
+    let src_node = store.get_node(src).ok().flatten()?;
+    // E4's #I3 guard, copied: an empty language degrades to unfiltered rather
+    // than filtering every candidate away.
+    let language =
+        (!src_node.vname.language.is_empty()).then_some(src_node.vname.language.as_str());
+    let dst = unique_base_definition(store, base_name, language)?;
     edge_if_sound(store, src, dst, EdgeKind::IsImplementation)
 }
 
@@ -1060,7 +1079,14 @@ fn inheritance_edge(
 /// nodes, and requires exactly one match across all of them. Two definitions of
 /// the same name — the cross-file ambiguity the editor's provider exists for —
 /// abstain rather than guess, the same precision guarantee as the call floor.
-fn unique_base_definition(store: &SqliteStore, base_name: &str) -> Option<NodeId> {
+///
+/// `language` scopes the candidates before the count, and a truncated window
+/// abstains, both for the reasons [`unique_definition`] gives.
+fn unique_base_definition(
+    store: &SqliteStore,
+    base_name: &str,
+    language: Option<&str>,
+) -> Option<NodeId> {
     let kinds = target_kinds(EdgeKind::IsImplementation);
     let mut found: Option<NodeId> = None;
     for kind in kinds {
@@ -1068,8 +1094,14 @@ fn unique_base_definition(store: &SqliteStore, base_name: &str) -> Option<NodeId
         let Ok(nodes) = store.lookup_nodes_exact(&sig, None) else {
             continue;
         };
+        if truncated(&nodes) {
+            return None;
+        }
         for n in nodes {
             if !kinds.contains(&n.kind.as_str()) {
+                continue;
+            }
+            if language.is_some_and(|lang| n.vname.language != lang) {
                 continue;
             }
             match found {
@@ -1120,6 +1152,20 @@ fn candidate_signatures(call: &UnresolvedCall) -> Vec<String> {
     sigs
 }
 
+/// Whether a candidate window came back full, meaning rows were withheld.
+///
+/// [`NODE_EXACT_LOOKUP_LIMIT`]'s own contract is that a full window proves at
+/// least one definition was withheld, and every uniqueness gate in this module
+/// narrows the window further (by kind, and by language since #815). Narrowing
+/// a sample cannot establish uniqueness over the set it was sampled from: two
+/// Rust `fn:run` definitions behind sixty same-signature TypeScript ones put
+/// exactly one Rust row in the window, and the language filter then read it as
+/// unambiguous. The set size is unknowable from here, so the honest answer is
+/// to abstain, which is this lane's policy for everything it cannot settle.
+fn truncated(candidates: &[travsr_core::Node]) -> bool {
+    candidates.len() >= NODE_EXACT_LOOKUP_LIMIT
+}
+
 /// The single node named by `signature` and valid as a `edge` target, or `None`
 /// when there are zero or more than one.
 ///
@@ -1133,6 +1179,11 @@ fn candidate_signatures(call: &UnresolvedCall) -> Vec<String> {
 /// count is taken (#815), so a foreign node sharing the name neither wins nor
 /// suppresses the real match. Returns the node itself so the gates that follow
 /// read its path without a second point lookup.
+///
+/// Every filter here runs on the returned window, not on the full set, so a
+/// truncated window is refused up front by [`truncated`]: narrowing an
+/// incomplete sample is how a "unique" match gets manufactured out of a
+/// genuinely ambiguous name.
 fn unique_definition(
     store: &SqliteStore,
     signature: &str,
@@ -1140,6 +1191,9 @@ fn unique_definition(
     language: Option<&str>,
 ) -> Option<travsr_core::Node> {
     let candidates = store.lookup_nodes_exact(signature, None).ok()?;
+    if truncated(&candidates) {
+        return None;
+    }
     let kinds = target_kinds(edge);
     let mut defs: Vec<travsr_core::Node> = candidates
         .into_iter()
@@ -1894,6 +1948,257 @@ mod tests {
             provenance_of(&store, src, py_parse.id()),
             None,
             "and must not reach the Python one",
+        );
+    }
+
+    /// The candidate window is capped at [`NODE_EXACT_LOOKUP_LIMIT`] rows, and
+    /// that constant's own contract says a full window means at least one
+    /// definition was withheld. Every filter in `unique_definition` runs on the
+    /// window rather than on the full set, so narrowing a truncated sample can
+    /// leave exactly one row standing and manufacture a confident match the
+    /// untruncated set would have refused as ambiguous.
+    ///
+    /// Two Rust `fn:run` definitions exist, so the honest answer is "ambiguous,
+    /// abstain". Enough same-signature TypeScript definitions are present to
+    /// fill the window and push one of the two Rust rows out of it, at which
+    /// point the language filter sees a single Rust candidate.
+    #[test]
+    fn a_truncated_candidate_window_abstains_rather_than_inventing_a_unique_match() {
+        let mut store = store_with(&[]);
+        let caller = VName::new(CORPUS, "", "src/probe.rs", "rust", "fn:probe");
+        let mut node = Node::new(caller.clone(), "function");
+        node.line = Some(1);
+        node.end_line = Some(9);
+        store.put_node(&node).expect("put_node");
+
+        // The genuine ambiguity: two Rust definitions of the same name.
+        for path in ["src/alpha.rs", "src/beta.rs"] {
+            let vname = VName::new(CORPUS, "", path, "rust", "fn:run");
+            let mut node = Node::new(vname, "function");
+            node.line = Some(2);
+            node.end_line = Some(6);
+            store.put_node(&node).expect("put_node");
+        }
+        // Same-signature noise in another language, enough of it to overflow
+        // the lookup's row cap. The count is chosen from the observed window:
+        // at 60 the hash-ordered `LIMIT` admits exactly one of the two Rust
+        // rows, which is the state that makes a truncated sample look unique.
+        for i in 0..60 {
+            let vname = VName::new(CORPUS, "", format!("src/n{i}.ts"), "typescript", "fn:run");
+            let mut node = Node::new(vname, "function");
+            node.line = Some(2);
+            node.end_line = Some(6);
+            store.put_node(&node).expect("put_node");
+        }
+
+        let src = caller.id();
+        let out = resolve_unambiguous_lexical(
+            &mut store,
+            CORPUS,
+            "src/probe.rs",
+            &[call(src, "fn:run", 5)],
+            &[],
+            &no_locals(),
+        );
+
+        assert_eq!(
+            out,
+            LiveOutcome {
+                emitted: 0,
+                pending: 1
+            },
+            "a full candidate window withheld rows, so uniqueness is unknowable \
+             and the lane must abstain",
+        );
+    }
+
+    /// #815's recall half on the inheritance lane. The call lane moved from
+    /// testing the winner to filtering the candidates precisely because a
+    /// foreign same-named node must not be counted by the uniqueness gate at
+    /// all: counting it makes the gate fail and suppresses the correct
+    /// same-language edge, so a collision costs recall rather than merely being
+    /// excluded. The base lane has the same shape and the same obligation.
+    #[test]
+    fn a_foreign_same_named_base_does_not_suppress_the_real_one() {
+        let mut store = store_with(&[]);
+        let py_class = VName::new(CORPUS, "", "src/worker.py", "python", "class:Worker");
+        let mut node = Node::new(py_class.clone(), "class");
+        node.line = Some(3);
+        node.end_line = Some(20);
+        store.put_node(&node).expect("put_node");
+        // The base the Python class actually extends.
+        let py_handler = VName::new(CORPUS, "", "src/handler.py", "python", "class:Handler");
+        let mut node = Node::new(py_handler.clone(), "class");
+        node.line = Some(1);
+        node.end_line = Some(10);
+        store.put_node(&node).expect("put_node");
+        // A same-named TypeScript class, unrelated and unreachable from Python.
+        let ts_handler = VName::new(CORPUS, "", "src/handler.ts", "typescript", "class:Handler");
+        let mut node = Node::new(ts_handler.clone(), "class");
+        node.line = Some(1);
+        node.end_line = Some(10);
+        store.put_node(&node).expect("put_node");
+
+        let out = resolve_unambiguous_lexical(
+            &mut store,
+            CORPUS,
+            "src/worker.py",
+            &[],
+            &[inherit("Handler", 3)],
+            &no_locals(),
+        );
+
+        assert_eq!(
+            out,
+            LiveOutcome {
+                emitted: 1,
+                pending: 0
+            },
+        );
+        assert_eq!(
+            provenance_of(&store, py_class.id(), py_handler.id()).as_deref(),
+            Some("live"),
+            "the Python class must reach the Python base",
+        );
+        assert_eq!(
+            provenance_of(&store, py_class.id(), ts_handler.id()),
+            None,
+            "and must not reach the TypeScript one",
+        );
+    }
+
+    /// #815 is not confined to the bare-identifier shape. A method call resolves
+    /// through `method:{recv}.{leaf}`, which is still a repo-wide exact-signature
+    /// lookup: the recovered receiver type narrows the *string*, not the search
+    /// scope. A Rust `cfg.get()` therefore reached a lone Python
+    /// `method:Config.get`, the same wrong cross-language edge by a different
+    /// route.
+    #[test]
+    fn a_method_call_does_not_resolve_to_another_language() {
+        let mut store = store_with(&[]);
+        let caller = VName::new(CORPUS, "", "src/probe.rs", "rust", "fn:probe");
+        let mut node = Node::new(caller.clone(), "function");
+        node.line = Some(1);
+        node.end_line = Some(9);
+        store.put_node(&node).expect("put_node");
+        // The graph's only `Config.get`, and it is Python. The Rust one the call
+        // actually names is external and carries no repo node.
+        let py_get = VName::new(CORPUS, "", "src/config.py", "python", "method:Config.get");
+        let mut node = Node::new(py_get.clone(), "method");
+        node.line = Some(12);
+        node.end_line = Some(14);
+        store.put_node(&node).expect("put_node");
+
+        let src = caller.id();
+        let method_call = UnresolvedCall {
+            is_method_call: true,
+            recv_type: Some("Config".to_string()),
+            ..call(src, "fn:get", 5)
+        };
+        let out = resolve_unambiguous_lexical(
+            &mut store,
+            CORPUS,
+            "src/probe.rs",
+            &[method_call],
+            &[],
+            &no_locals(),
+        );
+
+        assert_eq!(
+            out,
+            LiveOutcome {
+                emitted: 0,
+                pending: 1
+            },
+        );
+        assert_eq!(
+            provenance_of(&store, src, py_get.id()),
+            None,
+            "a Rust method call must not resolve to a Python method",
+        );
+    }
+
+    /// The qualifier gate compared the hint against the whole path as a raw
+    /// substring, so a short std qualifier matched a path that merely contains
+    /// its letters: `std::fs::write(...)` passed the gate against a definition in
+    /// `fsck.rs` and still minted the false edge the gate exists to stop. A
+    /// qualifier names a path segment, so it must be matched as one.
+    #[test]
+    fn a_qualifier_must_match_a_whole_path_segment() {
+        let mut store = store_with(&[]);
+        let caller = VName::new(CORPUS, "", "src/probe.rs", "rust", "fn:probe");
+        let mut node = Node::new(caller.clone(), "function");
+        node.line = Some(1);
+        node.end_line = Some(9);
+        store.put_node(&node).expect("put_node");
+        // "fsck" contains "fs", but the repo has no `fs` module here.
+        let local_write = VName::new(CORPUS, "", "src/fsck.rs", "rust", "fn:write");
+        let mut node = Node::new(local_write.clone(), "function");
+        node.line = Some(20);
+        node.end_line = Some(24);
+        store.put_node(&node).expect("put_node");
+
+        let src = caller.id();
+        let qualified = UnresolvedCall {
+            hint_crate: Some("fs".to_string()),
+            ..call(src, "fn:write", 5)
+        };
+        let out = resolve_unambiguous_lexical(
+            &mut store,
+            CORPUS,
+            "src/probe.rs",
+            &[qualified],
+            &[],
+            &no_locals(),
+        );
+
+        assert_eq!(
+            out,
+            LiveOutcome {
+                emitted: 0,
+                pending: 1
+            },
+        );
+        assert_eq!(
+            provenance_of(&store, src, local_write.id()),
+            None,
+            "`fsck` is not the `fs` module, so the qualifier must not reach it",
+        );
+
+        // Positive control: a definition that really does sit in an `fs` module
+        // segment must still resolve, or the tightening is recall loss.
+        let mut store = store_with(&[]);
+        let caller = VName::new(CORPUS, "", "src/probe.rs", "rust", "fn:probe");
+        let mut node = Node::new(caller.clone(), "function");
+        node.line = Some(1);
+        node.end_line = Some(9);
+        store.put_node(&node).expect("put_node");
+        let real_fs = VName::new(CORPUS, "", "src/fs/mod.rs", "rust", "fn:write");
+        let mut node = Node::new(real_fs.clone(), "function");
+        node.line = Some(20);
+        node.end_line = Some(24);
+        store.put_node(&node).expect("put_node");
+
+        let src = caller.id();
+        let qualified = UnresolvedCall {
+            hint_crate: Some("fs".to_string()),
+            ..call(src, "fn:write", 5)
+        };
+        let out = resolve_unambiguous_lexical(
+            &mut store,
+            CORPUS,
+            "src/probe.rs",
+            &[qualified],
+            &[],
+            &no_locals(),
+        );
+        assert_eq!(
+            out,
+            LiveOutcome {
+                emitted: 1,
+                pending: 0
+            },
+            "a real `fs` path segment must still satisfy the qualifier",
         );
     }
 
