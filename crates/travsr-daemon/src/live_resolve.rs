@@ -577,7 +577,43 @@ fn lexical_one(
     if bare_identifier && !same_language(store, call.src, dst) {
         return None;
     }
+    // The same collision inside one language, so #815's gate cannot see it: the
+    // standard library is not in the graph, so `std::fs::write(...)` has no repo
+    // node of its own, and a repo that happens to hold exactly one `fn:write`
+    // passed the exactly-one gate and got a wrong `ref/call` edge to it. The
+    // qualifier is the evidence that settles it, and the extractor already
+    // carries it (`hint_crate` is `Some("fs")` here, `None` for a genuine bare
+    // local call), so the fix is to spend it.
+    if bare_identifier && !hint_crate_reaches(store, call.hint_crate.as_deref(), dst) {
+        return None;
+    }
     edge_if_sound(store, call.src, dst, edge)
+}
+
+/// Whether a qualified call's qualifier is consistent with the definition the
+/// uniqueness gate picked.
+///
+/// The same path test `resolve_unresolved_calls` applies to its own candidates,
+/// which is why Phase B never mints these edges, reused here so the live floor
+/// refuses what the ratified path already refuses. Measured on the #813
+/// recovery harness: recovery holds at 2140 (lexical) and 2177 (oracle) of
+/// R=2189, unchanged, while the five collision edges go.
+///
+/// An unqualified call (`hint_crate` is `None`) carries no such evidence and is
+/// left to the gates around it, so a bare builtin that collides with a
+/// same-language repo definition is still out of reach here.
+///
+/// Abstains when the node cannot be read, matching [`same_language`]: this lane
+/// is precision-first, and an unreadable target is not evidence of a match.
+fn hint_crate_reaches(store: &SqliteStore, hint: Option<&str>, dst: NodeId) -> bool {
+    let Some(hint) = hint else {
+        return true;
+    };
+    let Ok(Some(node)) = store.get_node(dst) else {
+        return false;
+    };
+    let path = &node.vname.path;
+    path.contains(hint) || path.contains(&hint.replace('_', "-"))
 }
 
 /// Whether both endpoints are written in the same language (#815).
@@ -1779,6 +1815,79 @@ mod tests {
             None,
             "a builtin in the caller's language must not resolve to a same-named \
              definition in another language",
+        );
+    }
+
+    /// The #815 collision inside one language: the standard library is not in
+    /// the graph, so `std::fs::write(...)` resolves to nothing of its own, and a
+    /// repo holding exactly one `fn:write` used to receive the edge. The
+    /// qualifier the extractor carries (`hint_crate`) is what refuses it, and
+    /// the same call written bare must still resolve or this is recall loss,
+    /// not a fix.
+    #[test]
+    fn a_qualified_call_does_not_resolve_to_an_unrelated_same_named_definition() {
+        let mut store = store_with(&[]);
+        // Both ends Rust, so #815's same-language gate cannot see this one.
+        let caller = VName::new(CORPUS, "", "src/probe.rs", "rust", "fn:probe");
+        let mut node = Node::new(caller.clone(), "function");
+        node.line = Some(1);
+        node.end_line = Some(9);
+        store.put_node(&node).expect("put_node");
+        // The repo's own `write`, the graph's only `fn:write`.
+        let local_write = VName::new(CORPUS, "", "src/logfile.rs", "rust", "fn:write");
+        let mut node = Node::new(local_write.clone(), "function");
+        node.line = Some(20);
+        node.end_line = Some(24);
+        store.put_node(&node).expect("put_node");
+
+        let src = caller.id();
+        let qualified = UnresolvedCall {
+            hint_crate: Some("fs".to_string()),
+            ..call(src, "fn:write", 5)
+        };
+        let out = resolve_unambiguous_lexical(
+            &mut store,
+            CORPUS,
+            "src/probe.rs",
+            &[qualified],
+            &[],
+            &no_locals(),
+        );
+
+        assert_eq!(
+            out,
+            LiveOutcome {
+                emitted: 0,
+                pending: 1
+            }
+        );
+        assert_eq!(
+            provenance_of(&store, src, local_write.id()),
+            None,
+            "`std::fs::write` must not resolve to the repo's own unique `fn:write`",
+        );
+
+        // Negative control: the same name called bare carries no qualifier and
+        // is exactly the edge this lane exists to recover.
+        let out = resolve_unambiguous_lexical(
+            &mut store,
+            CORPUS,
+            "src/probe.rs",
+            &[call(src, "fn:write", 6)],
+            &[],
+            &no_locals(),
+        );
+        assert_eq!(
+            out,
+            LiveOutcome {
+                emitted: 1,
+                pending: 0
+            }
+        );
+        assert_eq!(
+            provenance_of(&store, src, local_write.id()).as_deref(),
+            Some("live"),
+            "an unqualified call to the repo's own `write` must still resolve",
         );
     }
 
