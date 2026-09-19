@@ -1,22 +1,30 @@
-<div align="center">
+<p align="center">
+  <a href="https://travsr.com"><img src="docs/assets/logo.svg" width="180" height="180" alt="Travsr"/></a>
+</p>
 
-<img src="docs/assets/logo.png" alt="Travsr" width="96" height="96">
+<h1 align="center">travsr</h1>
 
-# travsr
+<p align="center"><b>The code graph that lives next to git.</b></p>
 
-**The code graph that lives next to git.**
+<p align="center">
+  <a href="https://github.com/Travsr-com/travsr/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/Travsr-com/travsr/ci.yml?branch=master&style=flat-square&logo=githubactions&logoColor=white&label=CI" alt="CI"/></a>
+  <a href="https://github.com/Travsr-com/travsr/releases/latest"><img src="https://img.shields.io/github/v/release/Travsr-com/travsr?style=flat-square&logo=github&label=release&color=blue" alt="Latest release"/></a>
+  <a href="https://www.npmjs.com/package/@travsr.com/travsr"><img src="https://img.shields.io/npm/v/%40travsr.com%2Ftravsr?style=flat-square&logo=npm&logoColor=white&label=npm" alt="npm"/></a>
+  <a href="https://marketplace.visualstudio.com/items?itemName=travsr.travsr-vscode"><img src="https://img.shields.io/badge/vs%20code-extension-007ACC?style=flat-square&logo=visualstudiocode&logoColor=white" alt="VS Code extension"/></a>
+  <a href="#build-from-source"><img src="https://img.shields.io/badge/rust-1.88%2B-B7410E?style=flat-square&logo=rust&logoColor=white" alt="Rust 1.88+"/></a>
+  <a href="https://modelcontextprotocol.io"><img src="https://img.shields.io/badge/MCP-stdio%20%2B%20SSE-1f6feb?style=flat-square" alt="MCP"/></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-blue?style=flat-square" alt="Apache 2.0"/></a>
+</p>
 
-[![CI](https://img.shields.io/github/actions/workflow/status/Travsr-com/travsr/ci.yml?branch=master&style=flat-square&logo=githubactions&logoColor=white&label=CI)](https://github.com/Travsr-com/travsr/actions/workflows/ci.yml)
-[![Release](https://img.shields.io/github/v/release/Travsr-com/travsr?style=flat-square&logo=github&label=release&color=blue)](https://github.com/Travsr-com/travsr/releases/latest)
-[![npm](https://img.shields.io/npm/v/%40travsr.com%2Ftravsr?style=flat-square&logo=npm&logoColor=white&label=npm)](https://www.npmjs.com/package/@travsr.com/travsr)
-[![VS Code extension](https://img.shields.io/badge/vs%20code-extension-007ACC?style=flat-square&logo=visualstudiocode&logoColor=white)](https://marketplace.visualstudio.com/items?itemName=travsr.travsr-vscode)
-[![Rust](https://img.shields.io/badge/rust-1.88%2B-B7410E?style=flat-square&logo=rust&logoColor=white)](#build-from-source)
-[![MCP](https://img.shields.io/badge/MCP-stdio%20%2B%20SSE-1f6feb?style=flat-square)](https://modelcontextprotocol.io)
-[![License](https://img.shields.io/badge/license-Apache--2.0-blue?style=flat-square)](LICENSE)
-
-[Quickstart](#quickstart) · [MCP tools](#mcp-tools) · [CLI](#cli-commands) · [VS Code](#vs-code-extension) · [How it works](#how-it-works) · [Security](SECURITY.md) · [Changelog](CHANGELOG.md)
-
-</div>
+<p align="center">
+  <a href="#quickstart">Quickstart</a> ·
+  <a href="#mcp-tools">MCP tools</a> ·
+  <a href="#cli-commands">CLI</a> ·
+  <a href="#vs-code-extension">VS Code</a> ·
+  <a href="#how-it-works">How it works</a> ·
+  <a href="SECURITY.md">Security</a> ·
+  <a href="CHANGELOG.md">Changelog</a>
+</p>
 
 > Source code is a deterministic graph, not unstructured text. Travsr builds
 > that graph on every commit and exposes it via MCP so AI agents traverse real
