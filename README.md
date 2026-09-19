@@ -1,16 +1,33 @@
+<div align="center">
+
+<img src="docs/assets/logo.png" alt="Travsr" width="96" height="96">
+
 # travsr
 
 **The code graph that lives next to git.**
+
+[![CI](https://img.shields.io/github/actions/workflow/status/Travsr-com/travsr/ci.yml?branch=master&style=flat-square&logo=githubactions&logoColor=white&label=CI)](https://github.com/Travsr-com/travsr/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/Travsr-com/travsr?style=flat-square&logo=github&label=release&color=blue)](https://github.com/Travsr-com/travsr/releases/latest)
+[![npm](https://img.shields.io/npm/v/%40travsr.com%2Ftravsr?style=flat-square&logo=npm&logoColor=white&label=npm)](https://www.npmjs.com/package/@travsr.com/travsr)
+[![VS Code extension](https://img.shields.io/badge/vs%20code-extension-007ACC?style=flat-square&logo=visualstudiocode&logoColor=white)](https://marketplace.visualstudio.com/items?itemName=travsr.travsr-vscode)
+[![Rust](https://img.shields.io/badge/rust-1.88%2B-B7410E?style=flat-square&logo=rust&logoColor=white)](#build-from-source)
+[![MCP](https://img.shields.io/badge/MCP-stdio%20%2B%20SSE-1f6feb?style=flat-square)](https://modelcontextprotocol.io)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue?style=flat-square)](LICENSE)
+
+[Quickstart](#quickstart) · [MCP tools](#mcp-tools) · [CLI](#cli-commands) · [VS Code](#vs-code-extension) · [How it works](#how-it-works) · [Security](SECURITY.md) · [Changelog](CHANGELOG.md)
+
+</div>
 
 > Source code is a deterministic graph, not unstructured text. Travsr builds
 > that graph on every commit and exposes it via MCP so AI agents traverse real
 > edges instead of guessing from vector chunks.
 
-[![CI](https://github.com/Travsr-com/travsr/actions/workflows/ci.yml/badge.svg)](https://github.com/Travsr-com/travsr/actions/workflows/ci.yml)
-[![Bench](https://github.com/Travsr-com/travsr/actions/workflows/bench.yml/badge.svg)](https://github.com/Travsr-com/travsr/actions/workflows/bench.yml)
-[![Phase 2 Exit](https://github.com/Travsr-com/travsr/actions/workflows/phase2-exit.yml/badge.svg)](https://github.com/Travsr-com/travsr/actions/workflows/phase2-exit.yml)
-[![npm](https://img.shields.io/npm/v/%40travsr.com%2Ftravsr)](https://www.npmjs.com/package/@travsr.com/travsr)
-[![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
+## Why travsr
+
+- **Graph, not chunks.** Tree-sitter and LSIF build real call, import and reference edges, so an answer names the callers rather than the files that read similarly.
+- **Always fresh.** A post-commit hook and a file watcher re-index only what changed, so the graph tracks HEAD instead of the last time someone rebuilt an index.
+- **Local by default.** The graph is a SQLite file in your repo. Nothing leaves the machine unless you opt in.
+- **Works with the tools you already use.** One MCP server serves Claude, Cursor, Copilot, Cline, Continue and Zed, across every repo you have indexed.
 
 ---
 
