@@ -35,7 +35,7 @@
 - **Graph, not chunks.** Tree-sitter and LSIF build real call, import and reference edges, so an answer names the callers rather than the files that read similarly.
 - **Always fresh.** A post-commit hook and a file watcher re-index only what changed, so the graph tracks HEAD instead of the last time someone rebuilt an index.
 - **Local by default.** The graph is a SQLite file in your repo. Nothing leaves the machine unless you opt in.
-- **Works with the tools you already use.** One MCP server serves Claude, Cursor, Copilot, Cline, Continue and Zed, across every repo you have indexed.
+- **Works with the tools you already use.** One MCP server serves every repo you have indexed, and `travsr connect` wires up Claude Code, Cursor, VS Code Copilot, Codex, Gemini CLI, Windsurf, Zed and Antigravity for you.
 
 ---
 
@@ -108,8 +108,7 @@ The channels move independently, so `beta` can be newer than `rc` in content
 while sorting below it under semver. `v1.0.0-beta.2` was a fresh build cut
 after `v1.0.0-rc.1` rather than a promotion of it, and `v1.0.0` was promoted
 from that beta rather than from rc.1, so the stable bits are the ones the beta
-channel tested. `travsr --version` reports the tag base plus the commit it was
-built from, which is what tells two builds apart.
+channel tested. `travsr --version` reports the bare version, for example `1.1.1`.
 
 ---
 
@@ -303,15 +302,19 @@ travsr connect                       Detect installed AI coding tools and wire e
 travsr connect --print               Show what connect would write, without touching the filesystem
 travsr connect --remove              Undo a previous connect run
 travsr daemon start/stop/status      Start, stop, or check the background daemon
+travsr daemon restart                Stop the running daemon and start a fresh one
+travsr daemon stop-embed             Pause background embedding (resume-embed to undo)
 travsr daemon logs                   Print daemon log entries (--follow, --level, --since, --json)
 travsr daemon lsp                    Show the last diagnostics overlay the editor extension reported
-travsr repos                         List all globally registered repos
+travsr repos                         List registered repos (--json, --prune, --remove <name>)
 travsr status                        Show node/edge counts, schema version, last-indexed SHA
 travsr fsck                          Report ghost nodes and orphan edges (add --fix to repair)
-travsr config get/set <key>          Inspect or set a layered config key (global, or --repo for this repo)
+travsr config get/set/unset <key>    Inspect or change a layered config key (global, or --repo for this repo)
+travsr config list                   Every registered config key, its value, and where it came from
 travsr ask <query>                   Graph-grounded answer for a question, or a bare symbol name
 travsr ask --examples                What you can ask, with runnable examples from your own index
 travsr ask --cmds                    Every command travsr supports, grouped by what it is for
+travsr explain <symbol>              Why a query scored the way it did: a diagnostic for tuning search
 travsr references <symbol>           Every use site of a symbol as path:line (add --format json)
 travsr pattern <regex>               Graph-scoped text search for what the graph does not model
 travsr index                         Index without installing hooks or registering the repo
@@ -320,8 +323,9 @@ travsr graph --all                   Show graph for the entire indexed repositor
 travsr mcp --stdio                   Start the MCP stdio server (single-repo, cwd-based)
 travsr mcp --stdio --global          Start the MCP stdio server (all registered repos)
 travsr mcp --stdio --db <path>       Start the MCP stdio server (explicit db path)
+travsr serve                         Serve MCP over HTTP/SSE with bearer-token auth (loopback by default)
 travsr lang list                     Per-language analysis status, prerequisites, and this repo's state
-travsr lang status                   Alias of `lang list`
+travsr lang status [language]        Alias of `lang list`; name a language to see only that row
 travsr lang install <language>       Set up full cross-file analysis for a language, and enable this repo
 travsr lang detect                   Scan the repo and install what it finds (--yes to skip prompts)
 travsr lang remove <language>        Unregister a language analyzer
@@ -329,7 +333,9 @@ travsr lang allow-unsandboxed <lang> Windows only: permit a language whose build
                                      inside isolation (Java, Scala) to run with your own privileges
 travsr synonym add <term> <alias>    Add a query synonym
 travsr synonym list                  List all configured synonyms
+travsr synonym set <term> <aliases>  Replace every alias for a term at once
 travsr synonym remove <term>         Remove a synonym term
+travsr synonym reset                 Clear every configured synonym
 travsr embed list                    List available embedding models
 travsr embed init                    Initialize the embedding index for this repo
 travsr embed status                  Show embedding index status
@@ -456,8 +462,9 @@ The extension connects to your local Travsr daemon over MCP and adds:
 - **Graph panel**: interactive dependency graph rendered with Cytoscape.js; kind filtering, two-hop traversal, node search, and an overlay of the diagnostics your language extensions report; open via the Travsr sidebar or the command palette (`Travsr: Show Graph`)
 - **Context Explorer**: graph-ranked context for a natural-language query, grouped by how each result matched
 - **Languages panel**: which languages have full cross-file analysis here and in this repository, what each one still needs, and a one-click install
-- **Stats panel**: index and daemon health, plus a searchable daemon log with severity filters, a per-day file picker, and optional auto-refresh
+- **Health panel** (`Travsr: Health`): one verdict for the repository (healthy, stale, degraded, not running, no graph yet), each problem carrying the command that fixes it, plus a searchable daemon log with severity filters, a per-day file picker, and optional auto-refresh
 - **Repository picker**: choose which of several open repos an action targets, shown in the status bar
+- **Copy Graph Context for Chat**: put the graph-ranked context for the current symbol on the clipboard, for a chat that is not wired to MCP
 
 The extension uses your installed `travsr` binary, resolved from `travsr.binaryPath`, then `~/.travsr/bin`, then PATH, and offers to download a verified release build if none of those resolve. Set `travsr.binaryPath` in VS Code settings to pin it. The Languages panel needs the language-status fields a v1.0.0 or later binary reports; an older one is detected and named rather than rendered as a table of gaps.
 
@@ -480,7 +487,7 @@ hyperscale backend.
 
 ```
 git init && travsr init
-  └─▶ walks .ts / .tsx files (respects .gitignore)
+  └─▶ walks every tracked file in a supported language (respects .gitignore)
         └─▶ Tree-sitter parses each file
               └─▶ Nodes + edges → .travsr/graph.db (SQLite WAL)
                     └─▶ post-commit hook installed
@@ -497,7 +504,16 @@ git commit
 re-indexed automatically. The graph is also fully queryable immediately after
 `travsr init`, before any commit.
 
-Language support: **TypeScript / TSX, Rust, Python, Go** (builtin, zero configuration). Additional languages (Java, Kotlin, C#, Scala, PHP, Ruby, Swift) are available as Phase B indexers via `travsr lang install`.
+**Language support.** Tree-sitter parsing, which gives definitions, imports and
+file structure, covers 16 languages with no setup: TypeScript / TSX,
+JavaScript / JSX, Python, Rust, Go, Java, Kotlin, Scala, C#, C, C++,
+Objective-C, Swift, Ruby, PHP and Dart.
+
+Full cross-file analysis, which adds call and reference edges across files, is
+bundled for **TypeScript, JavaScript, Python and Rust**: nothing to install,
+though the TypeScript and Python analyzers need Node.js on PATH. Every other
+language installs its analyzer with `travsr lang install <language>`, and
+`travsr lang list` shows what each one still needs.
 
 ### Retrieval algorithms
 
