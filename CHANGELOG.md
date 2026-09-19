@@ -4,6 +4,48 @@ All notable changes to Travsr are documented here.
 
 ---
 
+## v1.1.1 - 2026-09-20
+
+> Install with `npm i -g @travsr.com/travsr` or
+> `curl -fsSL https://travsr.com/install.sh | sh`.
+>
+> A patch release from `master`, carrying everything merged since `v1.1.0`.
+> Ships alongside VS Code extension 0.12.1, which offers this release when no
+> `travsr` binary resolves.
+
+### Upgrading from 1.1.0
+
+The index format is unchanged, so an existing index keeps working as is. In a
+TypeScript, JavaScript or Python repository, run
+`travsr init --semantic --force` once after upgrading to pick up the
+cross-file edges the newly bundled analyzers produce (see the first fix below).
+
+### Fixed
+
+- **TypeScript, JavaScript and Python cross-file analysis works in an installed binary (#905).** Their LSIF emitters had never been in a published artifact: every release from `v0.9.0` through `v1.1.0` shipped the `travsr` binary alone, so outside a source checkout those three languages got tree-sitter heuristics only while `travsr lang list` reported them active. The release tarball now carries a `travsr-lib/` directory beside the binary with both emitters bundled, and `install.sh`, the npm postinstall and the VS Code installer all extract it (tolerantly, so `--version` still installs older tarballs). Measured on a clean install outside the monorepo: TypeScript goes from 9 heuristic `ref/call` edges plus a "could not be started" warning to 13 `scip` and 4 `lsif` edges, and Python from 6 heuristic edges with no warning at all to 6 `scip` edges. The tarball grows from 14.8 MB to 16.7 MB.
+- **A failed analyzer is reported instead of reading as complete (#905).** With `rust-analyzer lsif` exiting non-zero, `travsr status` still printed `semantic: complete` and nothing anywhere said the language had lost its cross-file edges. An analyzer that ran and failed now downgrades `semantic:` to `partial (incomplete: <lang>)` and names the analyzer, on `init` and `status`. The Rust record is gated on a root `Cargo.toml`, so a directory that merely contains `.rs` files is not flagged.
+- **`travsr lang install` no longer claims what it has not checked (#905).** It printed "full cross-file analysis is on" for TypeScript while `travsr status` in the same repository said the analyzer could not be started. The success line is now derived from actually resolving the bundled analyzer; when it is missing, install says so and gives the reinstall remedy. The exit code is unchanged. `lang list` and `lang detect` report `partial` for a bundled analyzer that is not there.
+- **`travsr lang status <language>` works (#905).** It exited 2 with `unexpected argument`. `status` is an alias of `list`, which now takes an optional language filter and refuses an unknown language by name.
+- **An editor save gets its live resolution targets (#906).** The VS Code extension asks the daemon for live-resolution targets the moment a file is saved, but the daemon's watcher parses that save about a second later, so the request was answered from pre-save state and the save's edges stayed missing until the next commit. The daemon now folds the saved file in before answering, and whichever of the two passes reaches the file second is a genuine no-op. The fix is daemon side, so it holds for any editor.
+- **The live lexical floor no longer invents edges across languages or onto the standard library (#909, #815).** Between commits, a bare call was resolved by repo-wide name uniqueness alone, so a Python method calling the builtin `set` got a `ref/call` edge to a Rust `fn:set`, and Rust calls to `std::fs::write` or `std::thread::spawn` resolved to repo-local `fn:write` and `fn:spawn`. The floor now requires the same language on both ends and honours a call's qualifier, and uniqueness is judged on the full candidate set rather than a truncated lookup window. On the #813 recovery harness this removes every wrong edge the lexical and oracle lanes measured, at identical recall.
+
+### Removed
+
+- **The Phase A pyright pass (#909).** It never produced a single edge: `pyright --outputjson` emits diagnostics, not symbols, so the pass spent a subprocess per Python file on an empty result. Python's cross-file analysis is unaffected; it runs through the native Phase B pass and the bundled `travsr-lsif-py` emitter. The Python fuzz target now fuzzes the tree-sitter grammar itself instead of the removed JSON adapter.
+
+### Security
+
+- **esbuild 0.28.2 in both LSIF emitter packages (GHSA-67mh-4wv8-2f99; #910, #917)** and **js-yaml 4.3.2 in the VS Code extension's dev tree (#917).** All three are build-time dependencies; neither ships in the published binary or extension at runtime.
+
+### Release and CI
+
+- **The emitter bundle is built and smoke-tested on Linux, macOS and Windows on every pull request (#905, #907)**, including an old-glibc and a musl image on Linux, since `release.yml` only runs on a tag push. `tree-sitter-python` is now a dev dependency, so the emitter's production tree carries no native addon, and CI asserts that.
+- **The Linux test job refreshes its package index before installing bubblewrap (#917).** The runner image's cached index pointed at a bubblewrap build Ubuntu had pulled from the mirrors, which failed every Linux test run with a 404.
+
+**Full changelog:** https://github.com/Travsr-com/travsr/compare/v1.1.0...v1.1.1
+
+---
+
 ## v1.1.0 - 2026-09-15
 
 > Install with `npm i -g @travsr.com/travsr` or

@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.12.1] - 2026-09-20
+
+Offers to download travsr v1.1.1 when no binary resolves.
+
+### Fixed
+
+- **An extension-managed install gets the bundled language analyzers (#905).** The download flow now also extracts `travsr-lib/` from the release tarball, which carries the TypeScript, JavaScript and Python LSIF emitters. Without it, a binary the extension installed produced structural edges only for those three languages. Extraction is tolerant, so a pin that predates the bundle still installs.
+- **Saving a file offers its live resolution targets (#906).** The save handler asked the daemon for targets before the daemon had parsed the save, so it got the previous pass's leftovers and the edges stayed missing until the next commit. The fix is in the daemon that ships with v1.1.1, so the extension needed no change of its own for it.
+
 ## [0.12.0] - 2026-09-15
 
 Offers to download travsr v1.1.0 when no binary resolves. The Health panel
