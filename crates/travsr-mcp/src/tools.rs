@@ -4893,10 +4893,13 @@ fn get_execution_path_body(
     };
 
     let mut out = String::new();
+    // Count hops, not symbols. `route_end` is how many nodes the route spans, so
+    // a direct call read as "2 steps"; one call is one step.
+    let hops = route_end.saturating_sub(1);
     out.push_str(&format!(
         "path ({} step{}, source to sink):\n",
-        route_end,
-        if route_end == 1 { "" } else { "s" }
+        hops,
+        if hops == 1 { "" } else { "s" }
     ));
     for n in &path[..route_end] {
         out.push_str(&render(n));
@@ -14664,6 +14667,12 @@ mod snippet_tests {
         let path_at = result
             .find("path (")
             .unwrap_or_else(|| panic!("a successful result must label its path; got: {result}"));
+        // alpha -> beta -> gamma is two calls. The header used to count the three
+        // symbols it spans, so a direct call announced itself as "2 steps".
+        assert!(
+            result.contains("path (2 steps,"),
+            "the header counts hops, not symbols; got: {result}"
+        );
         let sink_at = result
             .find("fn:gamma")
             .unwrap_or_else(|| panic!("the sink must appear; got: {result}"));
