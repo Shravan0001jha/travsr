@@ -1964,6 +1964,22 @@ impl SqliteStore {
         .map_err(|e| StoreError::Database(e.to_string()))
     }
 
+    /// How many files the content-hash cache tracks.
+    ///
+    /// `init` reads this to tell a database that has never been indexed (no
+    /// nodes and no hashes) from one a failed rebuild emptied (no nodes, hashes
+    /// still there). The second needs a rebuild; the first is just new.
+    pub fn file_hash_count(&self) -> Result<u64, StoreError> {
+        (|| -> AnyResult<u64> {
+            let n: i64 = self
+                .conn
+                .query_row("SELECT count(*) FROM files", [], |row| row.get(0))
+                .context("counting file hashes")?;
+            Ok(n as u64)
+        })()
+        .map_err(|e| StoreError::Database(e.to_string()))
+    }
+
     pub fn edge_count(&self) -> Result<u64, StoreError> {
         (|| -> AnyResult<u64> {
             let n: i64 = self
@@ -14572,6 +14588,87 @@ mod tests {
         assert_eq!(cleared, 2);
         assert!(store.get_all_file_hashes().unwrap().is_empty());
         assert!(store.get_file_hash("a.rs").unwrap().is_none());
+    }
+
+    /// `purge_graph` names its tables in a literal, so a migration that adds a
+    /// graph table would be silently left behind and the surviving rows would
+    /// collide with their own re-parse exactly as the v2 rebuild did. Every table
+    /// in the live schema must therefore be classified here on purpose: emptied
+    /// by the purge, emptied with its parent FTS index, or kept for a documented
+    /// reason. A new table fails this test until someone decides which it is.
+    #[test]
+    fn purge_graph_classifies_every_table_in_the_schema() {
+        use std::collections::BTreeSet;
+
+        /// Named in `purge_graph`'s statement batch.
+        const PURGED: &[&str] = &[
+            "nodes",
+            "edges",
+            "edge_sites",
+            "symbol_aliases",
+            "fts_vocab",
+            "nodes_fts",
+            "nodes_fts_map",
+            "nodes_fts_words",
+            "nodes_fts_words_map",
+        ];
+        /// FTS5 shadow tables and the fts5vocab view over one. Emptied by the
+        /// `'delete-all'` command on their parent, never by name.
+        const FTS_INTERNAL: &[&str] = &[
+            "nodes_fts_config",
+            "nodes_fts_data",
+            "nodes_fts_docsize",
+            "nodes_fts_idx",
+            "nodes_fts_words_config",
+            "nodes_fts_words_data",
+            "nodes_fts_words_docsize",
+            "nodes_fts_words_idx",
+            "nodes_words_vocab",
+        ];
+        /// Kept on purpose; `purge_graph`'s doc comment says why for each.
+        const KEPT: &[&str] = &[
+            "files",
+            "node_tombstones",
+            "ref_resolution_state",
+            "meta",
+            "sessions",
+            "fts_synonyms",
+        ];
+
+        let store = SqliteStore::open_in_memory().unwrap();
+        let live: BTreeSet<String> = {
+            let mut stmt = store
+                .conn
+                .prepare(
+                    "SELECT name FROM sqlite_master WHERE type = 'table' \
+                     AND name NOT LIKE 'sqlite_%'",
+                )
+                .unwrap();
+            stmt.query_map([], |r| r.get::<_, String>(0))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap()
+        };
+        let classified: BTreeSet<String> = PURGED
+            .iter()
+            .chain(FTS_INTERNAL)
+            .chain(KEPT)
+            .map(|t| (*t).to_string())
+            .collect();
+
+        let unclassified: Vec<&String> = live.difference(&classified).collect();
+        assert!(
+            unclassified.is_empty(),
+            "new table(s) {unclassified:?}: add them to PURGED if they hold graph \
+             rows (and to the statement batch in `purge_graph`), or to KEPT with \
+             the reason in its doc comment"
+        );
+        let vanished: Vec<&String> = classified.difference(&live).collect();
+        assert!(
+            vanished.is_empty(),
+            "table(s) {vanished:?} are listed here but no longer exist; \
+             `purge_graph` would fail on them"
+        );
     }
 
     #[test]

@@ -1474,8 +1474,16 @@ pub fn init_repo_with_progress(
     // could tell the two halves apart. Read the stored version BEFORE the stamp
     // overwrites it and drive the same full-rebuild path `--force` uses.
     // A read failure counts as skew: rebuilding is the recoverable direction.
+    //
+    // `nodes_before > 0` is not the right test for "there is an index here".
+    // A rebuild that purged and then failed leaves zero nodes with the old stamp
+    // intact, which is precisely the state the stamp was kept old to catch; read
+    // that way it looked like a brand-new database and the skew went unanswered
+    // forever. The `files` table is what separates the two: a database nobody has
+    // indexed has no hashes either, while the emptied one still has all of them.
     let stored_sig_version = store.get_signature_format_version().unwrap_or(0);
-    let format_skew = nodes_before > 0 && stored_sig_version != SIGNATURE_FORMAT_VERSION;
+    let indexed_before = nodes_before > 0 || store.file_hash_count().unwrap_or(0) > 0;
+    let format_skew = indexed_before && stored_sig_version != SIGNATURE_FORMAT_VERSION;
     if format_skew {
         eprintln!(
             "index format changed (v{stored_sig_version} -> v{SIGNATURE_FORMAT_VERSION}), \
@@ -1541,7 +1549,15 @@ pub fn init_repo_with_progress(
     // `""` and so is never any file. Those survivors then collided with their
     // own re-parse on `idx_nodes_vname` and failed the whole init. `purge_graph`
     // deletes the graph outright, which is what "rebuild from scratch" means.
-    if (force || format_skew) && store.node_count().unwrap_or(0) > 0 {
+    //
+    // Deliberately NOT gated on `node_count() > 0`. An empty graph is exactly the
+    // state a rebuild that purged and then failed leaves behind, and skipping the
+    // block there skips `clear_file_hashes` with it: the hash delta then finds
+    // every file unchanged, indexes nothing, reports "up to date - 0 nodes", and
+    // the stamp below records the current format over an empty graph. The skew is
+    // gone, so no later run rebuilds either. Running the block on an empty graph
+    // costs one no-op transaction and is what lets the repository heal itself.
+    if force || format_skew {
         tracing::info!(force, format_skew, "purging graph for a full rebuild");
         let purged = store
             .purge_graph()
@@ -9041,6 +9057,65 @@ mod tests {
             old,
             "a rebuild that purged but never re-indexed must leave the old stamp, \
              so the next run still sees the skew and rebuilds again"
+        );
+    }
+
+    /// Keeping the old stamp only matters if the next run acts on it. It could
+    /// not: the purge block was gated on `node_count() > 0`, and a rebuild that
+    /// purged and then failed leaves exactly zero nodes. The next run skipped the
+    /// block, skipped `clear_file_hashes` with it, found every file unchanged,
+    /// indexed nothing, reported "up to date - 0 nodes" and then stamped the
+    /// current format over the empty graph. From there `format_skew` read false
+    /// forever and no later run rebuilt either, which is the same dead end the
+    /// stamp move exists to prevent, reached one run later.
+    #[test]
+    fn init_repo_rebuilds_again_after_a_failed_rebuild_emptied_the_graph() {
+        let tmp = tempfile::tempdir().unwrap();
+        git_init(tmp.path());
+        std::fs::write(tmp.path().join("a.ts"), "export class A { go() {} }").unwrap();
+        assert_eq!(init_repo(tmp.path()).unwrap().files_indexed, 1);
+
+        let db_path = tmp.path().join(".travsr/graph.db");
+        let old = travsr_core::SIGNATURE_FORMAT_VERSION - 1;
+        {
+            let mut store = travsr_store::SqliteStore::open(&db_path).unwrap();
+            store.set_signature_format_version(old).unwrap();
+        }
+
+        // Fail the rebuild after the purge has already emptied the graph.
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER fail_node_insert BEFORE INSERT ON nodes \
+             BEGIN SELECT RAISE(ABORT, 'simulated indexing failure'); END;",
+        )
+        .unwrap();
+        assert!(init_repo(tmp.path()).is_err());
+        assert_eq!(
+            travsr_store::SqliteStore::open(&db_path)
+                .unwrap()
+                .node_count()
+                .unwrap(),
+            0,
+            "the fixture must leave the empty graph this test is about"
+        );
+        conn.execute_batch("DROP TRIGGER fail_node_insert;")
+            .unwrap();
+        drop(conn);
+
+        // The recovery run. Nothing on disk changed, so only the preserved skew
+        // can drive it.
+        init_repo(tmp.path()).expect("the run after a failed rebuild must rebuild");
+
+        let store = travsr_store::SqliteStore::open(&db_path).unwrap();
+        assert!(
+            store.node_count().unwrap() > 0,
+            "the recovery run must re-parse the repo, not report itself up to date \
+             over the graph the failed rebuild emptied"
+        );
+        assert_eq!(
+            store.get_signature_format_version().unwrap(),
+            travsr_core::SIGNATURE_FORMAT_VERSION,
+            "and only then may it stamp the current format"
         );
     }
 
