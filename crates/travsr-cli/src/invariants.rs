@@ -13,6 +13,25 @@ use anyhow::{Context, Result};
 pub const RULES_FILE: &str = "architecture-invariants.json";
 
 pub fn run(provenance: &str) -> Result<()> {
+    // An unknown filter matches no edge, and no edges means every dependency
+    // rule "holds": `travsr invariants --provenance ratifed` turned a gate that
+    // was failing on two real violations into exit 0. The same reasoning the
+    // rules file states for a renamed component applies to a mistyped filter —
+    // a guard must not be switchable off by accident — so the typo is rejected
+    // rather than answered.
+    if !travsr_mcp::PROVENANCE_FILTERS.contains(&provenance) {
+        anyhow::bail!(
+            "unknown --provenance '{provenance}'. Use one of: {}. \
+             An unrecognised filter matches no edges, which would report every \
+             rule as holding over an empty graph.",
+            travsr_mcp::PROVENANCE_FILTERS
+                .iter()
+                .map(|p| if p.is_empty() { "'' (all)" } else { p })
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+
     let cwd = std::env::current_dir().context("getting current directory")?;
     let repo_root = crate::repo::find_git_root(&cwd)?;
     let db_path = repo_root.join(".travsr/graph.db");

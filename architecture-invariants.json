@@ -1,5 +1,5 @@
 {
-  "$comment": "Architectural rules checked against the graph by `node scripts/arch-doc.mjs check`. A rule naming a component that no longer exists is a violation, not a pass, so renaming a crate cannot silently disable the rule that protects it.",
+  "$comment": "Architectural rules checked against the graph by `travsr invariants`, which exits non-zero on a violation so it works as a CI step. A rule naming a component that no longer exists is a violation, not a pass, so renaming a crate cannot silently disable the rule that protects it.",
   "invariants": [
     {
       "name": "parsing stays pure",
