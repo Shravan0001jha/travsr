@@ -3659,22 +3659,39 @@ const LIST_CAP: usize = 60;
 /// because each block is several lines, not one.
 const DETAIL_CAP: usize = 20;
 
-/// Trim to the last complete line that fits, and say what was dropped.
+/// Sanitize a brief, then cut it back to the last whole line that fits, and say
+/// what was dropped.
 ///
 /// The byte limit alone cut mid-row — a kubernetes brief ended on
 /// `... | depends on 0 | 5 f`. A half-written fact is worse than an absent one:
-/// it reads as data. Leaves a margin for the notice it appends.
-fn trim_to_whole_lines(body: &str, limit: usize) -> String {
-    if body.len() <= limit {
-        return body.to_string();
-    }
+/// it reads as data.
+///
+/// ORDER MATTERS, and getting it wrong is what made a first attempt at this look
+/// like it worked. `sanitize_mcp_body_with_limit` escapes `<` and `>` into
+/// four-byte entities and truncates AFTER that, so a body trimmed to whole lines
+/// first comes back over the limit and is cut at a raw byte boundary anyway. An
+/// architecture brief is full of `->` and a subsystem brief of `<-`, so both
+/// still ended mid-row, and the subsystem listing ended on its own truncation
+/// notice: `[brief trun`. Escape first, trim second, and the body is both inside
+/// the limit and made of whole lines.
+fn render_brief(body: &str, limit: usize) -> String {
     const NOTICE: &str =
         "\n[brief truncated to fit the token budget; raise token_budget for the rest]\n";
-    let room = limit.saturating_sub(NOTICE.len());
-    let cut = body[..body.len().min(room)]
-        .rfind('\n')
-        .map_or(0, |i| i + 1);
-    format!("{}{NOTICE}", &body[..cut])
+    // Escaping can quadruple a run of angle brackets, so give the sanitizer room
+    // to escape everything that could still fit; the trim below is what enforces
+    // `limit` on the result.
+    let escaped = sanitize_mcp_body_with_limit(body, limit.saturating_mul(4));
+    if escaped.len() <= limit {
+        return escaped;
+    }
+    let mut end = escaped.len().min(limit.saturating_sub(NOTICE.len()));
+    // `end` is a byte offset into escaped UTF-8; walk it back to a boundary
+    // before slicing, or a multi-byte identifier panics the tool.
+    while end > 0 && !escaped.is_char_boundary(end) {
+        end -= 1;
+    }
+    let cut = escaped[..end].rfind('\n').map_or(0, |i| i + 1);
+    format!("{}{NOTICE}", &escaped[..cut])
 }
 
 /// Byte cap for a brief, from a caller's token budget.
@@ -3725,6 +3742,29 @@ fn is_support_component(path: &str) -> bool {
                 | ".claude"
         )
     })
+}
+
+/// Whether a node puts its directory on the architecture map.
+///
+/// Reuses the two rules `get_repo_map` already applies rather than inventing a
+/// third, because a third definition of "component" is what made the earlier
+/// generators disagree:
+///
+/// - [`repo_map_is_symbol_kind`] — a component is a directory that owns code.
+///   Without it, `kind = "file"` nodes carried every path that holds no symbols
+///   at all into the map: `is_structural_noise` drops doc chunks but keeps the
+///   file node beside them, so `CLAUDE.md`, `Cargo.toml`, `README.md` and nine
+///   more root-level files each became their own component, "1 files, 0
+///   symbols". On this repository that was 12 of the 39 reported components.
+/// - [`repo_map_is_local_path`] — a synthetic angle-bracket pseudo-path
+///   (`<cgo_synthetic>/main.go`) is not a directory and cannot be a component,
+///   which `get_repo_map_excludes_synthetic_pseudo_paths` already pins for the
+///   repo map.
+fn is_component_member(n: &travsr_core::Node) -> bool {
+    repo_map_is_local_path(&n.vname.path)
+        && repo_map_is_symbol_kind(&n.kind)
+        && !n.test_role.is_test()
+        && !travsr_core::noise::is_structural_noise(n)
 }
 
 /// Whether a signature names a type declaration, in any of the indexed languages.
@@ -3840,7 +3880,7 @@ pub fn get_architecture_brief(
     provenance: &str,
     token_budget: usize,
 ) -> String {
-    use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+    use std::collections::{BTreeMap, BTreeSet, HashMap};
 
     let nodes = match store.all_nodes() {
         Ok(n) => n,
@@ -3861,15 +3901,11 @@ pub fn get_architecture_brief(
     let mut files: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     let mut symbols: BTreeMap<String, usize> = BTreeMap::new();
     let mut entries: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    let mut reach: HashMap<&str, usize> = HashMap::new();
     let mut declared: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     let mut member_of: BTreeMap<String, HashMap<String, usize>> = BTreeMap::new();
 
     for n in &nodes {
-        if n.vname.path.is_empty()
-            || n.test_role.is_test()
-            || travsr_core::noise::is_structural_noise(n)
-        {
+        if !is_component_member(n) {
             continue;
         }
         let comp = subsystem_component_of(&n.vname.path);
@@ -3877,9 +3913,7 @@ pub fn get_architecture_brief(
             .entry(comp.clone())
             .or_default()
             .insert(n.vname.path.clone());
-        if n.kind != "file" && n.kind != "import" {
-            *symbols.entry(comp.clone()).or_insert(0) += 1;
-        }
+        *symbols.entry(comp.clone()).or_insert(0) += 1;
         let sig = simple_symbol(&n.vname.signature).to_string();
         // Key on the SIGNATURE PREFIX, not `kind`. The prefix is the canonical
         // form every analyzer normalises to; `kind` is the language's own word.
@@ -3907,8 +3941,7 @@ pub fn get_architecture_brief(
         // has one incoming reference while `method:VName.new` has hundreds. Fold
         // `Type.member` into `Type` or the ranking is meaningless.
         let base = sig.split('.').next().unwrap_or(&sig).to_string();
-        *member_of.entry(comp).or_default().entry(base).or_insert(0) += 0;
-        reach.entry(n.vname.signature.as_str()).or_insert(0);
+        member_of.entry(comp).or_default().entry(base).or_insert(0);
     }
 
     let mut by_id: HashMap<travsr_core::NodeId, &travsr_core::Node> = HashMap::new();
@@ -3921,7 +3954,7 @@ pub fn get_architecture_brief(
                 continue;
             }
             if let Some(n) = by_id.get(dst) {
-                if n.vname.path.is_empty() || n.test_role.is_test() {
+                if !is_component_member(n) {
                     continue;
                 }
                 let comp = subsystem_component_of(&n.vname.path);
@@ -3992,35 +4025,23 @@ pub fn get_architecture_brief(
             cond[x].insert(y);
         }
     }
-    let mut depth = vec![usize::MAX; sccs.len()];
-    for start in 0..sccs.len() {
-        if depth[start] != usize::MAX {
-            continue;
-        }
-        let mut order: Vec<usize> = Vec::new();
-        let mut seen: HashSet<usize> = HashSet::new();
-        let mut st = vec![start];
-        while let Some(i) = st.pop() {
-            if !seen.insert(i) {
-                continue;
-            }
-            order.push(i);
-            for &j in &cond[i] {
-                st.push(j);
-            }
-        }
-        // Deepest-first so a node is resolved after everything it points at.
-        for &i in order.iter().rev() {
-            let d = cond[i]
-                .iter()
-                .map(|&j| depth[j].saturating_add(1))
-                .filter(|d| *d != usize::MAX)
-                .max()
-                .unwrap_or(0);
-            if depth[i] == usize::MAX || d > depth[i] {
-                depth[i] = d;
-            }
-        }
+    // Tarjan emits an SCC only after every SCC reachable from it, so `cond[i]`
+    // can hold nothing but indices below `i` and one ascending pass resolves each
+    // component after everything it points at. O(V + E).
+    //
+    // That ordering is the whole proof, so it is asserted rather than assumed.
+    // The previous version walked a DFS per component and folded over its
+    // reverse PREORDER, which is not a topological order — on 0 -> 1, 1 -> 2,
+    // 0 -> 2 it settles 1 before 2 and puts both on layer 0. It agreed with this
+    // only because the ascending outer loop had already resolved every successor,
+    // which is the same guarantee, reached the long way round.
+    let mut depth = vec![0usize; sccs.len()];
+    for i in 0..sccs.len() {
+        debug_assert!(
+            cond[i].iter().all(|&j| j < i),
+            "arch_sccs must emit in reverse topological order for layering to hold"
+        );
+        depth[i] = cond[i].iter().map(|&j| depth[j] + 1).max().unwrap_or(0);
     }
     let layer_of = |c: &str| depth[owner[c]];
     let max_layer = names.iter().map(|n| layer_of(n)).max().unwrap_or(0);
@@ -4050,7 +4071,11 @@ pub fn get_architecture_brief(
         if cycles.is_empty() {
             "acyclic".to_string()
         } else {
-            format!("{} dependency cycle(s), listed below", cycles.len())
+            format!(
+                "{} dependency cycle{}, listed below",
+                cycles.len(),
+                if cycles.len() == 1 { "" } else { "s" }
+            )
         }
     ));
 
@@ -4064,9 +4089,35 @@ pub fn get_architecture_brief(
     }
 
     if !cycles.is_empty() {
-        out.push_str("## Cycles\n");
-        for g in &cycles {
-            out.push_str(&format!("- {}\n", g.join(" <-> ")));
+        // Capped in both directions, like every other list here. A cycle is one
+        // SCC, so a single one can span the whole repository: a 140-component
+        // ring wrote one 5311-character line, and at a small token_budget that
+        // one line WAS the brief — the component list, the edges and every later
+        // section were trimmed away behind it.
+        out.push_str(&format!(
+            "## Cycles ({} of {})\n",
+            cycles.len().min(LIST_CAP),
+            cycles.len()
+        ));
+        for g in cycles.iter().take(LIST_CAP) {
+            // Members get the tighter cap: naming a cycle takes a few components,
+            // and `LIST_CAP` of them still wrote a 2311-character line that at a
+            // small budget crowded out the component list behind it.
+            let shown = g.len().min(DETAIL_CAP);
+            out.push_str(&format!("- {}", g[..shown].join(" <-> ")));
+            if g.len() > shown {
+                out.push_str(&format!(
+                    " <-> ... and {} more in this cycle",
+                    g.len() - shown
+                ));
+            }
+            out.push('\n');
+        }
+        if cycles.len() > LIST_CAP {
+            out.push_str(&format!(
+                "- ... and {} more cycles\n",
+                cycles.len() - LIST_CAP
+            ));
         }
         out.push('\n');
     }
@@ -4175,11 +4226,7 @@ pub fn get_architecture_brief(
            use and undercount where analysis is incomplete\n\
          - nothing here states WHY a dependency exists\n",
     );
-    let limit = brief_byte_limit(token_budget);
-    wrap_envelope(&sanitize_mcp_body_with_limit(
-        &trim_to_whole_lines(&out, limit),
-        limit,
-    ))
+    wrap_envelope(&render_brief(&out, brief_byte_limit(token_budget)))
 }
 
 // ── architecture invariants ───────────────────────────────────────────────────
@@ -4232,10 +4279,7 @@ fn component_dependency_graph(
     let mut components: BTreeSet<String> = BTreeSet::new();
     if let Ok(nodes) = store.all_nodes() {
         for n in &nodes {
-            if n.vname.path.is_empty()
-                || n.test_role.is_test()
-                || travsr_core::noise::is_structural_noise(n)
-            {
+            if !is_component_member(n) {
                 continue;
             }
             let comp = subsystem_component_of(&n.vname.path);
@@ -4343,7 +4387,11 @@ pub fn check_architecture_invariants(
                         broken.push(format!(
                             "'{a}' depends on '{comp}' ({w} file pair{}); allowed: {}",
                             if *w == 1 { "" } else { "s" },
-                            allowed.join(", ")
+                            if allowed.is_empty() {
+                                "nothing internal".to_string()
+                            } else {
+                                allowed.join(", ")
+                            }
                         ));
                     }
                 }
@@ -4364,7 +4412,7 @@ pub fn check_architecture_invariants(
         }
     }
     out.push_str(&format!(
-        "\n{} of {} invariant{} hold, over {} components and {} edges ({provenance} edges).\n",
+        "\n{} of {} invariant{} hold, over {} components and {} edges (provenance={}).\n",
         parsed.invariants.len() - violations,
         parsed.invariants.len(),
         if parsed.invariants.len() == 1 {
@@ -4373,8 +4421,26 @@ pub fn check_architecture_invariants(
             "s"
         },
         components.len(),
-        edges.len()
+        edges.len(),
+        if provenance.is_empty() {
+            "all"
+        } else {
+            provenance
+        }
     ));
+    // A rule can only be broken by an edge the graph resolved. On this repository
+    // `travsr-daemon`'s manifest declares nine internal dependencies and the
+    // resolved graph carries four, so a rule about the five it cannot see would
+    // report "holds" over silence. The briefs disclose this; a gate that exits 0
+    // has more need to, not less.
+    if let Some(note) = phase_b_degraded_note(store) {
+        out.push_str(&format!("\n{note}\n"));
+    }
+    out.push_str(
+        "\nChecked against the edges the graph resolved. A dependency analysis has \
+         not resolved cannot break a rule here, so \"holds\" means no violation was \
+         visible, never that none exists. `travsr status` reports coverage.\n",
+    );
     if violations > 0 {
         out.push_str("VIOLATIONS FOUND\n");
     }
@@ -4466,13 +4532,13 @@ pub fn get_subsystem_brief(
 
     let mut by_id: HashMap<travsr_core::NodeId, &travsr_core::Node> = HashMap::new();
     for n in &nodes {
-        // `is_structural_noise` also excludes file and doc-chunk nodes. Without
-        // it, a raw SCIP module descriptor outranks every real symbol and gets
-        // reported as its component's entry point.
-        if n.vname.path.is_empty()
-            || n.test_role.is_test()
-            || travsr_core::noise::is_structural_noise(n)
-        {
+        // Same membership rule as the architecture brief, so the two never
+        // disagree about what a component holds. `is_structural_noise` is part of
+        // it and is what keeps a raw SCIP module descriptor from outranking every
+        // real symbol and being reported as its component's entry point; it does
+        // NOT exclude `kind = "file"` nodes, which is why the kind check is
+        // there too.
+        if !is_component_member(n) {
             continue;
         }
         by_id.insert(n.id, n);
@@ -4555,14 +4621,25 @@ pub fn get_subsystem_brief(
     };
 
     if entry.is_empty() && component.is_empty() {
-        let mut out = String::from("SUBSYSTEMS (components called from outside)\n\n");
         let mut rows: Vec<_> = external.iter().collect();
         rows.sort_by_key(|(_, m)| std::cmp::Reverse(m.values().sum::<usize>()));
-        for (comp, m) in rows {
+        // Capped and trimmed like every other list here. This was the one path
+        // that went straight to the byte limit: on a 140-component repository it
+        // ended mid-entity on `exported_function_037  &`, with no notice that
+        // anything had been cut and the closing instruction gone with it.
+        let mut out = format!(
+            "SUBSYSTEMS (components called from outside, {} of {})\n\n",
+            rows.len().min(LIST_CAP),
+            rows.len()
+        );
+        let shown = rows.len().min(LIST_CAP);
+        for (comp, m) in rows.iter().take(LIST_CAP) {
             let total: usize = m.values().sum();
             out.push_str(&format!(
-                "{comp}  ({total} external calls, {} entry points)\n",
-                m.len()
+                "{comp}  ({total} external call{}, {} entry point{})\n",
+                if total == 1 { "" } else { "s" },
+                m.len(),
+                if m.len() == 1 { "" } else { "s" }
             ));
             for (id, c) in ranked(m).into_iter().take(3) {
                 out.push_str(&format!(
@@ -4572,11 +4649,14 @@ pub fn get_subsystem_brief(
                 ));
             }
         }
+        if rows.len() > shown {
+            out.push_str(&format!(
+                "... and {} more components, fewer external calls\n",
+                rows.len() - shown
+            ));
+        }
         out.push_str("\nTake one with `component`, or a single symbol with `entry`.\n");
-        return wrap_envelope(&sanitize_mcp_body_with_limit(
-            &out,
-            brief_byte_limit(token_budget),
-        ));
+        return wrap_envelope(&render_brief(&out, brief_byte_limit(token_budget)));
     }
 
     // Roots: a named symbol, or the component's most-called-into entry points.
@@ -4707,9 +4787,27 @@ pub fn get_subsystem_brief(
 
     out.push_str("\n## Called from\n");
     let root_set: HashSet<_> = roots.iter().copied().collect();
+    // In component mode the entries ARE "what something outside calls", so a
+    // caller inside the component is not calling in. Listing travsr-retrieval's
+    // own `bfs_fallback` here answered a different question from the one the
+    // heading asks. In entry mode the caller named one symbol, and every caller
+    // of it is wanted.
+    let outside_of = if component.is_empty() {
+        None
+    } else {
+        Some(component)
+    };
     let mut callers: Vec<travsr_core::NodeId> = calls
         .iter()
-        .filter(|(src, dsts)| !root_set.contains(src) && dsts.iter().any(|d| root_set.contains(d)))
+        .filter(|(src, dsts)| {
+            if root_set.contains(src) || !dsts.iter().any(|d| root_set.contains(d)) {
+                return false;
+            }
+            match outside_of {
+                Some(c) => subsystem_component_of(&by_id[src].vname.path) != c,
+                None => true,
+            }
+        })
         .map(|(src, _)| *src)
         .collect();
     callers.sort_by(|a, b| {
@@ -4813,11 +4911,7 @@ pub fn get_subsystem_brief(
          - Phase B coverage varies by language; absence is unknown, never no\n\
          - nothing here states WHY a call exists; read the source for that\n",
     );
-    let limit = brief_byte_limit(token_budget);
-    wrap_envelope(&sanitize_mcp_body_with_limit(
-        &trim_to_whole_lines(&out, limit),
-        limit,
-    ))
+    wrap_envelope(&render_brief(&out, brief_byte_limit(token_budget)))
 }
 
 // ── get_lang_status ───────────────────────────────────────────────────────────
@@ -8491,6 +8585,16 @@ impl Default for GraphJsonParams<'_> {
 /// Unknown filter values match nothing rather than everything: a typo should
 /// return an obviously empty graph, not silently ignore the constraint a
 /// consumer added precisely because it needed ground truth.
+/// Every value the `provenance` filter accepts: the two modes (`""` for all
+/// edges, `"ratified"` for everything the commit-gated pipeline has confirmed)
+/// and each provenance an edge can actually carry.
+///
+/// [`provenance_allowed`] answers an unknown value with "matches nothing", which
+/// is the right default for a query surface. A caller that treats an empty graph
+/// as a PASS has to reject the typo instead, which is why the vocabulary is
+/// named here rather than restated per call site.
+pub const PROVENANCE_FILTERS: &[&str] = &["", "ratified", "tree-sitter", "lsif", "scip", "live"];
+
 fn provenance_allowed(filter: &str, provenance: &str) -> bool {
     match filter {
         "" => true,
@@ -12628,14 +12732,19 @@ mod tests {
     #[test]
     fn a_brief_is_never_cut_mid_line() {
         // `... | depends on 0 | 5 f` was a half-written fact presented as data.
+        // Rows carry `->`, because escaping is what defeated the first fix: it
+        // expands each angle bracket to four bytes AFTER the trim, so a body
+        // trimmed first came back over the limit and was cut at a raw byte
+        // boundary anyway — including through the truncation notice itself,
+        // which reached the caller as `[brief trun`.
         let long = (0..400)
-            .map(|i| format!("- row {i} with enough text to cross the limit somewhere\n"))
+            .map(|i| format!("- row {i} -> with enough text to cross the limit somewhere\n"))
             .collect::<String>();
-        let out = trim_to_whole_lines(&long, 900);
+        let out = render_brief(&long, 900);
         assert!(out.len() <= 900, "must respect the limit: {}", out.len());
         assert!(
-            out.contains("brief truncated"),
-            "must say it was truncated:\n{out}"
+            out.ends_with("for the rest]\n"),
+            "the truncation notice must survive whole:\n{out}"
         );
         for line in out.lines().filter(|l| l.starts_with("- row")) {
             assert!(
@@ -12643,8 +12752,13 @@ mod tests {
                 "every surviving row must be whole, got: {line:?}"
             );
         }
-        // A body that fits is returned untouched.
-        assert_eq!(trim_to_whole_lines("- a\n- b\n", 900), "- a\n- b\n");
+        // A body that fits is escaped but not truncated.
+        assert_eq!(render_brief("- a -> b\n", 900), "- a -&gt; b\n");
+        // A multi-byte character astride the cut must not panic the tool.
+        let wide = (0..400)
+            .map(|i| format!("- ròw {i} -> ünicøde enough to cross the limit\n"))
+            .collect::<String>();
+        assert!(render_brief(&wide, 900).len() <= 900);
     }
 
     #[test]
@@ -12662,6 +12776,160 @@ mod tests {
         assert!(
             out.contains("never as none"),
             "must say absence is unknown:\n{out}"
+        );
+    }
+
+    #[test]
+    fn a_component_is_a_directory_that_owns_code() {
+        // `is_structural_noise` drops doc chunks but keeps the `kind = "file"`
+        // node beside them, so every path holding no symbols at all became its
+        // own component: `CLAUDE.md`, `Cargo.toml`, `README.md` and nine more
+        // root-level files, each reported as "1 files, 0 symbols". On this
+        // repository that was 12 of 39 components. A synthetic angle-bracket
+        // pseudo-path is not a directory either, and appeared at layer 3.
+        use travsr_core::EdgeKind;
+        let real = make_node("crates/alpha/src/lib.rs", "fn:a");
+        let dep = make_node("crates/beta/src/lib.rs", "fn:b");
+        let readme = make_kind("README.md", "file", "file");
+        let manifest = make_kind("Cargo.toml", "file", "file");
+        let synthetic = make_kind("<cgo_synthetic>/main.go", "fn:GoCallback", "function");
+        let store = make_store(
+            &[real.clone(), dep.clone(), readme, manifest, synthetic],
+            &[(real.id, dep.id, EdgeKind::RefCall)],
+        );
+
+        let out = get_architecture_brief(&store, "", 30_000);
+        assert!(out.contains("2 components"), "only the two crates:\n{out}");
+        for phantom in ["README.md", "Cargo.toml", "cgo_synthetic"] {
+            assert!(
+                !out.contains(phantom),
+                "{phantom} is not a component:\n{out}"
+            );
+        }
+        // And the invariant view must agree, or a rule is checked against a
+        // different graph from the one the brief describes.
+        let (components, _) = component_dependency_graph(&store, "");
+        assert_eq!(
+            components.iter().map(|c| c.as_str()).collect::<Vec<_>>(),
+            vec!["crates/alpha", "crates/beta"]
+        );
+    }
+
+    #[test]
+    fn architecture_brief_layers_a_diamond_by_longest_path() {
+        // a -> b -> c with a -> c as well. `b` depends on `c`, so it cannot share
+        // `c`'s layer, and `a` is two hops from the foundation even though it
+        // also reaches it in one. The layering leans on `arch_sccs` emitting in
+        // reverse topological order; this is what pins that it still does.
+        use travsr_core::EdgeKind;
+        let a = make_node("crates/alpha/src/lib.rs", "fn:a");
+        let b = make_node("crates/beta/src/lib.rs", "fn:b");
+        let c = make_node("crates/gamma/src/lib.rs", "fn:c");
+        let store = make_store(
+            &[a.clone(), b.clone(), c.clone()],
+            &[
+                (a.id, b.id, EdgeKind::RefCall),
+                (b.id, c.id, EdgeKind::RefCall),
+                (a.id, c.id, EdgeKind::RefCall),
+            ],
+        );
+        let out = get_architecture_brief(&store, "", 30_000);
+        for (comp, layer) in [("crates/gamma", 0), ("crates/beta", 1), ("crates/alpha", 2)] {
+            assert!(
+                out.contains(&format!("- {comp} | layer {layer} |")),
+                "{comp} belongs on layer {layer}:\n{out}"
+            );
+        }
+        assert!(out.contains("3 layers"), "three layers, not two:\n{out}");
+    }
+
+    #[test]
+    fn architecture_brief_caps_the_members_of_one_cycle() {
+        // A cycle is a single SCC, so one of them can span the whole repository.
+        // Uncapped, a 140-component ring wrote one 5311-character line, and at a
+        // small token_budget that line WAS the brief: the component list, the
+        // edges and every later section were trimmed away behind it.
+        use travsr_core::EdgeKind;
+        let n = DETAIL_CAP + 5;
+        let nodes: Vec<_> = (0..n)
+            .map(|i| make_node(&format!("crates/c{i:03}/src/lib.rs"), &format!("fn:f{i}")))
+            .collect();
+        let edges: Vec<_> = (0..n)
+            .map(|i| (nodes[i].id, nodes[(i + 1) % n].id, EdgeKind::RefCall))
+            .collect();
+        let store = make_store(&nodes, &edges);
+        let out = get_architecture_brief(&store, "", 30_000);
+
+        let cycle_line = out
+            .lines()
+            .find(|l| l.contains("&lt;-&gt;"))
+            .unwrap_or_else(|| panic!("the ring must be reported as a cycle:\n{out}"));
+        assert_eq!(
+            cycle_line.matches("crates/c").count(),
+            DETAIL_CAP,
+            "exactly DETAIL_CAP members are named: {cycle_line}"
+        );
+        assert!(
+            cycle_line.ends_with(&format!("and {} more in this cycle", n - DETAIL_CAP)),
+            "the rest must be disclosed, not dropped: {cycle_line}"
+        );
+        assert!(
+            out.contains("## Components, by how many others depend on them"),
+            "the sections behind the cycle must survive it:\n{out}"
+        );
+    }
+
+    #[test]
+    fn subsystem_brief_called_from_is_external_in_component_mode() {
+        // A component's entries are by definition what something OUTSIDE calls,
+        // so a caller inside it is not calling in. travsr-retrieval's own
+        // `bfs_fallback` was listed under "Called from" beside the travsr-mcp
+        // callers, which answers a different question from the one the heading
+        // asks.
+        use travsr_core::EdgeKind;
+        let entry = make_node("crates/lib/src/api.rs", "fn:entry");
+        let sibling = make_node("crates/lib/src/internal.rs", "fn:sibling");
+        let outsider = make_node("crates/app/src/main.rs", "fn:outsider");
+        let store = make_store(
+            &[entry.clone(), sibling.clone(), outsider.clone()],
+            &[
+                (outsider.id, entry.id, EdgeKind::RefCall),
+                (sibling.id, entry.id, EdgeKind::RefCall),
+            ],
+        );
+
+        let out = get_subsystem_brief(&store, "", "crates/lib", "", 3, 6, 8_000);
+        let called_from = out
+            .split("## Called from")
+            .nth(1)
+            .unwrap_or_else(|| panic!("section must exist:\n{out}"))
+            .split("## Call spine")
+            .next()
+            .unwrap()
+            .to_string();
+        assert!(
+            called_from.contains("outsider"),
+            "the external caller must be listed: {called_from}"
+        );
+        assert!(
+            !called_from.contains("sibling"),
+            "a caller inside the component is not calling in: {called_from}"
+        );
+
+        // Naming the symbol directly asks a different question, and there every
+        // caller is wanted.
+        let by_entry = get_subsystem_brief(&store, "fn:entry", "", "", 3, 6, 8_000);
+        let called_from = by_entry
+            .split("## Called from")
+            .nth(1)
+            .unwrap()
+            .split("## Call spine")
+            .next()
+            .unwrap()
+            .to_string();
+        assert!(
+            called_from.contains("sibling") && called_from.contains("outsider"),
+            "entry mode lists every caller: {called_from}"
         );
     }
 
