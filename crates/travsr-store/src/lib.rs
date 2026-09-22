@@ -1964,6 +1964,22 @@ impl SqliteStore {
         .map_err(|e| StoreError::Database(e.to_string()))
     }
 
+    /// How many files the content-hash cache tracks.
+    ///
+    /// `init` reads this to tell a database that has never been indexed (no
+    /// nodes and no hashes) from one a failed rebuild emptied (no nodes, hashes
+    /// still there). The second needs a rebuild; the first is just new.
+    pub fn file_hash_count(&self) -> Result<u64, StoreError> {
+        (|| -> AnyResult<u64> {
+            let n: i64 = self
+                .conn
+                .query_row("SELECT count(*) FROM files", [], |row| row.get(0))
+                .context("counting file hashes")?;
+            Ok(n as u64)
+        })()
+        .map_err(|e| StoreError::Database(e.to_string()))
+    }
+
     pub fn edge_count(&self) -> Result<u64, StoreError> {
         (|| -> AnyResult<u64> {
             let n: i64 = self
@@ -2322,6 +2338,75 @@ impl SqliteStore {
             .execute("DELETE FROM files", [])
             .context("clearing file hashes")
             .map_err(|e| StoreError::Database(e.to_string()))
+    }
+
+    /// Delete the entire graph: every node, edge and derived index row.
+    ///
+    /// `reconcile` cannot do this. It computes ghosts as paths **in the `files`
+    /// table** that are absent from the walk, so it only ever deletes nodes for
+    /// paths `files` tracks. Two node populations are invisible to it: paths an
+    /// older binary indexed but no longer records a hash for (a vendored tree),
+    /// and nodes whose VName path is not a file at all (external package nodes
+    /// carry `path = ""`). On a v2 fastlane index 104 192 of 125 193 nodes
+    /// survived a "full" purge routed through `reconcile` that way.
+    ///
+    /// The survivors are fatal rather than merely stale: a NodeId hashes
+    /// `SIGNATURE_FORMAT_VERSION`, so a rebuild re-emits the same VName tuple
+    /// under a different id, `ON CONFLICT(id)` never sees the old row, and
+    /// `idx_nodes_vname` aborts the whole write. Re-parsing a file does not save
+    /// it either — the per-path delete in [`Self::write_file_graphs_batch`] is
+    /// keyed on the *file's* path, which an external package node does not
+    /// share.
+    ///
+    /// Deliberately left alone:
+    /// - `files` — the caller clears it with [`Self::clear_file_hashes`], which
+    ///   is also what `--force` needs on its own.
+    /// - `node_tombstones` — the v17 CDC log. The delete trigger appends one row
+    ///   per node here, which is exactly how the embed sidecar learns to drop
+    ///   the matching `embed.db` vectors.
+    /// - `ref_resolution_state` — #811: a surviving `pending` row is the honest
+    ///   record of a reference Phase B could not resolve, and it has to outlive
+    ///   an `init --semantic --force` (see
+    ///   [`Self::reconcile_ref_resolution_states`], which is where rows whose
+    ///   `src` this purge removed are dropped, on evidence rather than by a
+    ///   wipe).
+    /// - `meta`, `sessions`, `fts_synonyms` — stamps and user config, not graph.
+    ///   The one exception is `meta.phase_b_commit`, which claims Phase B is
+    ///   current for a commit and so is false once this runs; the caller deletes
+    ///   it alongside the hash cache.
+    ///
+    /// Returns the number of nodes removed.
+    pub fn purge_graph(&mut self) -> Result<u64, StoreError> {
+        (|| -> AnyResult<u64> {
+            let tx = self
+                .conn
+                .transaction()
+                .context("starting purge_graph transaction")?;
+            let count: i64 = tx
+                .query_row("SELECT COUNT(*) FROM nodes", [], |r| r.get(0))
+                .context("counting nodes to purge")?;
+            // `nodes_fts` / `nodes_fts_words` are contentless FTS5 tables, which
+            // forbid `DELETE FROM`; `'delete-all'` is the supported way to empty
+            // one, and unlike a row-by-row retraction it needs no surviving
+            // `nodes_fts_map` row to read the old tokens back from.
+            // `nodes_words_vocab` is an fts5vocab view over `nodes_fts_words`
+            // and empties with it.
+            tx.execute_batch(
+                "DELETE FROM edges; \
+                 DELETE FROM edge_sites; \
+                 DELETE FROM symbol_aliases; \
+                 INSERT INTO nodes_fts(nodes_fts) VALUES('delete-all'); \
+                 DELETE FROM nodes_fts_map; \
+                 INSERT INTO nodes_fts_words(nodes_fts_words) VALUES('delete-all'); \
+                 DELETE FROM nodes_fts_words_map; \
+                 DELETE FROM fts_vocab; \
+                 DELETE FROM nodes;",
+            )
+            .context("deleting graph tables")?;
+            tx.commit().context("committing purge_graph transaction")?;
+            Ok(count as u64)
+        })()
+        .map_err(|e| StoreError::Database(format!("{e:#}")))
     }
 
     /// Write a batch of parsed file graphs in a single SQLite transaction.
@@ -2691,7 +2776,7 @@ impl SqliteStore {
             tx.commit().context("committing batch write transaction")?;
             Ok(counts)
         })()
-        .map_err(|e| StoreError::Database(e.to_string()))
+        .map_err(|e| StoreError::Database(format!("{e:#}")))
     }
 
     /// Delete all nodes (and their edges) whose VName path equals `path`.
@@ -5084,6 +5169,14 @@ LIMIT ?4",
         Ok(())
     }
 
+    pub fn delete_meta(&mut self, key: &str) -> Result<(), StoreError> {
+        self.conn
+            .execute("DELETE FROM meta WHERE key = ?1", params![key])
+            .context("deleting meta key")
+            .map_err(|e| StoreError::Database(e.to_string()))?;
+        Ok(())
+    }
+
     /// Return the VName signature format version recorded in this database.
     ///
     /// Returns `0` for legacy databases (pre-RFC-002) that have no such row,
@@ -5097,6 +5190,38 @@ LIMIT ?4",
                 .unwrap_or_else(|| "0".to_string());
             raw.parse::<u8>()
                 .with_context(|| format!("invalid signature_format_version in meta: {raw}"))
+        })()
+        .map_err(|e| StoreError::Database(e.to_string()))
+    }
+
+    /// Whether a stored node's id is the one this binary derives from its VName.
+    ///
+    /// The `signature_format_version` stamp is a claim; the ids are evidence.
+    /// `VName::id()` hashes `SIGNATURE_FORMAT_VERSION` first, so one node whose
+    /// stored id differs from its re-derived id proves the graph was built under
+    /// another format whatever the stamp says (#918). An empty graph is `true`.
+    pub fn node_ids_match_current_format(&self) -> Result<bool, StoreError> {
+        (|| -> AnyResult<bool> {
+            let row = self
+                .conn
+                .query_row(
+                    "SELECT id, corpus, root, path, language, signature FROM nodes LIMIT 1",
+                    [],
+                    |row| {
+                        let id = i64_to_node_id(row.get::<_, i64>(0)?);
+                        let vname = VName::new(
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, String>(3)?,
+                            row.get::<_, String>(4)?,
+                            row.get::<_, String>(5)?,
+                        );
+                        Ok((id, vname))
+                    },
+                )
+                .optional()
+                .context("reading one node to check its id format")?;
+            Ok(row.map_or(true, |(id, vname)| vname.id() == id))
         })()
         .map_err(|e| StoreError::Database(e.to_string()))
     }
@@ -14547,6 +14672,87 @@ mod tests {
         assert_eq!(cleared, 2);
         assert!(store.get_all_file_hashes().unwrap().is_empty());
         assert!(store.get_file_hash("a.rs").unwrap().is_none());
+    }
+
+    /// `purge_graph` names its tables in a literal, so a migration that adds a
+    /// graph table would be silently left behind and the surviving rows would
+    /// collide with their own re-parse exactly as the v2 rebuild did. Every table
+    /// in the live schema must therefore be classified here on purpose: emptied
+    /// by the purge, emptied with its parent FTS index, or kept for a documented
+    /// reason. A new table fails this test until someone decides which it is.
+    #[test]
+    fn purge_graph_classifies_every_table_in_the_schema() {
+        use std::collections::BTreeSet;
+
+        /// Named in `purge_graph`'s statement batch.
+        const PURGED: &[&str] = &[
+            "nodes",
+            "edges",
+            "edge_sites",
+            "symbol_aliases",
+            "fts_vocab",
+            "nodes_fts",
+            "nodes_fts_map",
+            "nodes_fts_words",
+            "nodes_fts_words_map",
+        ];
+        /// FTS5 shadow tables and the fts5vocab view over one. Emptied by the
+        /// `'delete-all'` command on their parent, never by name.
+        const FTS_INTERNAL: &[&str] = &[
+            "nodes_fts_config",
+            "nodes_fts_data",
+            "nodes_fts_docsize",
+            "nodes_fts_idx",
+            "nodes_fts_words_config",
+            "nodes_fts_words_data",
+            "nodes_fts_words_docsize",
+            "nodes_fts_words_idx",
+            "nodes_words_vocab",
+        ];
+        /// Kept on purpose; `purge_graph`'s doc comment says why for each.
+        const KEPT: &[&str] = &[
+            "files",
+            "node_tombstones",
+            "ref_resolution_state",
+            "meta",
+            "sessions",
+            "fts_synonyms",
+        ];
+
+        let store = SqliteStore::open_in_memory().unwrap();
+        let live: BTreeSet<String> = {
+            let mut stmt = store
+                .conn
+                .prepare(
+                    "SELECT name FROM sqlite_master WHERE type = 'table' \
+                     AND name NOT LIKE 'sqlite_%'",
+                )
+                .unwrap();
+            stmt.query_map([], |r| r.get::<_, String>(0))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap()
+        };
+        let classified: BTreeSet<String> = PURGED
+            .iter()
+            .chain(FTS_INTERNAL)
+            .chain(KEPT)
+            .map(|t| (*t).to_string())
+            .collect();
+
+        let unclassified: Vec<&String> = live.difference(&classified).collect();
+        assert!(
+            unclassified.is_empty(),
+            "new table(s) {unclassified:?}: add them to PURGED if they hold graph \
+             rows (and to the statement batch in `purge_graph`), or to KEPT with \
+             the reason in its doc comment"
+        );
+        let vanished: Vec<&String> = classified.difference(&live).collect();
+        assert!(
+            vanished.is_empty(),
+            "table(s) {vanished:?} are listed here but no longer exist; \
+             `purge_graph` would fail on them"
+        );
     }
 
     #[test]

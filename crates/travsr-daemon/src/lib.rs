@@ -1474,8 +1474,23 @@ pub fn init_repo_with_progress(
     // could tell the two halves apart. Read the stored version BEFORE the stamp
     // overwrites it and drive the same full-rebuild path `--force` uses.
     // A read failure counts as skew: rebuilding is the recoverable direction.
+    //
+    // `nodes_before > 0` is not the right test for "there is an index here".
+    // A rebuild that purged and then failed leaves zero nodes with the old stamp
+    // intact, which is precisely the state the stamp was kept old to catch; read
+    // that way it looked like a brand-new database and the skew went unanswered
+    // forever. The `files` table is what separates the two: a database nobody has
+    // indexed has no hashes either, while the emptied one still has all of them.
+    //
+    // The stamp alone is not trusted either (#918). A 1.1.0 binary stamped the
+    // new format before its rebuild failed, leaving a current stamp over
+    // old-format ids that no plain `init` could get past. Re-deriving one
+    // stored node's id checks the claim against the evidence.
     let stored_sig_version = store.get_signature_format_version().unwrap_or(0);
-    let format_skew = nodes_before > 0 && stored_sig_version != SIGNATURE_FORMAT_VERSION;
+    let indexed_before = nodes_before > 0 || store.file_hash_count().unwrap_or(0) > 0;
+    let ids_current = store.node_ids_match_current_format().unwrap_or(false);
+    let format_skew =
+        indexed_before && (stored_sig_version != SIGNATURE_FORMAT_VERSION || !ids_current);
     if format_skew {
         eprintln!(
             "index format changed (v{stored_sig_version} -> v{SIGNATURE_FORMAT_VERSION}), \
@@ -1528,26 +1543,35 @@ pub fn init_repo_with_progress(
     // purging the existing graph so every file is re-parsed below. Config that changes
     // *semantic* output but not file content — e.g. `--allow-unsandboxed-lsif` —
     // is not part of the per-file hash delta, so without this a re-run would say
-    // "up to date" while never rebuilding those edges. Uses a 100%-ceiling policy
-    // because wiping the whole graph is the explicit, user-requested intent here.
+    // "up to date" while never rebuilding those edges.
     //
     // `format_skew` takes the same path for the same reason: every NodeId in the
     // stored graph was hashed under a different signature format, so re-parsing
     // only the changed files would leave the two formats mixed.
-    if (force || format_skew) && store.node_count().unwrap_or(0) > 0 {
+    //
+    // This used to run through `reconcile` with an empty walk set, which is the
+    // wrong tool: `reconcile` derives its delete set from the `files` table, so
+    // it cannot touch a node whose path `files` does not track — a vendored tree
+    // an older binary indexed, or an external package node, whose VName path is
+    // `""` and so is never any file. Those survivors then collided with their
+    // own re-parse on `idx_nodes_vname` and failed the whole init. `purge_graph`
+    // deletes the graph outright, which is what "rebuild from scratch" means.
+    //
+    // Deliberately NOT gated on `node_count() > 0`. An empty graph is exactly the
+    // state a rebuild that purged and then failed leaves behind, and skipping the
+    // block there skips `clear_file_hashes` with it: the hash delta then finds
+    // every file unchanged, indexes nothing, reports "up to date - 0 nodes", and
+    // the stamp below records the current format over an empty graph. The skew is
+    // gone, so no later run rebuilds either. Running the block on an empty graph
+    // costs one no-op transaction and is what lets the repository heal itself.
+    if force || format_skew {
         tracing::info!(force, format_skew, "purging graph for a full rebuild");
-        let empty_walked = std::collections::HashSet::<String>::new();
-        let purge_policy = travsr_core::SafetyPolicy {
-            mass_delete_ceiling_pct: 1.0,
-            ..Default::default()
-        };
-        store
-            .reconcile(&empty_walked, &purge_policy, repo_root, &corpus)
+        let purged = store
+            .purge_graph()
             .map_err(|e| anyhow::anyhow!("{e}"))
             .context("full-graph purge before rebuild")?;
-        // #757 audit: `reconcile` only prunes nodes for files absent from disk,
-        // so on-disk files keep their nodes AND their `files` content-hash rows.
-        // The hash-delta below would then skip every unchanged file, leaving the
+        // #757 audit: the purge does not touch the `files` content-hash rows, so
+        // the hash-delta below would skip every unchanged file and leave the
         // whole point of the rebuild (re-parse with the current analyzer, even
         // when file bytes are unchanged) unmet — it reported "up to date" over an
         // index an older binary built. Clearing the hash cache makes every file
@@ -1556,23 +1580,14 @@ pub fn init_repo_with_progress(
             .clear_file_hashes()
             .map_err(|e| anyhow::anyhow!("{e}"))
             .context("clearing file hash cache before rebuild")?;
-        tracing::info!(cleared, "cleared file hash cache for full re-parse");
+        // The purge removed every Phase B edge, so a `phase_b_commit` still at
+        // HEAD would tell the already-done gate and `arm_phase_b_if_pending`
+        // that Phase B is current over a graph that has none of it.
+        store
+            .delete_meta("phase_b_commit")
+            .context("clearing the Phase B marker before rebuild")?;
+        tracing::info!(purged, cleared, "purged graph for full re-parse");
     }
-
-    // RFC-002: the stamp must come AFTER the purge above, because a rebuild
-    // that fails or that the user interrupts would otherwise leave the new
-    // version stamped over old-format nodes: `format_skew` would read false on
-    // every later run, the hash delta would skip every unchanged file, and the
-    // `reindex_files` guard would stop firing, so the skew would become
-    // permanently undetectable.
-    //
-    // Nothing below reads the stamp back. Init's own indexing does not route
-    // through `reindex_files` (see the note on that at the Phase B step), so
-    // the older "stamp early or reindex_files skips every file" reasoning did
-    // not apply to this path and is not what holds the position here.
-    store
-        .set_signature_format_version(SIGNATURE_FORMAT_VERSION)
-        .context("writing signature_format_version")?;
 
     // Persist repo_root so MCP snippet tools can resolve vname.path → absolute
     // path at query time without threading repo_root through function signatures.
@@ -1863,6 +1878,26 @@ pub fn init_repo_with_progress(
             e
         }
     })?;
+
+    // RFC-002: the stamp goes here, after the rebuild it guards has actually
+    // landed — the purge ran, every file was parsed, staging was flushed and the
+    // FTS index was rebuilt, all above this point and all through a bare `?`.
+    // Written any earlier (it used to sit right after the purge) an init that
+    // failed or that the user interrupted left the current version recorded over
+    // old-format nodes: `format_skew` read false on every later run, the hash
+    // delta skipped every unchanged file and the `reindex_files` guard stopped
+    // firing, so the skew became permanently undetectable and the repo could not
+    // self-heal. The observed failure did exactly that — it aborted on a UNIQUE
+    // violation with the v3 stamp already committed, so a second `travsr init`
+    // reported a current index over a graph that was now missing most of itself.
+    //
+    // Nothing between the purge and here reads the stamp back. Init's own
+    // indexing does not route through `reindex_files` (see the note on that at
+    // the Phase B step), so the older "stamp early or reindex_files skips every
+    // file" reasoning did not apply to this path either.
+    store
+        .set_signature_format_version(SIGNATURE_FORMAT_VERSION)
+        .context("writing signature_format_version")?;
 
     // UX-023: sweep nodes for files that no longer exist on disk. The incremental
     // hash-delta path above only re-indexes files that are still present, so nodes
@@ -8879,10 +8914,10 @@ mod tests {
             store.set_signature_format_version(old).unwrap();
         }
 
-        // Make the purge fail where an interrupted rebuild would stop: the
-        // `reconcile` call reads the `files` table before it deletes anything.
-        // The schema version already matches, so reopening the store runs no
-        // migration and does not put the table back.
+        // Make the rebuild fail where an interrupted one would stop: the hash
+        // cache is cleared as part of the purge step, before a single file is
+        // parsed. The schema version already matches, so reopening the store
+        // runs no migration and does not put the table back.
         {
             let conn = rusqlite::Connection::open(&db_path).unwrap();
             conn.execute_batch("DROP TABLE files").unwrap();
@@ -8898,6 +8933,266 @@ mod tests {
             store.get_signature_format_version().unwrap(),
             old,
             "a failed rebuild must leave the old stamp so the skew stays detectable"
+        );
+    }
+
+    /// The format rebuild has to empty the graph, and routing it through
+    /// `reconcile` could not: `reconcile` derives its delete set from the
+    /// `files` table, so a node whose VName path `files` does not track is
+    /// invisible to it. An external package node is the smallest case — a
+    /// GitHub Actions `uses:` reference is stored with `path = ""`, which is not
+    /// a file and never will be. It survived the purge, and the per-path delete
+    /// in `write_file_graphs_batch` did not reach it either, because that is
+    /// keyed on the workflow file's own path. The rebuild then re-emitted the
+    /// same VName under a new id (a NodeId hashes SIGNATURE_FORMAT_VERSION),
+    /// `ON CONFLICT(id)` never saw the old row, and `idx_nodes_vname` aborted
+    /// the init:
+    ///
+    ///   UNIQUE constraint failed: nodes.corpus, nodes.root, nodes.path,
+    ///   nodes.language, nodes.signature
+    ///
+    /// Measured on a v2 fastlane index: 104 192 of 125 193 nodes survived that
+    /// purge, under 5455 paths the `files` table (1992 rows) did not track.
+    #[test]
+    fn init_repo_rebuild_removes_nodes_the_files_table_never_tracked() {
+        let tmp = tempfile::tempdir().unwrap();
+        git_init(tmp.path());
+        std::fs::create_dir_all(tmp.path().join(".github/workflows")).unwrap();
+        std::fs::write(
+            tmp.path().join(".github/workflows/ci.yml"),
+            "jobs:\n  build:\n    steps:\n      - uses: actions/checkout@v7\n",
+        )
+        .unwrap();
+        assert_eq!(init_repo(tmp.path()).unwrap().files_indexed, 1);
+
+        let db_path = tmp.path().join(".travsr/graph.db");
+        let untracked = || -> i64 {
+            rusqlite::Connection::open(&db_path)
+                .unwrap()
+                .query_row(
+                    "SELECT COUNT(*) FROM nodes WHERE path NOT IN (SELECT path FROM files)",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        };
+        assert_eq!(
+            untracked(),
+            1,
+            "fixture must leave exactly the package node the `files` table cannot see"
+        );
+
+        // Make it a graph an older binary wrote: the same VName tuples under
+        // ids hashed from a different SIGNATURE_FORMAT_VERSION, so the re-parse
+        // reproduces each VName under an id that is not the stored one.
+        // `-id - 1` is bitwise NOT: a bijection, so it cannot collide.
+        let stale_ids: Vec<i64> = {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute("UPDATE nodes SET id = -id - 1", []).unwrap();
+            let mut stmt = conn.prepare("SELECT id FROM nodes").unwrap();
+            let ids = stmt
+                .query_map([], |r| r.get(0))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<i64>>>()
+                .unwrap();
+            ids
+        };
+        let old = travsr_core::SIGNATURE_FORMAT_VERSION - 1;
+        {
+            let mut store = travsr_store::SqliteStore::open(&db_path).unwrap();
+            store.set_signature_format_version(old).unwrap();
+        }
+
+        init_repo(tmp.path()).expect("a format rebuild must not collide with its own old rows");
+
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        for id in stale_ids {
+            let survived: i64 = conn
+                .query_row("SELECT COUNT(*) FROM nodes WHERE id = ?1", [id], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            assert_eq!(
+                survived, 0,
+                "old-format row {id} survived the rebuild; those are the rows that collide"
+            );
+        }
+        let packages: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM nodes WHERE signature = 'pkg:actions/checkout@v7'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(packages, 1, "the package node must be rebuilt exactly once");
+        assert_eq!(untracked(), 1, "and still be the only untracked node");
+    }
+
+    /// #918's on-disk state: a 1.1.0 binary stamped the current format, then
+    /// failed its rebuild, and the hash cache was already cleared. The stamp
+    /// read current, so `format_skew` was false, init took the incremental path
+    /// and the path-less package node collided with its re-keyed self on
+    /// `idx_nodes_vname` on every plain run. The ids have to override the stamp.
+    #[test]
+    fn init_repo_rebuilds_when_the_stamp_lies_about_the_ids() {
+        let tmp = tempfile::tempdir().unwrap();
+        git_init(tmp.path());
+        std::fs::create_dir_all(tmp.path().join(".github/workflows")).unwrap();
+        std::fs::write(
+            tmp.path().join(".github/workflows/ci.yml"),
+            "jobs:\n  build:\n    steps:\n      - uses: actions/checkout@v7\n",
+        )
+        .unwrap();
+        assert_eq!(init_repo(tmp.path()).unwrap().files_indexed, 1);
+
+        let db_path = tmp.path().join(".travsr/graph.db");
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute_batch("UPDATE nodes SET id = -id - 1; DELETE FROM files;")
+                .unwrap();
+        }
+        assert_eq!(
+            travsr_store::SqliteStore::open(&db_path)
+                .unwrap()
+                .get_signature_format_version()
+                .unwrap(),
+            travsr_core::SIGNATURE_FORMAT_VERSION,
+            "the fixture's stamp must claim the current format"
+        );
+
+        let rebuilt = init_repo(tmp.path())
+            .expect("a current stamp over old-format ids must rebuild, not collide");
+        assert_eq!(rebuilt.files_indexed, 1);
+        let store = travsr_store::SqliteStore::open(&db_path).unwrap();
+        assert!(store.node_ids_match_current_format().unwrap());
+    }
+
+    /// The purge removes every Phase B edge, so the marker saying Phase B is
+    /// current for HEAD has to go with them. Left in place, the already-done
+    /// gate and `arm_phase_b_if_pending` both read the empty call graph as
+    /// current until the next commit.
+    #[test]
+    fn init_repo_format_rebuild_clears_the_phase_b_marker() {
+        let tmp = tempfile::tempdir().unwrap();
+        git_init(tmp.path());
+        std::fs::write(tmp.path().join("a.ts"), "export class A { go() {} }").unwrap();
+        assert_eq!(init_repo(tmp.path()).unwrap().files_indexed, 1);
+
+        let db_path = tmp.path().join(".travsr/graph.db");
+        {
+            let mut store = travsr_store::SqliteStore::open(&db_path).unwrap();
+            store.set_meta("phase_b_commit", "abc123").unwrap();
+            store
+                .set_signature_format_version(travsr_core::SIGNATURE_FORMAT_VERSION - 1)
+                .unwrap();
+        }
+
+        assert_eq!(init_repo(tmp.path()).unwrap().files_indexed, 1);
+        let store = travsr_store::SqliteStore::open(&db_path).unwrap();
+        assert_eq!(store.get_meta("phase_b_commit").unwrap(), None);
+    }
+
+    /// The stamp guards the rebuild, so it cannot be written until the rebuild
+    /// has landed — not merely until the purge has. The observed failure was
+    /// exactly this: the purge succeeded, the stamp was committed, indexing then
+    /// aborted on a UNIQUE violation, and the repo was left claiming the current
+    /// format over a graph that had just lost most of itself, with `format_skew`
+    /// reading false on every later run so it could never self-heal.
+    #[test]
+    fn init_repo_keeps_the_old_stamp_when_the_rebuild_indexing_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        git_init(tmp.path());
+        std::fs::write(tmp.path().join("a.ts"), "export class A { go() {} }").unwrap();
+        assert_eq!(init_repo(tmp.path()).unwrap().files_indexed, 1);
+
+        let db_path = tmp.path().join(".travsr/graph.db");
+        let old = travsr_core::SIGNATURE_FORMAT_VERSION - 1;
+        {
+            let mut store = travsr_store::SqliteStore::open(&db_path).unwrap();
+            store.set_signature_format_version(old).unwrap();
+        }
+
+        // Fail the write of the re-parsed graph, which is where the real
+        // failure landed: after the purge has already emptied the old one.
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TRIGGER fail_node_insert BEFORE INSERT ON nodes \
+                 BEGIN SELECT RAISE(ABORT, 'simulated indexing failure'); END;",
+            )
+            .unwrap();
+        }
+
+        assert!(
+            init_repo(tmp.path()).is_err(),
+            "a rebuild whose indexing fails must fail the init"
+        );
+
+        let store = travsr_store::SqliteStore::open(&db_path).unwrap();
+        assert_eq!(
+            store.get_signature_format_version().unwrap(),
+            old,
+            "a rebuild that purged but never re-indexed must leave the old stamp, \
+             so the next run still sees the skew and rebuilds again"
+        );
+    }
+
+    /// Keeping the old stamp only matters if the next run acts on it. It could
+    /// not: the purge block was gated on `node_count() > 0`, and a rebuild that
+    /// purged and then failed leaves exactly zero nodes. The next run skipped the
+    /// block, skipped `clear_file_hashes` with it, found every file unchanged,
+    /// indexed nothing, reported "up to date - 0 nodes" and then stamped the
+    /// current format over the empty graph. From there `format_skew` read false
+    /// forever and no later run rebuilt either, which is the same dead end the
+    /// stamp move exists to prevent, reached one run later.
+    #[test]
+    fn init_repo_rebuilds_again_after_a_failed_rebuild_emptied_the_graph() {
+        let tmp = tempfile::tempdir().unwrap();
+        git_init(tmp.path());
+        std::fs::write(tmp.path().join("a.ts"), "export class A { go() {} }").unwrap();
+        assert_eq!(init_repo(tmp.path()).unwrap().files_indexed, 1);
+
+        let db_path = tmp.path().join(".travsr/graph.db");
+        let old = travsr_core::SIGNATURE_FORMAT_VERSION - 1;
+        {
+            let mut store = travsr_store::SqliteStore::open(&db_path).unwrap();
+            store.set_signature_format_version(old).unwrap();
+        }
+
+        // Fail the rebuild after the purge has already emptied the graph.
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER fail_node_insert BEFORE INSERT ON nodes \
+             BEGIN SELECT RAISE(ABORT, 'simulated indexing failure'); END;",
+        )
+        .unwrap();
+        assert!(init_repo(tmp.path()).is_err());
+        assert_eq!(
+            travsr_store::SqliteStore::open(&db_path)
+                .unwrap()
+                .node_count()
+                .unwrap(),
+            0,
+            "the fixture must leave the empty graph this test is about"
+        );
+        conn.execute_batch("DROP TRIGGER fail_node_insert;")
+            .unwrap();
+        drop(conn);
+
+        // The recovery run. Nothing on disk changed, so only the preserved skew
+        // can drive it.
+        init_repo(tmp.path()).expect("the run after a failed rebuild must rebuild");
+
+        let store = travsr_store::SqliteStore::open(&db_path).unwrap();
+        assert!(
+            store.node_count().unwrap() > 0,
+            "the recovery run must re-parse the repo, not report itself up to date \
+             over the graph the failed rebuild emptied"
+        );
+        assert_eq!(
+            store.get_signature_format_version().unwrap(),
+            travsr_core::SIGNATURE_FORMAT_VERSION,
+            "and only then may it stamp the current format"
         );
     }
 
