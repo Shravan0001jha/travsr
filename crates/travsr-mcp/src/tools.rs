@@ -3647,6 +3647,1313 @@ pub fn get_blast_radius_global(
     sanitize_for_mcp(&raw)
 }
 
+/// How many rows a brief lists before it stops and says how many it skipped.
+///
+/// Ranked, so the head is the load-bearing part of the answer. 60 covers every
+/// component of a normal repository outright and still fits a monorepo's
+/// interesting head: kubernetes resolves 3379 components, and the 60 most
+/// depended-upon are the architecture a reader is asking about.
+const LIST_CAP: usize = 60;
+
+/// How many components get their own detail block. Lower than `LIST_CAP`
+/// because each block is several lines, not one.
+const DETAIL_CAP: usize = 20;
+
+/// Sanitize a brief, then cut it back to the last whole line that fits, and say
+/// what was dropped.
+///
+/// The byte limit alone cut mid-row — a kubernetes brief ended on
+/// `... | depends on 0 | 5 f`. A half-written fact is worse than an absent one:
+/// it reads as data.
+///
+/// ORDER MATTERS, and getting it wrong is what made a first attempt at this look
+/// like it worked. `sanitize_mcp_body_with_limit` escapes `<` and `>` into
+/// four-byte entities and truncates AFTER that, so a body trimmed to whole lines
+/// first comes back over the limit and is cut at a raw byte boundary anyway. An
+/// architecture brief is full of `->` and a subsystem brief of `<-`, so both
+/// still ended mid-row, and the subsystem listing ended on its own truncation
+/// notice: `[brief trun`. Escape first, trim second, and the body is both inside
+/// the limit and made of whole lines.
+fn render_brief(body: &str, limit: usize) -> String {
+    const NOTICE: &str =
+        "\n[brief truncated to fit the token budget; raise token_budget for the rest]\n";
+    // Escaping can quadruple a run of angle brackets, so give the sanitizer room
+    // to escape everything that could still fit; the trim below is what enforces
+    // `limit` on the result.
+    let escaped = sanitize_mcp_body_with_limit(body, limit.saturating_mul(4));
+    if escaped.len() <= limit {
+        return escaped;
+    }
+    let mut end = escaped.len().min(limit.saturating_sub(NOTICE.len()));
+    // `end` is a byte offset into escaped UTF-8; walk it back to a boundary
+    // before slicing, or a multi-byte identifier panics the tool.
+    while end > 0 && !escaped.is_char_boundary(end) {
+        end -= 1;
+    }
+    let cut = escaped[..end].rfind('\n').map_or(0, |i| i + 1);
+    format!("{}{NOTICE}", &escaped[..cut])
+}
+
+/// Byte cap for a brief, from a caller's token budget.
+///
+/// `sanitize_for_mcp` caps at 4 KiB, which silently cut an architecture brief
+/// off mid-line and dropped its last section entirely. A brief is a fact packet
+/// meant to be read whole, so the caller sets the size, as `get_context` does.
+fn brief_byte_limit(token_budget: usize) -> usize {
+    token_budget
+        .saturating_mul(TOKEN_CHARS_PER_TOKEN)
+        .clamp(4_096, 512_000)
+}
+
+/// Directories that support the product rather than being it.
+///
+/// Language-agnostic by listing every convention the indexed languages use:
+/// `test`/`tests`/`spec`/`__tests__` (most), `testdata` (Go), `fixtures`,
+/// `bench`/`benches`, `examples`, `docs`, plus build and dependency caches.
+/// Matched per path segment, so a component named `contest` is not caught.
+fn is_support_component(path: &str) -> bool {
+    path.split('/').any(|seg| {
+        matches!(
+            seg.to_ascii_lowercase().as_str(),
+            "test"
+                | "tests"
+                | "spec"
+                | "specs"
+                | "__tests__"
+                | "testdata"
+                | "fixture"
+                | "fixtures"
+                | "bench"
+                | "benches"
+                | "benchmark"
+                | "benchmarks"
+                | "fuzz"
+                | "example"
+                | "examples"
+                | "doc"
+                | "docs"
+                | "scripts"
+                | "vendor"
+                | "node_modules"
+                | "target"
+                | "build"
+                | "dist"
+                | ".github"
+                | ".claude"
+        )
+    })
+}
+
+/// Whether a node puts its directory on the architecture map.
+///
+/// Reuses the two rules `get_repo_map` already applies rather than inventing a
+/// third, because a third definition of "component" is what made the earlier
+/// generators disagree:
+///
+/// - [`repo_map_is_symbol_kind`] — a component is a directory that owns code.
+///   Without it, `kind = "file"` nodes carried every path that holds no symbols
+///   at all into the map: `is_structural_noise` drops doc chunks but keeps the
+///   file node beside them, so `CLAUDE.md`, `Cargo.toml`, `README.md` and nine
+///   more root-level files each became their own component, "1 files, 0
+///   symbols". On this repository that was 12 of the 39 reported components.
+/// - [`repo_map_is_local_path`] — a synthetic angle-bracket pseudo-path
+///   (`<cgo_synthetic>/main.go`) is not a directory and cannot be a component,
+///   which `get_repo_map_excludes_synthetic_pseudo_paths` already pins for the
+///   repo map.
+fn is_component_member(n: &travsr_core::Node) -> bool {
+    repo_map_is_local_path(&n.vname.path)
+        && repo_map_is_symbol_kind(&n.kind)
+        && !n.test_role.is_test()
+        && !travsr_core::noise::is_structural_noise(n)
+}
+
+/// Whether a signature names a type declaration, in any of the indexed languages.
+///
+/// The set is the canonical prefixes the analyzers normalise to, collected from
+/// their own capture tables: `struct` also carries C and C++ unions, `class`
+/// also carries Dart mixins, Kotlin objects, Scala traits and Objective-C
+/// protocols, and `type` also carries typedefs and C# delegates.
+fn is_type_signature(signature: &str) -> bool {
+    matches!(
+        signature.split(':').next().unwrap_or(""),
+        "struct" | "enum" | "class" | "interface" | "trait" | "type" | "protocol" | "actor"
+    )
+}
+
+/// Whether a signature names a program entry point.
+///
+/// `fn:main` covers the languages whose entry is a free function (Rust, Go, C,
+/// C++, Python, Dart); `method:X.main` covers the ones where it is a static
+/// method on a class (Java, Kotlin, C#, Scala). A language whose entry is a
+/// module-level side effect, such as Python's `__main__` guard or a JavaScript
+/// index module, has no symbol to find and is simply not reported.
+fn is_entry_point_signature(signature: &str) -> bool {
+    if signature == "fn:main" {
+        return true;
+    }
+    // C# spells it `Main`; Java, Kotlin and Scala spell it `main`. Compare the
+    // member case-insensitively rather than listing both spellings. Verified
+    // against real csharp, java and scala indexes.
+    signature
+        .strip_prefix("method:")
+        .and_then(|m| m.rsplit('.').next())
+        .is_some_and(|member| member.eq_ignore_ascii_case("main"))
+}
+
+// ── get_architecture_brief ────────────────────────────────────────────────────
+
+/// Strongly connected components, iterative Tarjan.
+///
+/// Iterative rather than recursive because a monorepo can have hundreds of
+/// components and a deep chain would otherwise blow the stack.
+fn arch_sccs(
+    nodes: &[String],
+    adj: &std::collections::HashMap<String, Vec<String>>,
+) -> Vec<Vec<String>> {
+    use std::collections::{HashMap, HashSet};
+    let mut index: HashMap<&str, usize> = HashMap::new();
+    let mut low: HashMap<&str, usize> = HashMap::new();
+    let mut on_stack: HashSet<&str> = HashSet::new();
+    let mut stack: Vec<&str> = Vec::new();
+    let mut out: Vec<Vec<String>> = Vec::new();
+    let mut counter = 0usize;
+
+    for root in nodes {
+        if index.contains_key(root.as_str()) {
+            continue;
+        }
+        let mut work: Vec<(&str, usize)> = vec![(root.as_str(), 0)];
+        while let Some(&mut (v, ref mut pi)) = work.last_mut() {
+            if *pi == 0 {
+                index.insert(v, counter);
+                low.insert(v, counter);
+                counter += 1;
+                stack.push(v);
+                on_stack.insert(v);
+            }
+            let kids = adj.get(v).map(|k| k.as_slice()).unwrap_or(&[]);
+            if *pi < kids.len() {
+                let w = kids[*pi].as_str();
+                *pi += 1;
+                if !index.contains_key(w) {
+                    work.push((w, 0));
+                } else if on_stack.contains(w) {
+                    let lv = low[v].min(index[w]);
+                    low.insert(v, lv);
+                }
+                continue;
+            }
+            if low[v] == index[v] {
+                let mut group = Vec::new();
+                while let Some(w) = stack.pop() {
+                    on_stack.remove(w);
+                    group.push(w.to_string());
+                    if w == v {
+                        break;
+                    }
+                }
+                group.sort();
+                out.push(group);
+            }
+            work.pop();
+            if let Some(&(parent, _)) = work.last() {
+                let lp = low[parent].min(low[v]);
+                low.insert(parent, lp);
+            }
+        }
+    }
+    out
+}
+
+/// The shape of a repository: its components, how they depend on each other,
+/// what each one owns, and where the cycles are.
+///
+/// Components are the SAME unit `get_subsystem_brief` uses. Three separate
+/// definitions of "component" across the generators is what made their outputs
+/// disagree with each other, so there is one rule and both tools share it.
+///
+/// Layering is the longest path to a component that depends on nothing
+/// internally, computed over the cycle condensation so a cycle cannot make it
+/// diverge.
+pub fn get_architecture_brief(
+    store: &SqliteStore,
+    provenance: &str,
+    token_budget: usize,
+) -> String {
+    use std::collections::{BTreeMap, BTreeSet, HashMap};
+
+    // An unknown filter matches no edge, which the brief would otherwise report
+    // as analysis that has not run.
+    if !PROVENANCE_FILTERS.contains(&provenance) {
+        return sanitize_for_mcp(&format!(
+            "unknown provenance '{provenance}'. Use 'ratified' for confirmed edges, '' for \
+             everything, or name one provenance exactly (tree-sitter, lsif, scip, live)."
+        ));
+    }
+
+    let nodes = match store.all_nodes() {
+        Ok(n) => n,
+        Err(e) => {
+            tracing::warn!("get_architecture_brief: all_nodes error: {e}");
+            return sanitize_for_mcp("");
+        }
+    };
+    let pairs = match store.resolved_dep_pairs(provenance) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!("get_architecture_brief: resolved_dep_pairs error: {e}");
+            return sanitize_for_mcp("");
+        }
+    };
+
+    // Components and their contents.
+    let mut files: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut symbols: BTreeMap<String, usize> = BTreeMap::new();
+    let mut entries: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut declared: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut member_of: BTreeMap<String, HashMap<String, usize>> = BTreeMap::new();
+
+    for n in &nodes {
+        if !is_component_member(n) {
+            continue;
+        }
+        let comp = subsystem_component_of(&n.vname.path);
+        files
+            .entry(comp.clone())
+            .or_default()
+            .insert(n.vname.path.clone());
+        *symbols.entry(comp.clone()).or_insert(0) += 1;
+        let sig = simple_symbol(&n.vname.signature).to_string();
+        // Key on the SIGNATURE PREFIX, not `kind`. The prefix is the canonical
+        // form every analyzer normalises to; `kind` is the language's own word.
+        // A C union is stored kind="union" signature="struct:Name", a Dart mixin
+        // and a Kotlin object are both "class:", a typedef and a C# delegate are
+        // both "type:". Matching on `kind` silently found no types at all in C,
+        // C++, Dart, Kotlin, Objective-C and Swift.
+        if is_type_signature(&n.vname.signature) {
+            declared
+                .entry(comp.clone())
+                .or_default()
+                .insert(sig.clone());
+        }
+        // Check the FILE's path, not the component's. Components roll up to the
+        // package root, so `crates/x/examples/bench.rs` lands in component
+        // `crates/x`, which is not a support directory: a benchmark example and
+        // a test harness were both reported as the package's entry point.
+        if is_entry_point_signature(&n.vname.signature) && !is_support_component(&n.vname.path) {
+            entries
+                .entry(comp.clone())
+                .or_default()
+                .push(n.vname.path.clone());
+        }
+        // A type's usage lands on its members, not its declaration: `struct:VName`
+        // has one incoming reference while `method:VName.new` has hundreds. Fold
+        // `Type.member` into `Type` or the ranking is meaningless.
+        let base = sig.split('.').next().unwrap_or(&sig).to_string();
+        member_of.entry(comp).or_default().entry(base).or_insert(0);
+    }
+
+    let mut by_id: HashMap<travsr_core::NodeId, &travsr_core::Node> = HashMap::new();
+    for n in &nodes {
+        by_id.insert(n.id, n);
+    }
+    if let Ok(edges) = store.all_edges() {
+        for (_, dst, kind, prov) in &edges {
+            // References only. `defines/binding` runs from a type to each of its
+            // members, so counting it ranked types by how many members they have.
+            if !matches!(
+                kind.as_str(),
+                "ref/call"
+                    | "ref/field"
+                    | "ref/imports"
+                    | "is-implementation"
+                    | "overrides"
+                    | "ffi/call"
+            ) || !provenance_allowed(provenance, prov)
+            {
+                continue;
+            }
+            if let Some(n) = by_id.get(dst) {
+                if !is_component_member(n) {
+                    continue;
+                }
+                let comp = subsystem_component_of(&n.vname.path);
+                let sig = simple_symbol(&n.vname.signature);
+                let base = sig.split('.').next().unwrap_or(sig).to_string();
+                if let Some(m) = member_of.get_mut(&comp) {
+                    *m.entry(base).or_insert(0) += 1;
+                }
+            }
+        }
+    }
+
+    // Component-to-component edges, weighted by distinct crossing file pairs.
+    let mut weight: BTreeMap<(String, String), usize> = BTreeMap::new();
+    for (src, dst) in &pairs {
+        let a = subsystem_component_of(src);
+        let b = subsystem_component_of(dst);
+        if a == b || !files.contains_key(&a) || !files.contains_key(&b) {
+            continue;
+        }
+        *weight.entry((a, b)).or_insert(0) += 1;
+    }
+
+    // Drop supporting directories, but only while that still leaves a graph. A
+    // library's only internal consumers can BE its tests and examples, and an
+    // empty diagram is worse than a noisy one.
+    let product: Vec<String> = files
+        .keys()
+        .filter(|c| !is_support_component(c))
+        .cloned()
+        .collect();
+    let product_edges = weight
+        .keys()
+        .filter(|(a, b)| !is_support_component(a) && !is_support_component(b))
+        .count();
+    let (names, view): (Vec<String>, &str) = if product.len() >= 2 && product_edges >= 1 {
+        weight.retain(|(a, b), _| !is_support_component(a) && !is_support_component(b));
+        (product, "tests, benchmarks and docs excluded")
+    } else {
+        (
+            files.keys().cloned().collect(),
+            "tests and examples included, because they carry the only dependencies here",
+        )
+    };
+    if names.is_empty() {
+        return sanitize_for_mcp("no components: this index has no indexed source files.");
+    }
+
+    let mut adj: HashMap<String, Vec<String>> = HashMap::new();
+    let mut in_deg: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for (a, b) in weight.keys() {
+        adj.entry(a.clone()).or_default().push(b.clone());
+        in_deg.entry(b.clone()).or_default().insert(a.clone());
+    }
+
+    // Layer = longest path to a sink over the SCC condensation.
+    let sccs = arch_sccs(&names, &adj);
+    let mut owner: HashMap<&str, usize> = HashMap::new();
+    for (i, g) in sccs.iter().enumerate() {
+        for m in g {
+            owner.insert(m.as_str(), i);
+        }
+    }
+    let mut cond: Vec<BTreeSet<usize>> = vec![BTreeSet::new(); sccs.len()];
+    for (a, b) in weight.keys() {
+        let (x, y) = (owner[a.as_str()], owner[b.as_str()]);
+        if x != y {
+            cond[x].insert(y);
+        }
+    }
+    // Tarjan emits an SCC only after every SCC reachable from it, so `cond[i]`
+    // can hold nothing but indices below `i` and one ascending pass resolves each
+    // component after everything it points at. O(V + E).
+    //
+    // That ordering is the whole proof, so it is asserted rather than assumed.
+    // The previous version walked a DFS per component and folded over its
+    // reverse PREORDER, which is not a topological order — on 0 -> 1, 1 -> 2,
+    // 0 -> 2 it settles 1 before 2 and puts both on layer 0. It agreed with this
+    // only because the ascending outer loop had already resolved every successor,
+    // which is the same guarantee, reached the long way round.
+    let mut depth = vec![0usize; sccs.len()];
+    for i in 0..sccs.len() {
+        debug_assert!(
+            cond[i].iter().all(|&j| j < i),
+            "arch_sccs must emit in reverse topological order for layering to hold"
+        );
+        depth[i] = cond[i].iter().map(|&j| depth[j] + 1).max().unwrap_or(0);
+    }
+    let layer_of = |c: &str| depth[owner[c]];
+    let max_layer = names.iter().map(|n| layer_of(n)).max().unwrap_or(0);
+
+    let mut out = String::new();
+    out.push_str("ARCHITECTURE BRIEF\n");
+    out.push_str(&format!(
+        "provenance={} | components are one per package where the repo has them, else the \
+         containing directory | {} | snapshot of the code as indexed\n\n",
+        if provenance.is_empty() {
+            "all"
+        } else {
+            provenance
+        },
+        view
+    ));
+
+    let cycles: Vec<&Vec<String>> = sccs.iter().filter(|g| g.len() > 1).collect();
+    out.push_str(&format!(
+        "## Shape\n- {} component{}, {} edge{}, {} layer{}\n- {}\n\n",
+        names.len(),
+        if names.len() == 1 { "" } else { "s" },
+        weight.len(),
+        if weight.len() == 1 { "" } else { "s" },
+        max_layer + 1,
+        if max_layer == 0 { "" } else { "s" },
+        if cycles.is_empty() {
+            "acyclic".to_string()
+        } else {
+            format!(
+                "{} dependency cycle{}, listed below",
+                cycles.len(),
+                if cycles.len() == 1 { "" } else { "s" }
+            )
+        }
+    ));
+
+    if weight.is_empty() {
+        out.push_str(
+            "## No dependencies resolved\nTravsr recorded no cross-component edges here. That \
+             usually means full cross-file analysis has not run for this language, not that the \
+             components are independent. Read every \"depends on nothing\" below as unknown, \
+             never as none.\n\n",
+        );
+    }
+
+    if !cycles.is_empty() {
+        // Capped in both directions, like every other list here. A cycle is one
+        // SCC, so a single one can span the whole repository: a 140-component
+        // ring wrote one 5311-character line, and at a small token_budget that
+        // one line WAS the brief — the component list, the edges and every later
+        // section were trimmed away behind it.
+        out.push_str(&format!(
+            "## Cycles ({} of {})\n",
+            cycles.len().min(LIST_CAP),
+            cycles.len()
+        ));
+        for g in cycles.iter().take(LIST_CAP) {
+            // Members get the tighter cap: naming a cycle takes a few components,
+            // and `LIST_CAP` of them still wrote a 2311-character line that at a
+            // small budget crowded out the component list behind it.
+            let shown = g.len().min(DETAIL_CAP);
+            out.push_str(&format!("- {}", g[..shown].join(" <-> ")));
+            if g.len() > shown {
+                out.push_str(&format!(
+                    " <-> ... and {} more in this cycle",
+                    g.len() - shown
+                ));
+            }
+            out.push('\n');
+        }
+        if cycles.len() > LIST_CAP {
+            out.push_str(&format!(
+                "- ... and {} more cycles\n",
+                cycles.len() - LIST_CAP
+            ));
+        }
+        out.push('\n');
+    }
+
+    let dependents = |c: &str| in_deg.get(c).map(|s| s.len()).unwrap_or(0);
+    let mut ranked: Vec<&String> = names.iter().collect();
+    ranked.sort_by(|a, b| dependents(b).cmp(&dependents(a)).then_with(|| a.cmp(b)));
+
+    // Every list below is capped and discloses its remainder. Unbounded, the
+    // byte limit did the cutting instead: on kubernetes (3379 components) the
+    // brief emitted 346 of them, ended mid-line, and dropped its last two
+    // sections with no indication they had ever existed. A ranked head plus an
+    // honest count is a usable answer; a silent tenth of one is not.
+    let omitted = |shown: usize, total: usize, what: &str| -> String {
+        if total > shown {
+            format!("- ... and {} more {what}, ranked lower\n", total - shown)
+        } else {
+            String::new()
+        }
+    };
+
+    out.push_str(&format!(
+        "## Components, by how many others depend on them ({} of {})\n",
+        ranked.len().min(LIST_CAP),
+        ranked.len()
+    ));
+    for c in ranked.iter().take(LIST_CAP) {
+        let deps = weight.keys().filter(|(a, _)| a == *c).count();
+        out.push_str(&format!(
+            "- {} | layer {} | {} dependent{} | depends on {} | {} files | {} symbols\n",
+            c,
+            layer_of(c),
+            dependents(c),
+            if dependents(c) == 1 { "" } else { "s" },
+            deps,
+            files.get(*c).map(|f| f.len()).unwrap_or(0),
+            symbols.get(*c).copied().unwrap_or(0)
+        ));
+    }
+
+    out.push_str(&omitted(LIST_CAP, ranked.len(), "components"));
+
+    let mut ws: Vec<(&(String, String), &usize)> = weight.iter().collect();
+    ws.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
+    out.push_str(&format!(
+        "\n## Dependency edges, heaviest first ({} of {}; weight = distinct file pairs crossing)\n",
+        ws.len().min(LIST_CAP),
+        ws.len()
+    ));
+    for ((a, b), w) in ws.iter().take(LIST_CAP) {
+        out.push_str(&format!("- {a} -> {b} ({w})\n"));
+    }
+    out.push_str(&omitted(LIST_CAP, ws.len(), "edges"));
+
+    out.push_str(&format!(
+        "\n## What each component owns ({} of {})\n",
+        ranked.len().min(DETAIL_CAP),
+        ranked.len()
+    ));
+    for c in ranked.iter().take(DETAIL_CAP) {
+        out.push_str(&format!("### {c}\n"));
+        if let Some(es) = entries.get(*c) {
+            for e in es.iter().take(2) {
+                out.push_str(&format!("- entry point: {e}\n"));
+            }
+        }
+        if let (Some(decl), Some(m)) = (declared.get(*c), member_of.get(*c)) {
+            let mut ts: Vec<(&String, usize)> = decl
+                .iter()
+                .map(|t| (t, m.get(t).copied().unwrap_or(0)))
+                .collect();
+            ts.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+            let shown: Vec<String> = ts
+                .iter()
+                .take(6)
+                .map(|(t, n)| format!("{t} ({n})"))
+                .collect();
+            if !shown.is_empty() {
+                out.push_str(&format!("- most referenced types: {}\n", shown.join(", ")));
+            }
+        }
+        let ins: Vec<&String> = in_deg
+            .get(*c)
+            .map(|s| s.iter().collect())
+            .unwrap_or_default();
+        if !ins.is_empty() {
+            out.push_str(&format!(
+                "- used by: {}\n",
+                ins.iter()
+                    .map(|s| s.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+    }
+
+    out.push_str(&omitted(DETAIL_CAP, ranked.len(), "components detailed"));
+
+    if let Some(note) = phase_b_degraded_note(store) {
+        out.push_str(&format!("\n## Freshness\n{note}\n"));
+    }
+    out.push_str(
+        "\n## What this brief cannot tell you\n\
+         - a missing edge means the graph did not resolve it, not that it does not exist\n\
+         - type counts are references reaching a type or one of its members, so they rank by \
+           use and undercount where analysis is incomplete\n\
+         - nothing here states WHY a dependency exists\n",
+    );
+    wrap_envelope(&render_brief(&out, brief_byte_limit(token_budget)))
+}
+
+// ── architecture invariants ───────────────────────────────────────────────────
+
+/// A rule a repository's dependency graph must satisfy.
+///
+/// Deliberately three narrow shapes rather than a query language: these are the
+/// constraints projects actually write down in prose, and prose is exactly what
+/// drifts. CLAUDE.md's own dependency section had been missing two real edges.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Invariant {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    components: Vec<String>,
+    /// The only components this one may depend on. Empty list means "nothing".
+    #[serde(default, rename = "mayDependOn")]
+    may_depend_on: Option<Vec<String>>,
+    /// The only components allowed to depend on this one.
+    #[serde(default, rename = "mayBeUsedBy")]
+    may_be_used_by: Option<Vec<String>>,
+    #[serde(default)]
+    acyclic: bool,
+    #[serde(default)]
+    because: String,
+}
+
+/// Unknown keys are an error, not ignored: a misspelled `mayDependsOn` would
+/// otherwise be dropped and its rule would hold over nothing.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InvariantFile {
+    #[serde(rename = "$comment", default)]
+    _comment: Option<String>,
+    #[serde(default)]
+    invariants: Vec<Invariant>,
+}
+
+/// What `check_architecture_invariants` found: the report to print, and how
+/// many rules it found broken. The caller keys its exit code on `violations`,
+/// not on the wording of `text`.
+pub struct InvariantReport {
+    pub text: String,
+    pub violations: usize,
+}
+
+/// Components and the weighted edges between them, at the same granularity and
+/// with the same filters the briefs use.
+///
+/// `get_architecture_brief` gathers this alongside symbols, types and entry
+/// points it needs and this does not. The pieces that decide what a component
+/// IS — `subsystem_component_of`, `resolved_dep_pairs`, the noise and test
+/// filters — are shared, and `invariants_and_brief_agree_on_components` holds
+/// the two answers together.
+fn component_dependency_graph(
+    store: &SqliteStore,
+    provenance: &str,
+) -> (
+    std::collections::BTreeSet<String>,
+    std::collections::BTreeMap<(String, String), usize>,
+) {
+    use std::collections::{BTreeMap, BTreeSet};
+    let mut components: BTreeSet<String> = BTreeSet::new();
+    if let Ok(nodes) = store.all_nodes() {
+        for n in &nodes {
+            if !is_component_member(n) {
+                continue;
+            }
+            let comp = subsystem_component_of(&n.vname.path);
+            // The brief drops supporting directories; this must drop them too, or
+            // the two disagree about what a component is. Left in, the only cycle
+            // reported for this repository was `bench <-> packages/travsr-vscode`,
+            // which is two scratch trees, not an architecture violation.
+            if is_support_component(&comp) {
+                continue;
+            }
+            components.insert(comp);
+        }
+    }
+    let mut edges: BTreeMap<(String, String), usize> = BTreeMap::new();
+    if let Ok(pairs) = store.resolved_dep_pairs(provenance) {
+        for (src, dst) in &pairs {
+            let a = subsystem_component_of(src);
+            let b = subsystem_component_of(dst);
+            if a != b && components.contains(&a) && components.contains(&b) {
+                *edges.entry((a, b)).or_insert(0) += 1;
+            }
+        }
+    }
+    (components, edges)
+}
+
+/// Check declared architectural rules against the graph.
+///
+/// Plain text, not an MCP envelope: the one consumer is `travsr invariants`,
+/// which prints it to a terminal. Escaping `->` to `-&gt;` for a reader that
+/// does not exist would be the only effect.
+///
+/// Returns a report; the caller decides whether a violation is fatal. A rules
+/// file that does not parse is an `Err`, never a report, so a gate cannot pass
+/// on a file it could not read. A rule naming a component the graph does not
+/// have FAILS rather than passing vacuously, because renaming a crate would
+/// otherwise silently retire the rule that exists to protect it, which is the
+/// one failure mode a guard must not have.
+pub fn check_architecture_invariants(
+    store: &SqliteStore,
+    rules_json: &str,
+    provenance: &str,
+) -> Result<InvariantReport, String> {
+    let parsed: InvariantFile = serde_json::from_str(rules_json)
+        .map_err(|e| format!("could not read the invariants file: {e}"))?;
+    if parsed.invariants.is_empty() {
+        return Ok(InvariantReport {
+            text: "no invariants declared.".to_string(),
+            violations: 0,
+        });
+    }
+
+    let (components, edges) = component_dependency_graph(store, provenance);
+    let names: Vec<String> = components.iter().cloned().collect();
+    let mut adj: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+    for (a, b) in edges.keys() {
+        adj.entry(a.clone()).or_default().push(b.clone());
+    }
+    let cycles: Vec<Vec<String>> = arch_sccs(&names, &adj)
+        .into_iter()
+        .filter(|g| g.len() > 1)
+        .collect();
+
+    let mut out = String::new();
+    // No early return here: on an empty index every rule naming a component must
+    // still fail as "not a component in this graph", not pass by being skipped.
+    if components.is_empty() {
+        out.push_str("no components: this index has no indexed source files.\n");
+    }
+    let mut violations = 0usize;
+    for rule in &parsed.invariants {
+        let name = if rule.name.is_empty() {
+            "(unnamed rule)"
+        } else {
+            &rule.name
+        };
+        let mut broken: Vec<String> = Vec::new();
+
+        if rule.acyclic {
+            for g in &cycles {
+                broken.push(format!("cycle: {} -> {}", g.join(" -> "), g[0]));
+            }
+        }
+        for comp in &rule.components {
+            if !components.contains(comp) {
+                broken.push(format!(
+                    "rule names '{comp}', which is not a component in this graph (renamed or removed?)"
+                ));
+                continue;
+            }
+            if let Some(allowed) = &rule.may_depend_on {
+                for ((a, b), w) in &edges {
+                    if a == comp && !allowed.contains(b) {
+                        broken.push(format!(
+                            "'{comp}' depends on '{b}' ({w} file pair{}); allowed: {}",
+                            if *w == 1 { "" } else { "s" },
+                            if allowed.is_empty() {
+                                "nothing internal".to_string()
+                            } else {
+                                allowed.join(", ")
+                            }
+                        ));
+                    }
+                }
+            }
+            if let Some(allowed) = &rule.may_be_used_by {
+                for ((a, b), w) in &edges {
+                    if b == comp && !allowed.contains(a) {
+                        broken.push(format!(
+                            "'{a}' depends on '{comp}' ({w} file pair{}); allowed: {}",
+                            if *w == 1 { "" } else { "s" },
+                            if allowed.is_empty() {
+                                "nothing internal".to_string()
+                            } else {
+                                allowed.join(", ")
+                            }
+                        ));
+                    }
+                }
+            }
+        }
+
+        if broken.is_empty() {
+            out.push_str(&format!("holds    {name}\n"));
+        } else {
+            violations += 1;
+            out.push_str(&format!("VIOLATED {name}\n"));
+            for b in &broken {
+                out.push_str(&format!("           {b}\n"));
+            }
+            if !rule.because.is_empty() {
+                out.push_str(&format!("           why: {}\n", rule.because));
+            }
+        }
+    }
+    out.push_str(&format!(
+        "\n{} of {} invariant{} hold, over {} components and {} edges (provenance={}).\n",
+        parsed.invariants.len() - violations,
+        parsed.invariants.len(),
+        if parsed.invariants.len() == 1 {
+            ""
+        } else {
+            "s"
+        },
+        components.len(),
+        edges.len(),
+        if provenance.is_empty() {
+            "all"
+        } else {
+            provenance
+        }
+    ));
+    // A rule can only be broken by an edge the graph resolved. On this repository
+    // `travsr-daemon`'s manifest declares nine internal dependencies and the
+    // resolved graph carries four, so a rule about the five it cannot see would
+    // report "holds" over silence. The briefs disclose this; a gate that exits 0
+    // has more need to, not less.
+    if let Some(note) = phase_b_degraded_note(store) {
+        out.push_str(&format!("\n{note}\n"));
+    }
+    out.push_str(
+        "\nChecked against the edges the graph resolved. A dependency analysis has \
+         not resolved cannot break a rule here, so \"holds\" means no violation was \
+         visible, never that none exists. `travsr status` reports coverage.\n",
+    );
+    if violations > 0 {
+        out.push_str("VIOLATIONS FOUND\n");
+    }
+    Ok(InvariantReport {
+        text: out,
+        violations,
+    })
+}
+
+// ── get_subsystem_brief ───────────────────────────────────────────────────────
+
+/// The component a file belongs to: the package directory where the repository
+/// has one, otherwise the containing directory. Deliberately not `repo_regions`:
+/// that rollup is tuned for retrieval breadth, while a reader reasoning about a
+/// subsystem thinks in crates and packages.
+fn subsystem_component_of(path: &str) -> String {
+    for root in [
+        "crates/",
+        "packages/",
+        "apps/",
+        "services/",
+        "cmd/",
+        "modules/",
+    ] {
+        if let Some(rest) = path.strip_prefix(root) {
+            if let Some(name) = rest.split('/').next() {
+                if !name.is_empty() {
+                    return format!("{root}{name}");
+                }
+            }
+        }
+    }
+    // A root-level file goes to `(root)`, as in the repo map, rather than
+    // becoming a component named after itself.
+    repo_map_dir_of(path)
+}
+
+fn simple_symbol(sig: &str) -> &str {
+    match sig.find(':') {
+        Some(i) if sig[..i].chars().all(|c| c.is_ascii_lowercase() || c == '-') => &sig[i + 1..],
+        _ => sig,
+    }
+}
+
+/// What runs when control enters a symbol, as a fact packet rather than a
+/// document.
+///
+/// With neither `entry` nor `component`, it lists the subsystems it can see: a
+/// component's real entry points are the symbols something OUTSIDE it calls,
+/// which needs no naming convention and works in any language.
+///
+/// Callees are ranked by reach, but a call that LEAVES the component is never
+/// cut. Reach alone promotes widely-shared helpers and buried travsr-retrieval
+/// entirely when tracing get_context, whose whole job is PPR and knapsack. A
+/// cross-component call is a contract, and contracts are the point.
+pub fn get_subsystem_brief(
+    store: &SqliteStore,
+    entry: &str,
+    component: &str,
+    provenance: &str,
+    depth: u8,
+    width: usize,
+    token_budget: usize,
+) -> String {
+    use std::collections::{BTreeMap, HashMap, HashSet};
+
+    for (name, value) in [("entry", entry), ("component", component)] {
+        if value.is_empty() {
+            continue;
+        }
+        if let Err(reason) = validate_mcp_arg(value) {
+            tracing::warn!("get_subsystem_brief rejected invalid {name}: {reason}");
+            return sanitize_for_mcp(&format!("invalid {name}: {reason}"));
+        }
+    }
+
+    let nodes = match store.all_nodes() {
+        Ok(n) => n,
+        Err(e) => {
+            tracing::warn!("get_subsystem_brief: all_nodes error: {e}");
+            return sanitize_for_mcp("");
+        }
+    };
+    let edges = match store.all_edges() {
+        Ok(e) => e,
+        Err(e) => {
+            tracing::warn!("get_subsystem_brief: all_edges error: {e}");
+            return sanitize_for_mcp("");
+        }
+    };
+
+    let mut by_id: HashMap<travsr_core::NodeId, &travsr_core::Node> = HashMap::new();
+    for n in &nodes {
+        // Same membership rule as the architecture brief, so the two never
+        // disagree about what a component holds. `is_structural_noise` is part of
+        // it and is what keeps a raw SCIP module descriptor from outranking every
+        // real symbol and being reported as its component's entry point; it does
+        // NOT exclude `kind = "file"` nodes, which is why the kind check is
+        // there too.
+        if !is_component_member(n) {
+            continue;
+        }
+        by_id.insert(n.id, n);
+    }
+
+    // Reach and calls must describe the SAME universe. Counting reach over every
+    // edge while filtering calls let the brief say "nothing in the graph calls
+    // it" and print a non-zero reach two lines later, both as fact.
+    let mut reach: HashMap<travsr_core::NodeId, usize> = HashMap::new();
+    let mut calls: HashMap<travsr_core::NodeId, Vec<travsr_core::NodeId>> = HashMap::new();
+    let mut any_call_edge = false;
+    let mut any_call_past_filter = false;
+    for (src, dst, kind, prov) in &edges {
+        let is_call = kind == "ref/call";
+        if is_call {
+            any_call_edge = true;
+            if provenance_allowed(provenance, prov) {
+                any_call_past_filter = true;
+            }
+        }
+        if !provenance_allowed(provenance, prov)
+            || !by_id.contains_key(src)
+            || !by_id.contains_key(dst)
+        {
+            continue;
+        }
+        *reach.entry(*dst).or_insert(0) += 1;
+        if kind == "ref/call" && src != dst {
+            calls.entry(*src).or_default().push(*dst);
+        }
+    }
+
+    if calls.is_empty() {
+        // Three different causes, three different answers. Collapsing them told a
+        // user with a complete semantic index to install a toolchain they already
+        // had, which is worse than saying nothing.
+        return sanitize_for_mcp(&if !any_call_edge {
+            "no call edges in this index, so there is no flow to trace. Full cross-file \
+             analysis produces them: run `travsr lang install <language>` then `travsr init \
+             --semantic` in this repo. `travsr status` reports the current state."
+                .to_string()
+        } else if !any_call_past_filter {
+            format!(
+                "no call edges matched provenance '{provenance}', though this index does have \
+                 a call graph. Use 'ratified' for confirmed edges, '' for everything, or name \
+                 one provenance exactly (tree-sitter, lsif, scip, live)."
+            )
+        } else {
+            "every call edge in this index runs between symbols this view excludes (test code \
+             and structural noise), so there is no flow to show between the symbols that \
+             remain."
+                .to_string()
+        });
+    }
+
+    // Entry points per component: what something outside the component calls.
+    let mut external: BTreeMap<String, HashMap<travsr_core::NodeId, usize>> = BTreeMap::new();
+    for (src, dsts) in &calls {
+        let from = subsystem_component_of(&by_id[src].vname.path);
+        for dst in dsts {
+            let to = subsystem_component_of(&by_id[dst].vname.path);
+            if to == from {
+                continue;
+            }
+            *external.entry(to).or_default().entry(*dst).or_insert(0) += 1;
+        }
+    }
+
+    let ranked = |m: &HashMap<travsr_core::NodeId, usize>| -> Vec<(travsr_core::NodeId, usize)> {
+        let mut v: Vec<_> = m.iter().map(|(k, c)| (*k, *c)).collect();
+        v.sort_by(|a, b| {
+            b.1.cmp(&a.1).then_with(|| {
+                by_id[&a.0]
+                    .vname
+                    .signature
+                    .cmp(&by_id[&b.0].vname.signature)
+            })
+        });
+        v
+    };
+
+    if entry.is_empty() && component.is_empty() {
+        let mut rows: Vec<_> = external.iter().collect();
+        rows.sort_by_key(|(_, m)| std::cmp::Reverse(m.values().sum::<usize>()));
+        // Capped and trimmed like every other list here. This was the one path
+        // that went straight to the byte limit: on a 140-component repository it
+        // ended mid-entity on `exported_function_037  &`, with no notice that
+        // anything had been cut and the closing instruction gone with it.
+        let mut out = format!(
+            "SUBSYSTEMS (components called from outside, {} of {})\n\n",
+            rows.len().min(LIST_CAP),
+            rows.len()
+        );
+        let shown = rows.len().min(LIST_CAP);
+        for (comp, m) in rows.iter().take(LIST_CAP) {
+            let total: usize = m.values().sum();
+            out.push_str(&format!(
+                "{comp}  ({total} external call{}, {} entry point{})\n",
+                if total == 1 { "" } else { "s" },
+                m.len(),
+                if m.len() == 1 { "" } else { "s" }
+            ));
+            for (id, c) in ranked(m).into_iter().take(3) {
+                out.push_str(&format!(
+                    "    {}  <- {c} caller{}\n",
+                    simple_symbol(&by_id[&id].vname.signature),
+                    if c == 1 { "" } else { "s" }
+                ));
+            }
+        }
+        if rows.len() > shown {
+            out.push_str(&format!(
+                "... and {} more components, fewer external calls\n",
+                rows.len() - shown
+            ));
+        }
+        out.push_str("\nTake one with `component`, or a single symbol with `entry`.\n");
+        return wrap_envelope(&render_brief(&out, brief_byte_limit(token_budget)));
+    }
+
+    // Roots: a named symbol, or the component's most-called-into entry points.
+    let roots: Vec<travsr_core::NodeId> = if !component.is_empty() {
+        match external.get(component) {
+            Some(m) => ranked(m).into_iter().take(4).map(|(id, _)| id).collect(),
+            None => {
+                let known: Vec<&str> = external.keys().map(|s| s.as_str()).take(12).collect();
+                return sanitize_for_mcp(&format!(
+                    "no component '{component}' is called from outside. Components with entry \
+                     points: {}",
+                    known.join(", ")
+                ));
+            }
+        }
+    } else {
+        let want = simple_symbol(entry);
+        let mut hit: Vec<travsr_core::NodeId> = by_id
+            .values()
+            .filter(|n| n.vname.signature == entry)
+            .map(|n| n.id)
+            .collect();
+        if hit.is_empty() {
+            hit = by_id
+                .values()
+                .filter(|n| simple_symbol(&n.vname.signature) == want)
+                .map(|n| n.id)
+                .collect();
+        }
+        if hit.is_empty() {
+            return sanitize_for_mcp(&format!("entry symbol '{entry}' is not in the graph"));
+        }
+        // Collected from a HashMap, so the order arriving here is arbitrary and a
+        // sort on reach alone leaves ties in whatever order the map yielded:
+        // identical queries returned different symbols across runs. Break ties on
+        // the path, which is unique per definition.
+        hit.sort_by(|a, b| {
+            reach
+                .get(b)
+                .unwrap_or(&0)
+                .cmp(reach.get(a).unwrap_or(&0))
+                .then_with(|| by_id[a].vname.path.cmp(&by_id[b].vname.path))
+        });
+        hit.truncate(1);
+        hit
+    };
+
+    // Walk outward, keeping every cross-component call and the widest-reaching
+    // same-component ones.
+    let mut levels: Vec<Vec<travsr_core::NodeId>> = vec![roots.clone()];
+    let mut seen: HashSet<travsr_core::NodeId> = roots.iter().copied().collect();
+    let mut kept: Vec<(travsr_core::NodeId, travsr_core::NodeId)> = Vec::new();
+    for d in 0..depth as usize {
+        let mut next = Vec::new();
+        for src in levels[d].clone() {
+            let here = subsystem_component_of(&by_id[&src].vname.path);
+            let mut crosses = Vec::new();
+            let mut internal = Vec::new();
+            let mut uniq: Vec<_> = calls.get(&src).cloned().unwrap_or_default();
+            uniq.sort();
+            uniq.dedup();
+            for dst in uniq {
+                if seen.contains(&dst) {
+                    continue;
+                }
+                if subsystem_component_of(&by_id[&dst].vname.path) == here {
+                    internal.push(dst);
+                } else {
+                    crosses.push(dst);
+                }
+            }
+            let by_reach = |v: &mut Vec<travsr_core::NodeId>| {
+                v.sort_by(|a, b| {
+                    reach
+                        .get(b)
+                        .unwrap_or(&0)
+                        .cmp(reach.get(a).unwrap_or(&0))
+                        .then_with(|| by_id[a].vname.signature.cmp(&by_id[b].vname.signature))
+                });
+            };
+            by_reach(&mut crosses);
+            by_reach(&mut internal);
+            internal.truncate(width);
+            // `seen` is global to the walk, so gating the record on it dropped a
+            // second call into an already-visited symbol. The spine is a tree and
+            // must stay one, but the contracts list is not: record every crossing,
+            // and only extend the frontier for a symbol not yet reached.
+            for dst in crosses.into_iter().chain(internal) {
+                let crossing = subsystem_component_of(&by_id[&dst].vname.path) != here;
+                let first_visit = seen.insert(dst);
+                if first_visit {
+                    next.push(dst);
+                }
+                if first_visit || crossing {
+                    kept.push((src, dst));
+                }
+            }
+        }
+        if next.is_empty() {
+            break;
+        }
+        levels.push(next);
+    }
+
+    let label = |id: &travsr_core::NodeId| simple_symbol(&by_id[id].vname.signature);
+    let mut out = String::new();
+    out.push_str(&format!(
+        "SUBSYSTEM BRIEF: {}\n",
+        if component.is_empty() {
+            label(&roots[0]).to_string()
+        } else {
+            component.to_string()
+        }
+    ));
+    out.push_str(&format!(
+        "provenance={} | snapshot of the code as indexed; not maintained\n\n",
+        if provenance.is_empty() {
+            "all"
+        } else {
+            provenance
+        }
+    ));
+
+    out.push_str("## Entry\n");
+    for r in &roots {
+        out.push_str(&format!("- {} - {}\n", label(r), by_id[r].vname.path));
+    }
+
+    out.push_str("\n## Called from\n");
+    let root_set: HashSet<_> = roots.iter().copied().collect();
+    // In component mode the entries ARE "what something outside calls", so a
+    // caller inside the component is not calling in. Listing travsr-retrieval's
+    // own `bfs_fallback` here answered a different question from the one the
+    // heading asks. In entry mode the caller named one symbol, and every caller
+    // of it is wanted.
+    let outside_of = if component.is_empty() {
+        None
+    } else {
+        Some(component)
+    };
+    let mut callers: Vec<travsr_core::NodeId> = calls
+        .iter()
+        .filter(|(src, dsts)| {
+            if root_set.contains(src) || !dsts.iter().any(|d| root_set.contains(d)) {
+                return false;
+            }
+            match outside_of {
+                Some(c) => subsystem_component_of(&by_id[src].vname.path) != c,
+                None => true,
+            }
+        })
+        .map(|(src, _)| *src)
+        .collect();
+    callers.sort_by(|a, b| {
+        reach
+            .get(b)
+            .unwrap_or(&0)
+            .cmp(reach.get(a).unwrap_or(&0))
+            .then_with(|| by_id[a].vname.signature.cmp(&by_id[b].vname.signature))
+    });
+    callers.truncate(8);
+    if callers.is_empty() {
+        out.push_str(
+            "- nothing in the graph calls it: a public entry reached from outside the indexed \
+             code, or unresolved\n",
+        );
+    }
+    for c in &callers {
+        out.push_str(&format!("- {} - {}\n", label(c), by_id[c].vname.path));
+    }
+
+    out.push_str(
+        "\n## Call spine, by depth from the entry\n(depth is calls from the entry, NOT elapsed \
+         order; reach = references arriving at that symbol)\n",
+    );
+    for (d, level) in levels.iter().enumerate() {
+        out.push_str(&format!("### depth {d}\n"));
+        for id in level {
+            out.push_str(&format!(
+                "- {} [{}] reach={} - {}\n",
+                label(id),
+                subsystem_component_of(&by_id[id].vname.path),
+                reach.get(id).copied().unwrap_or(0),
+                by_id[id].vname.path
+            ));
+        }
+    }
+
+    out.push_str("\n## Calls that leave the component (the contracts)\n");
+    let mut by_target: BTreeMap<String, Vec<(travsr_core::NodeId, travsr_core::NodeId)>> =
+        BTreeMap::new();
+    for (a, b) in &kept {
+        let (ca, cb) = (
+            subsystem_component_of(&by_id[a].vname.path),
+            subsystem_component_of(&by_id[b].vname.path),
+        );
+        if ca != cb {
+            by_target.entry(cb).or_default().push((*a, *b));
+        }
+    }
+    if by_target.is_empty() {
+        out.push_str("- none; control stays in one component for the traced depth\n");
+    }
+    let mut targets: Vec<_> = by_target.into_iter().collect();
+    targets.sort_by_key(|(_, v)| std::cmp::Reverse(v.len()));
+    for (target, es) in targets {
+        out.push_str(&format!("### -> {target} ({})\n", es.len()));
+        for (a, b) in es {
+            out.push_str(&format!(
+                "- {} calls {} - {}\n",
+                label(&a),
+                label(&b),
+                by_id[&b].vname.path
+            ));
+        }
+    }
+
+    let spine_edges = kept
+        .iter()
+        .filter(|(_, b)| levels.iter().flatten().any(|n| n == b))
+        .count();
+    let comps: HashSet<String> = levels
+        .iter()
+        .flatten()
+        .map(|id| subsystem_component_of(&by_id[id].vname.path))
+        .collect();
+    out.push_str(&format!(
+        "\n## Shape\n- {} symbols, {} calls, {} components\n",
+        levels.iter().map(|l| l.len()).sum::<usize>(),
+        spine_edges,
+        comps.len()
+    ));
+
+    let degraded = phase_b_degraded_note(store);
+    if degraded.is_some() || kept.is_empty() {
+        out.push_str("\n## Freshness\n");
+    }
+    if let Some(note) = degraded {
+        out.push_str(&format!("{note}\n"));
+    }
+    if kept.is_empty() {
+        out.push_str(
+            "No outgoing calls resolved from this entry, so there is no flow \
+             to show. The symbol exists; its call edges do not, which means they are unresolved \
+             rather than absent. Check `travsr status` before reading this as \"it calls \
+             nothing\".\n",
+        );
+    }
+    out.push_str(
+        "\n## What this brief cannot tell you\n\
+         - a missing call means the graph did not resolve it, not that it does not happen\n\
+         - Phase B coverage varies by language; absence is unknown, never no\n\
+         - nothing here states WHY a call exists; read the source for that\n",
+    );
+    wrap_envelope(&render_brief(&out, brief_byte_limit(token_budget)))
+}
+
 // ── get_lang_status ───────────────────────────────────────────────────────────
 
 /// Detect the language of `file` from its extension, then check whether Phase B
@@ -4246,34 +5553,31 @@ fn repo_region_dep_edges(
     edges
 }
 
-/// Transitive-dependent count per region: distinct regions that can reach `R`
-/// through the reverse dependency edges. Integer counts → deterministic.
+/// Direct-dependent count per region: distinct regions with an edge straight
+/// into `R`. Integer counts → deterministic.
+///
+/// Deliberately NOT transitive. Reverse reachability saturates on a funnel-
+/// shaped graph: everything reaches `travsr-mcp`, so every leaf hanging off it
+/// inherits its whole ancestor set and a one-consumer utility (`travsr-rerank`)
+/// outranks the product surface it serves. Direct in-degree keeps the ranking
+/// discriminating.
 fn repo_region_dependents(
     regions_universe: &std::collections::HashSet<String>,
     dep_edges: &std::collections::HashSet<(String, String)>,
 ) -> std::collections::HashMap<String, usize> {
     use std::collections::{HashMap, HashSet};
-    let mut rev: HashMap<&str, Vec<&str>> = HashMap::new();
+    // Callers guarantee src != dst, so no region can depend on itself.
+    let mut direct: HashMap<&str, HashSet<&str>> = HashMap::new();
     for (a, b) in dep_edges {
-        rev.entry(b.as_str()).or_default().push(a.as_str());
+        direct.entry(b.as_str()).or_default().insert(a.as_str());
     }
-    let mut dependents = HashMap::new();
-    for region in regions_universe {
-        let mut seen: HashSet<&str> = HashSet::new();
-        let mut stack: Vec<&str> = vec![region.as_str()];
-        while let Some(cur) = stack.pop() {
-            if let Some(ins) = rev.get(cur) {
-                for &a in ins {
-                    if seen.insert(a) {
-                        stack.push(a);
-                    }
-                }
-            }
-        }
-        seen.remove(region.as_str());
-        dependents.insert(region.clone(), seen.len());
-    }
-    dependents
+    regions_universe
+        .iter()
+        .map(|region| {
+            let n = direct.get(region.as_str()).map_or(0, |ins| ins.len());
+            (region.clone(), n)
+        })
+        .collect()
 }
 
 /// Build the agent cold-start orientation map: directory-level components ranked
@@ -4337,7 +5641,8 @@ fn get_repo_map_raw(store: &SqliteStore, reserve_per_line: usize) -> String {
     // ── Spine: dependents from the RESOLVED graph (ref/call + resolves-to),
     // aggregated to regions. Language-agnostic — no import syntax is parsed. ──
     let known: HashSet<String> = region_symbols.keys().cloned().collect();
-    let pairs = store.resolved_dep_pairs().unwrap_or_default();
+    // The text repo map has no provenance argument, so it keeps seeing every edge.
+    let pairs = store.resolved_dep_pairs("").unwrap_or_default();
     let dep_edges = repo_region_dep_edges(&pairs, &regions, &known);
     let dependents = repo_region_dependents(&known, &dep_edges);
     let has_refcall = store.has_any_refcall_edges();
@@ -7320,6 +8625,16 @@ impl Default for GraphJsonParams<'_> {
 /// Unknown filter values match nothing rather than everything: a typo should
 /// return an obviously empty graph, not silently ignore the constraint a
 /// consumer added precisely because it needed ground truth.
+/// Every value the `provenance` filter accepts: the two modes (`""` for all
+/// edges, `"ratified"` for everything the commit-gated pipeline has confirmed)
+/// and each provenance an edge can actually carry.
+///
+/// [`provenance_allowed`] answers an unknown value with "matches nothing", which
+/// is the right default for a query surface. A caller that treats an empty graph
+/// as a PASS has to reject the typo instead, which is why the vocabulary is
+/// named here rather than restated per call site.
+pub const PROVENANCE_FILTERS: &[&str] = &["", "ratified", "tree-sitter", "lsif", "scip", "live"];
+
 fn provenance_allowed(filter: &str, provenance: &str) -> bool {
     match filter {
         "" => true,
@@ -7354,7 +8669,7 @@ pub fn get_graph_json(store: &SqliteStore, params: &GraphJsonParams<'_>) -> Stri
                 return "{}".to_string();
             }
         }
-        return overview_graph(store, path_prefix);
+        return overview_graph(store, path_prefix, provenance);
     }
     // Only "" (all kinds) and "file" are valid kind_filter values.
     if !matches!(*kind_filter, "" | "file") {
@@ -7413,7 +8728,7 @@ fn file_label(path: &str) -> &str {
 }
 
 /// Entry point for `mode="overview"`. Routes by whether path_prefix is set.
-fn overview_graph(store: &SqliteStore, path_prefix: &str) -> String {
+fn overview_graph(store: &SqliteStore, path_prefix: &str, provenance: &str) -> String {
     let file_nodes = match store.nodes_by_kind("file") {
         Ok(n) => n,
         Err(e) => {
@@ -7425,7 +8740,7 @@ fn overview_graph(store: &SqliteStore, path_prefix: &str) -> String {
     // language-agnostic primitive the repo map uses. Replaces the old
     // depends+resolves-to-only `file_import_pairs`, which produced ~0 edges here
     // because top-level-dir buckets collapsed every intra-monorepo edge.
-    let pairs = match store.resolved_dep_pairs() {
+    let pairs = match store.resolved_dep_pairs(provenance) {
         Ok(p) => p,
         Err(e) => {
             tracing::warn!("overview_graph: resolved_dep_pairs error: {e}");
@@ -8181,7 +9496,7 @@ pub fn get_graph_json_global(
             }
         }
         // Overview mode: run per-repo and merge package tiles
-        return get_graph_json_global_overview(repos, repo, path_prefix);
+        return get_graph_json_global_overview(repos, repo, path_prefix, provenance);
     }
     if !(query.is_empty() && *kind_filter == "file") {
         if let Err(reason) = validate_mcp_arg(query) {
@@ -8286,6 +9601,7 @@ fn get_graph_json_global_overview(
     repos: &HashMap<String, PathBuf>,
     repo: Option<&str>,
     path_prefix: &str,
+    provenance: &str,
 ) -> String {
     use std::collections::HashMap as HMap;
 
@@ -8309,7 +9625,7 @@ fn get_graph_json_global_overview(
         }
         match SqliteStore::open_read_only(db_path) {
             Ok(store) => {
-                let raw = overview_graph(&store, path_prefix);
+                let raw = overview_graph(&store, path_prefix, provenance);
                 let parsed: serde_json::Value = match serde_json::from_str(&raw) {
                     Ok(v) => v,
                     Err(_) => continue,
@@ -11247,6 +12563,608 @@ mod tests {
     }
 
     #[test]
+    fn subsystem_brief_never_cuts_a_call_that_leaves_the_component() {
+        // Ranking callees by reach alone promotes widely-shared helpers and
+        // dropped travsr-retrieval entirely when tracing get_context, whose whole
+        // job is PPR and knapsack. A call that leaves the component is a contract
+        // between components and must survive any width limit.
+        use travsr_core::EdgeKind;
+        let entry = make_node("crates/a/src/lib.rs", "fn:entry");
+        let popular = make_node("crates/a/src/util.rs", "fn:popular");
+        let crosser = make_node("crates/b/src/lib.rs", "fn:crosser");
+        let noise = make_node("crates/a/src/noise.rs", "fn:noise");
+        // Give the same-component helpers more reach than the crossing call.
+        let mut edges = vec![
+            (entry.id, popular.id, EdgeKind::RefCall),
+            (entry.id, crosser.id, EdgeKind::RefCall),
+            (entry.id, noise.id, EdgeKind::RefCall),
+        ];
+        for extra in [&popular, &noise] {
+            edges.push((crosser.id, extra.id, EdgeKind::RefCall));
+        }
+        let store = make_store(&[entry, popular, crosser, noise], &edges);
+
+        // width = 1 keeps a single same-component callee, yet the crossing call
+        // must still be there.
+        let out = get_subsystem_brief(&store, "fn:entry", "", "", 3, 1, 8_000);
+        assert!(
+            out.contains("crosser"),
+            "a cross-component call must survive width=1:\n{out}"
+        );
+        assert!(
+            out.contains("Calls that leave the component"),
+            "crossings section must be present:\n{out}"
+        );
+    }
+
+    #[test]
+    fn type_and_entry_detection_covers_every_indexed_language() {
+        // The analyzers keep each language's own word in `kind` and normalise the
+        // SIGNATURE PREFIX. Matching on `kind` found no types at all in C, C++,
+        // Dart, Kotlin, Objective-C or Swift, because a union is kind="union"
+        // signature="struct:", a mixin and a Kotlin object are both "class:", and
+        // a typedef and a C# delegate are both "type:".
+        for sig in [
+            "struct:CUnion",     // C / C++ union
+            "struct:RustStruct", // Rust, Go
+            "class:DartMixin",   // Dart mixin, Kotlin object, Scala trait
+            "protocol:ObjCProto",
+            "interface:TsInterface",
+            "type:CsDelegate", // typedef, using-alias, delegate
+            "enum:JavaEnum",
+            "trait:RustTrait",
+            "actor:SwiftActor",
+        ] {
+            assert!(is_type_signature(sig), "must be a type: {sig}");
+        }
+        for sig in [
+            "fn:helper",
+            "method:Store.open",
+            "field:VName.path",
+            "var:x",
+            "const:LIMIT",
+            "impl:Foo",
+            "macro:m",
+            "import:os",
+        ] {
+            assert!(!is_type_signature(sig), "must not be a type: {sig}");
+        }
+
+        // Entry points: a free function in Rust/Go/C/C++/Python/Dart, a static
+        // method on a class in Java/Kotlin/C#/Scala.
+        assert!(is_entry_point_signature("fn:main"));
+        assert!(is_entry_point_signature("method:App.main"));
+        assert!(is_entry_point_signature("method:Program.Main"));
+        assert!(!is_entry_point_signature("fn:main_worktree_root"));
+        assert!(!is_entry_point_signature("fn:domain"));
+        assert!(!is_entry_point_signature("method:App.maintain"));
+    }
+
+    #[test]
+    fn architecture_brief_components_match_the_subsystem_tool() {
+        // Three different definitions of "component" across the generators is
+        // what made their outputs disagree. Both tools must use one rule.
+        use travsr_core::EdgeKind;
+        let a = make_node("crates/alpha/src/lib.rs", "fn:a");
+        let b = make_node("crates/beta/src/lib.rs", "fn:b");
+        let store = make_store(&[a.clone(), b.clone()], &[(a.id, b.id, EdgeKind::RefCall)]);
+        let arch = get_architecture_brief(&store, "", 8_000);
+        let sub = get_subsystem_brief(&store, "fn:a", "", "", 3, 6, 8_000);
+        for comp in ["crates/alpha", "crates/beta"] {
+            assert!(
+                arch.contains(comp),
+                "architecture brief names {comp}:\n{arch}"
+            );
+            assert!(sub.contains(comp), "subsystem brief names {comp}:\n{sub}");
+        }
+    }
+
+    #[test]
+    fn invariants_catch_a_broken_rule_and_a_renamed_component() {
+        use travsr_core::EdgeKind;
+        let a = make_node("crates/alpha/src/lib.rs", "fn:a");
+        let b = make_node("crates/beta/src/lib.rs", "fn:b");
+        let store = make_store(&[a.clone(), b.clone()], &[(a.id, b.id, EdgeKind::RefCall)]);
+
+        let rules = r#"{"invariants":[
+            {"name":"alpha is pure","components":["crates/alpha"],"mayDependOn":[],"because":"r1"},
+            {"name":"gone","components":["crates/removed"],"mayDependOn":[],"because":"r2"},
+            {"name":"beta is fine","components":["crates/beta"],"mayDependOn":[],"because":"r3"}
+        ]}"#;
+        let report = check_architecture_invariants(&store, rules, "").unwrap();
+        let out = &report.text;
+
+        assert!(out.contains("VIOLATED alpha is pure"), "{out}");
+        assert!(out.contains("depends on 'crates/beta'"), "{out}");
+        // A rule naming a component the graph lacks must FAIL. Passing it
+        // vacuously would let a rename silently retire the rule protecting it.
+        assert!(out.contains("VIOLATED gone"), "{out}");
+        assert!(out.contains("not a component in this graph"), "{out}");
+        assert!(out.contains("holds    beta is fine"), "{out}");
+        assert_eq!(
+            report.violations, 2,
+            "the caller keys its exit code on this:\n{out}"
+        );
+
+        // A misspelled key must be rejected, not dropped. Dropped, the rule has
+        // no constraint left and holds over nothing.
+        let misspelled = r#"{"invariants":[
+            {"name":"alpha is pure","components":["crates/alpha"],"mayDependsOn":[]}
+        ]}"#;
+        let err = check_architecture_invariants(&store, misspelled, "")
+            .err()
+            .expect("an unknown rule key must be an error");
+        assert!(err.contains("mayDependsOn"), "{err}");
+
+        // An empty index must still fail a rule that names a component, rather
+        // than returning before any rule is checked.
+        let empty = make_store(&[], &[]);
+        let report = check_architecture_invariants(&empty, rules, "").unwrap();
+        assert_eq!(report.violations, 3, "{}", report.text);
+        assert!(
+            report
+                .text
+                .contains("rule names 'crates/alpha', which is not a component"),
+            "{}",
+            report.text
+        );
+    }
+
+    #[test]
+    fn invariants_reject_a_rules_file_that_does_not_parse() {
+        // Returned as a report, a parse error carried no violation marker and
+        // `travsr invariants` exited 0 on a file it could not read.
+        let store = make_store(&[make_node("crates/alpha/src/lib.rs", "fn:a")], &[]);
+        let trailing_comma = r#"{"invariants":[
+            {"name":"alpha is pure","components":["crates/alpha"],"mayDependOn":[]},
+        ]}"#;
+        assert!(check_architecture_invariants(&store, trailing_comma, "").is_err());
+        // The shipped file's top-level `$comment` must still parse.
+        let commented = r#"{"$comment":"why","invariants":[{"name":"n","acyclic":true}]}"#;
+        assert!(check_architecture_invariants(&store, commented, "").is_ok());
+    }
+
+    #[test]
+    fn a_root_level_file_belongs_to_the_root_component() {
+        // `main.go` at the root was its own component named after the file.
+        assert_eq!(subsystem_component_of("main.go"), "(root)");
+        assert_eq!(subsystem_component_of("cmd/tool/main.go"), "cmd/tool");
+        assert_eq!(subsystem_component_of("pkg/util/x.go"), "pkg/util");
+    }
+
+    #[test]
+    fn architecture_brief_ranks_types_by_references_not_members() {
+        // Counting every edge kind ranked a type by how many members it defines:
+        // `defines/binding` from a type to each member folded into the type.
+        use travsr_core::EdgeKind;
+        let big = make_node("crates/a/src/lib.rs", "struct:Big");
+        let used = make_node("crates/a/src/lib.rs", "struct:Used");
+        let user = make_node("crates/b/src/lib.rs", "fn:user");
+        let mut nodes = vec![big.clone(), used.clone(), user.clone()];
+        let mut edges = vec![(user.id, used.id, EdgeKind::RefCall)];
+        for m in ["x", "y", "z"] {
+            let member = make_node("crates/a/src/lib.rs", &format!("method:Big.{m}"));
+            edges.push((big.id, member.id, EdgeKind::DefinesBinding));
+            nodes.push(member);
+        }
+        let store = make_store(&nodes, &edges);
+        let out = get_architecture_brief(&store, "", 30_000);
+        assert!(
+            out.contains("most referenced types: Used (1), Big (0)"),
+            "only references may count toward a type's rank:\n{out}"
+        );
+    }
+
+    #[test]
+    fn architecture_brief_names_an_unknown_provenance() {
+        // A typo matched no edges and the brief blamed missing analysis.
+        use travsr_core::EdgeKind;
+        let a = make_node("crates/alpha/src/lib.rs", "fn:a");
+        let b = make_node("crates/beta/src/lib.rs", "fn:b");
+        let store = make_store(&[a.clone(), b.clone()], &[(a.id, b.id, EdgeKind::RefCall)]);
+        let out = get_architecture_brief(&store, "ratifed", 8_000);
+        assert!(
+            out.contains("unknown provenance 'ratifed'"),
+            "must name the filter as the cause:\n{out}"
+        );
+        assert!(
+            !out.contains("has not run"),
+            "must not blame missing analysis:\n{out}"
+        );
+    }
+
+    #[test]
+    fn invariants_and_the_brief_agree_on_components() {
+        // They gather separately: the brief also needs symbols, types and entry
+        // points. Sharing `subsystem_component_of`, the noise/test filters and
+        // `is_support_component` is what keeps them describing one graph, and
+        // this holds them to it. Left unchecked, the invariant view counted
+        // supporting directories the brief drops and reported a cycle between
+        // two scratch trees as an architecture violation.
+        use travsr_core::EdgeKind;
+        let a = make_node("crates/alpha/src/lib.rs", "fn:a");
+        let b = make_node("crates/beta/src/lib.rs", "fn:b");
+        let t = make_node("crates/alpha/tests/it.rs", "fn:t");
+        let store = make_store(
+            &[a.clone(), b.clone(), t.clone()],
+            &[
+                (a.id, b.id, EdgeKind::RefCall),
+                (t.id, b.id, EdgeKind::RefCall),
+            ],
+        );
+
+        let (components, edges) = component_dependency_graph(&store, "");
+        let brief = get_architecture_brief(&store, "", 30_000);
+        for c in &components {
+            assert!(brief.contains(c.as_str()), "brief is missing {c}:\n{brief}");
+        }
+        // Compare the numbers, not a pluralised sentence: the brief writes
+        // "1 edge" and "2 edges", and this assertion should not care which.
+        assert!(
+            brief.contains(&format!("- {} component", components.len()))
+                && brief.contains(&format!(", {} edge", edges.len())),
+            "counts must disagree with neither: expected {} components / {} edges:\n{brief}",
+            components.len(),
+            edges.len()
+        );
+    }
+
+    #[test]
+    fn architecture_brief_caps_its_lists_and_says_what_it_dropped() {
+        // Unbounded, the byte limit did the cutting: on kubernetes the brief
+        // emitted 346 of 3379 components, ended mid-row on `| depends on 0 | 5 f`,
+        // and lost its last two sections with no sign they had existed. A ranked
+        // head with an honest count is an answer; a silent tenth of one is not.
+        use travsr_core::EdgeKind;
+        let mut nodes = Vec::new();
+        let mut edges = Vec::new();
+        let hub = make_node("crates/hub/src/lib.rs", "fn:hub");
+        nodes.push(hub.clone());
+        for i in 0..(LIST_CAP + 25) {
+            let n = make_node(&format!("crates/c{i}/src/lib.rs"), &format!("fn:f{i}"));
+            edges.push((n.id, hub.id, EdgeKind::RefCall));
+            nodes.push(n);
+        }
+        let store = make_store(&nodes, &edges);
+        let out = get_architecture_brief(&store, "", 30_000);
+
+        let listed = out
+            .lines()
+            .filter(|l| l.starts_with("- ") && l.contains("| layer "))
+            .count();
+        assert_eq!(
+            listed, LIST_CAP,
+            "the component list must stop at the cap, not run to the byte limit:\n{out}"
+        );
+        assert!(
+            out.contains(&format!("({LIST_CAP} of {})", nodes.len())),
+            "the heading must say how many of how many:\n{out}"
+        );
+        let hidden = nodes.len() - LIST_CAP;
+        assert!(
+            out.contains(&format!("and {hidden} more components, ranked lower")),
+            "the remainder must be disclosed, not dropped silently:\n{out}"
+        );
+        // Every section must survive; losing the tail is what the byte limit did.
+        for section in [
+            "## Shape",
+            "## Components, by how many others depend on them",
+            "## What each component owns",
+            "## What this brief cannot tell you",
+        ] {
+            assert!(out.contains(section), "section {section} missing:\n{out}");
+        }
+    }
+
+    #[test]
+    fn a_brief_is_never_cut_mid_line() {
+        // `... | depends on 0 | 5 f` was a half-written fact presented as data.
+        // Rows carry `->`, because escaping is what defeated the first fix: it
+        // expands each angle bracket to four bytes AFTER the trim, so a body
+        // trimmed first came back over the limit and was cut at a raw byte
+        // boundary anyway — including through the truncation notice itself,
+        // which reached the caller as `[brief trun`.
+        let long = (0..400)
+            .map(|i| format!("- row {i} -> with enough text to cross the limit somewhere\n"))
+            .collect::<String>();
+        let out = render_brief(&long, 900);
+        assert!(out.len() <= 900, "must respect the limit: {}", out.len());
+        assert!(
+            out.ends_with("for the rest]\n"),
+            "the truncation notice must survive whole:\n{out}"
+        );
+        for line in out.lines().filter(|l| l.starts_with("- row")) {
+            assert!(
+                line.ends_with("somewhere"),
+                "every surviving row must be whole, got: {line:?}"
+            );
+        }
+        // A body that fits is escaped but not truncated.
+        assert_eq!(render_brief("- a -> b\n", 900), "- a -&gt; b\n");
+        // A multi-byte character astride the cut must not panic the tool.
+        let wide = (0..400)
+            .map(|i| format!("- ròw {i} -> ünicøde enough to cross the limit\n"))
+            .collect::<String>();
+        assert!(render_brief(&wide, 900).len() <= 900);
+    }
+
+    #[test]
+    fn architecture_brief_discloses_an_empty_dependency_graph() {
+        // Asserting independence from an empty graph called a Go file that
+        // imports and calls another package "separately buildable".
+        let a = make_node("crates/alpha/src/lib.rs", "fn:a");
+        let b = make_node("crates/beta/src/lib.rs", "fn:b");
+        let store = make_store(&[a, b], &[]);
+        let out = get_architecture_brief(&store, "", 8_000);
+        assert!(
+            out.contains("No dependencies resolved"),
+            "must disclose rather than assert independence:\n{out}"
+        );
+        assert!(
+            out.contains("never as none"),
+            "must say absence is unknown:\n{out}"
+        );
+    }
+
+    #[test]
+    fn a_component_is_a_directory_that_owns_code() {
+        // `is_structural_noise` drops doc chunks but keeps the `kind = "file"`
+        // node beside them, so every path holding no symbols at all became its
+        // own component: `CLAUDE.md`, `Cargo.toml`, `README.md` and nine more
+        // root-level files, each reported as "1 files, 0 symbols". On this
+        // repository that was 12 of 39 components. A synthetic angle-bracket
+        // pseudo-path is not a directory either, and appeared at layer 3.
+        use travsr_core::EdgeKind;
+        let real = make_node("crates/alpha/src/lib.rs", "fn:a");
+        let dep = make_node("crates/beta/src/lib.rs", "fn:b");
+        let readme = make_kind("README.md", "file", "file");
+        let manifest = make_kind("Cargo.toml", "file", "file");
+        let synthetic = make_kind("<cgo_synthetic>/main.go", "fn:GoCallback", "function");
+        let store = make_store(
+            &[real.clone(), dep.clone(), readme, manifest, synthetic],
+            &[(real.id, dep.id, EdgeKind::RefCall)],
+        );
+
+        let out = get_architecture_brief(&store, "", 30_000);
+        assert!(out.contains("2 components"), "only the two crates:\n{out}");
+        for phantom in ["README.md", "Cargo.toml", "cgo_synthetic"] {
+            assert!(
+                !out.contains(phantom),
+                "{phantom} is not a component:\n{out}"
+            );
+        }
+        // And the invariant view must agree, or a rule is checked against a
+        // different graph from the one the brief describes.
+        let (components, _) = component_dependency_graph(&store, "");
+        assert_eq!(
+            components.iter().map(|c| c.as_str()).collect::<Vec<_>>(),
+            vec!["crates/alpha", "crates/beta"]
+        );
+    }
+
+    #[test]
+    fn architecture_brief_layers_a_diamond_by_longest_path() {
+        // a -> b -> c with a -> c as well. `b` depends on `c`, so it cannot share
+        // `c`'s layer, and `a` is two hops from the foundation even though it
+        // also reaches it in one. The layering leans on `arch_sccs` emitting in
+        // reverse topological order; this is what pins that it still does.
+        use travsr_core::EdgeKind;
+        let a = make_node("crates/alpha/src/lib.rs", "fn:a");
+        let b = make_node("crates/beta/src/lib.rs", "fn:b");
+        let c = make_node("crates/gamma/src/lib.rs", "fn:c");
+        let store = make_store(
+            &[a.clone(), b.clone(), c.clone()],
+            &[
+                (a.id, b.id, EdgeKind::RefCall),
+                (b.id, c.id, EdgeKind::RefCall),
+                (a.id, c.id, EdgeKind::RefCall),
+            ],
+        );
+        let out = get_architecture_brief(&store, "", 30_000);
+        for (comp, layer) in [("crates/gamma", 0), ("crates/beta", 1), ("crates/alpha", 2)] {
+            assert!(
+                out.contains(&format!("- {comp} | layer {layer} |")),
+                "{comp} belongs on layer {layer}:\n{out}"
+            );
+        }
+        assert!(out.contains("3 layers"), "three layers, not two:\n{out}");
+    }
+
+    #[test]
+    fn architecture_brief_caps_the_members_of_one_cycle() {
+        // A cycle is a single SCC, so one of them can span the whole repository.
+        // Uncapped, a 140-component ring wrote one 5311-character line, and at a
+        // small token_budget that line WAS the brief: the component list, the
+        // edges and every later section were trimmed away behind it.
+        use travsr_core::EdgeKind;
+        let n = DETAIL_CAP + 5;
+        let nodes: Vec<_> = (0..n)
+            .map(|i| make_node(&format!("crates/c{i:03}/src/lib.rs"), &format!("fn:f{i}")))
+            .collect();
+        let edges: Vec<_> = (0..n)
+            .map(|i| (nodes[i].id, nodes[(i + 1) % n].id, EdgeKind::RefCall))
+            .collect();
+        let store = make_store(&nodes, &edges);
+        let out = get_architecture_brief(&store, "", 30_000);
+
+        let cycle_line = out
+            .lines()
+            .find(|l| l.contains("&lt;-&gt;"))
+            .unwrap_or_else(|| panic!("the ring must be reported as a cycle:\n{out}"));
+        assert_eq!(
+            cycle_line.matches("crates/c").count(),
+            DETAIL_CAP,
+            "exactly DETAIL_CAP members are named: {cycle_line}"
+        );
+        assert!(
+            cycle_line.ends_with(&format!("and {} more in this cycle", n - DETAIL_CAP)),
+            "the rest must be disclosed, not dropped: {cycle_line}"
+        );
+        assert!(
+            out.contains("## Components, by how many others depend on them"),
+            "the sections behind the cycle must survive it:\n{out}"
+        );
+    }
+
+    #[test]
+    fn subsystem_brief_called_from_is_external_in_component_mode() {
+        // A component's entries are by definition what something OUTSIDE calls,
+        // so a caller inside it is not calling in. travsr-retrieval's own
+        // `bfs_fallback` was listed under "Called from" beside the travsr-mcp
+        // callers, which answers a different question from the one the heading
+        // asks.
+        use travsr_core::EdgeKind;
+        let entry = make_node("crates/lib/src/api.rs", "fn:entry");
+        let sibling = make_node("crates/lib/src/internal.rs", "fn:sibling");
+        let outsider = make_node("crates/app/src/main.rs", "fn:outsider");
+        let store = make_store(
+            &[entry.clone(), sibling.clone(), outsider.clone()],
+            &[
+                (outsider.id, entry.id, EdgeKind::RefCall),
+                (sibling.id, entry.id, EdgeKind::RefCall),
+            ],
+        );
+
+        let out = get_subsystem_brief(&store, "", "crates/lib", "", 3, 6, 8_000);
+        let called_from = out
+            .split("## Called from")
+            .nth(1)
+            .unwrap_or_else(|| panic!("section must exist:\n{out}"))
+            .split("## Call spine")
+            .next()
+            .unwrap()
+            .to_string();
+        assert!(
+            called_from.contains("outsider"),
+            "the external caller must be listed: {called_from}"
+        );
+        assert!(
+            !called_from.contains("sibling"),
+            "a caller inside the component is not calling in: {called_from}"
+        );
+
+        // Naming the symbol directly asks a different question, and there every
+        // caller is wanted.
+        let by_entry = get_subsystem_brief(&store, "fn:entry", "", "", 3, 6, 8_000);
+        let called_from = by_entry
+            .split("## Called from")
+            .nth(1)
+            .unwrap()
+            .split("## Call spine")
+            .next()
+            .unwrap()
+            .to_string();
+        assert!(
+            called_from.contains("sibling") && called_from.contains("outsider"),
+            "entry mode lists every caller: {called_from}"
+        );
+    }
+
+    #[test]
+    fn subsystem_brief_is_deterministic_across_runs() {
+        // `hit` and `callers` were built from HashMaps and sorted on reach alone,
+        // so equal-reach candidates kept whatever order the map yielded and the
+        // same query returned different symbols across runs. CLAUDE.md requires
+        // the structural tier to be same-input-same-output.
+        use travsr_core::EdgeKind;
+        let a = make_node("crates/a/src/one.rs", "fn:dup");
+        let b = make_node("crates/b/src/two.rs", "fn:dup");
+        let c1 = make_node("crates/c/src/x.rs", "fn:c1");
+        let c2 = make_node("crates/c/src/y.rs", "fn:c2");
+        // Both `fn:dup` definitions get exactly one caller, so reach ties.
+        let edges = vec![
+            (c1.id, a.id, EdgeKind::RefCall),
+            (c2.id, b.id, EdgeKind::RefCall),
+        ];
+        let store = make_store(&[a, b, c1, c2], &edges);
+        let first = get_subsystem_brief(&store, "fn:dup", "", "", 3, 6, 8_000);
+        for _ in 0..12 {
+            assert_eq!(
+                get_subsystem_brief(&store, "fn:dup", "", "", 3, 6, 8_000),
+                first,
+                "identical queries must return identical briefs"
+            );
+        }
+    }
+
+    #[test]
+    fn subsystem_brief_reach_and_calls_describe_one_universe() {
+        // Reach counted every edge while calls counted only non-test ones, so the
+        // brief could say "nothing in the graph calls it" and print a non-zero
+        // reach two lines later, both as fact.
+        use travsr_core::EdgeKind;
+        let target = make_node("crates/a/src/lib.rs", "fn:target");
+        let real = make_node("crates/a/src/caller.rs", "fn:real_caller");
+        let mut test_caller = make_node("crates/a/tests/it.rs", "fn:test_caller");
+        test_caller.test_role = travsr_core::TestRole::EntryPoint;
+        let edges = vec![
+            (real.id, target.id, EdgeKind::RefCall),
+            (test_caller.id, target.id, EdgeKind::RefCall),
+        ];
+        let store = make_store(&[target, real, test_caller], &edges);
+        let out = get_subsystem_brief(&store, "fn:target", "", "", 3, 6, 8_000);
+        assert!(
+            out.contains("real_caller"),
+            "the non-test caller must be listed:\n{out}"
+        );
+        assert!(
+            !out.contains("test_caller"),
+            "the test caller must be excluded:\n{out}"
+        );
+        // One caller survives exclusion, so reach must be 1 and not 2.
+        assert!(
+            out.contains("reach=1"),
+            "reach must count only what calls counts:\n{out}"
+        );
+    }
+
+    #[test]
+    fn subsystem_brief_distinguishes_a_bad_filter_from_a_missing_call_graph() {
+        // Routing an unrecognised provenance through the same empty-calls branch
+        // told users with a complete semantic index to install a toolchain they
+        // already had.
+        use travsr_core::EdgeKind;
+        let a = make_node("crates/a/src/lib.rs", "fn:a");
+        let b = make_node("crates/b/src/lib.rs", "fn:b");
+        let store = make_store(
+            &[a, b],
+            &[(
+                make_node("crates/a/src/lib.rs", "fn:a").id,
+                make_node("crates/b/src/lib.rs", "fn:b").id,
+                EdgeKind::RefCall,
+            )],
+        );
+        let out = get_subsystem_brief(&store, "fn:a", "", "nonsense-filter", 3, 6, 8_000);
+        assert!(
+            out.contains("no call edges matched provenance"),
+            "must name the filter as the cause:\n{out}"
+        );
+        assert!(
+            !out.contains("lang install"),
+            "must not tell a user with a call graph to install an analyzer:\n{out}"
+        );
+    }
+
+    #[test]
+    fn subsystem_brief_says_so_when_there_is_no_call_graph() {
+        // Without Phase B there are no ref/call edges, so there is no flow. Say
+        // that, rather than returning an empty document that reads as "nothing
+        // happens here".
+        let a = make_node("crates/a/src/lib.rs", "fn:a");
+        let b = make_node("crates/b/src/lib.rs", "fn:b");
+        let store = make_store(&[a, b], &[]);
+        let out = get_subsystem_brief(&store, "fn:a", "", "", 3, 6, 8_000);
+        assert!(
+            out.contains("no call edges"),
+            "must disclose the missing call graph:\n{out}"
+        );
+        assert!(
+            out.contains("lang install"),
+            "must say how to get one:\n{out}"
+        );
+    }
+
+    #[test]
     fn get_repo_map_ranks_regions_by_dependents() {
         let store = two_crate_store(false);
         let result = get_repo_map(&store);
@@ -11263,6 +13181,28 @@ mod tests {
         assert!(
             result.contains("dependents: 1"),
             "core dependents shown:\n{result}"
+        );
+    }
+
+    #[test]
+    fn get_repo_map_counts_direct_dependents_only() {
+        // a -> b -> c: c has one direct dependent. A transitive count gives it
+        // two, and on a funnel-shaped graph lets a leaf outrank what it serves.
+        use travsr_core::EdgeKind;
+        let a = make_node("alpha/lib.rs", "fn:a");
+        let b = make_node("beta/lib.rs", "fn:b");
+        let c = make_node("gamma/lib.rs", "fn:c");
+        let store = make_store(
+            &[a.clone(), b.clone(), c.clone()],
+            &[
+                (a.id, b.id, EdgeKind::RefCall),
+                (b.id, c.id, EdgeKind::RefCall),
+            ],
+        );
+        let result = get_repo_map(&store);
+        assert!(
+            result.contains("gamma  dependents: 1 "),
+            "c must count one direct dependent, not two:\n{result}"
         );
     }
 

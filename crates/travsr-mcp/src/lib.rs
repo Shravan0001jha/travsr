@@ -39,6 +39,7 @@ pub use query::AMBIGUOUS_DISPLAY_LIMIT;
 // #645 WS-B: the CLI `status` surface reuses this exact classifier so the CLI
 // and MCP notes never disagree about an index/HEAD mismatch.
 pub use tools::head_index_mismatch_note;
+pub use tools::{check_architecture_invariants, InvariantReport, PROVENANCE_FILTERS};
 // The CLI surfaces the same call-graph completeness note as the MCP tools.
 // Shared rather than reimplemented: the doc on `phase_b_degraded_note` already
 // promised the two would never disagree, and until now only the MCP side used
