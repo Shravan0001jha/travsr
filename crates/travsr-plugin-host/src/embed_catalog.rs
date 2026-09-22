@@ -642,15 +642,16 @@ fn sidecar_supports_cancel(bin_path: &Path) -> bool {
 }
 
 /// True if a process with `pid` is currently alive (no signal sent).
+///
+/// #759: delegates to [`crate::unix_pid_is_alive`] so that `EPERM` (process
+/// exists, this user may not signal it) is correctly reported as alive.
+/// The previous `kill -0` shell-out collapsed `EPERM` and `ESRCH` into the
+/// same non-zero exit, causing a sidecar running under a different uid to
+/// read as dead — `terminate_inflight_reindex` would then log a false
+/// "drained gracefully" and orphan the sidecar without sending SIGTERM.
 #[cfg(unix)]
 fn pid_alive(pid: u32) -> bool {
-    Command::new("kill")
-        .args(["-0", &pid.to_string()])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+    crate::unix_pid_is_alive(pid)
 }
 /// #500: real liveness probe (OpenProcess + GetExitCodeProcess, no signal).
 /// The previous hardcoded `false` made `!pid_alive(pid)` in the grace poll
@@ -2174,6 +2175,19 @@ mod tests {
         assert!(
             !pid_alive(pid),
             "an exited, reaped child must be reported dead"
+        );
+    }
+
+    /// #759 regression: pid_alive must report a process alive even when
+    /// the calling user cannot signal it (EPERM). PID 1 is the canonical
+    /// hermetic case — always alive and (outside a root-run container)
+    /// always returns EPERM from kill(1, 0) for non-root callers.
+    #[cfg(unix)]
+    #[test]
+    fn pid_alive_eperm_reads_as_alive_not_dead() {
+        assert!(
+            pid_alive(1),
+            "PID 1 is alive; EPERM from kill(1,0) must not be misread as dead (#759)"
         );
     }
 
