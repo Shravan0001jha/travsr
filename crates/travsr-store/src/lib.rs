@@ -2371,6 +2371,9 @@ impl SqliteStore {
     ///   `src` this purge removed are dropped, on evidence rather than by a
     ///   wipe).
     /// - `meta`, `sessions`, `fts_synonyms` — stamps and user config, not graph.
+    ///   The one exception is `meta.phase_b_commit`, which claims Phase B is
+    ///   current for a commit and so is false once this runs; the caller deletes
+    ///   it alongside the hash cache.
     ///
     /// Returns the number of nodes removed.
     pub fn purge_graph(&mut self) -> Result<u64, StoreError> {
@@ -5125,6 +5128,14 @@ LIMIT ?4",
         Ok(())
     }
 
+    pub fn delete_meta(&mut self, key: &str) -> Result<(), StoreError> {
+        self.conn
+            .execute("DELETE FROM meta WHERE key = ?1", params![key])
+            .context("deleting meta key")
+            .map_err(|e| StoreError::Database(e.to_string()))?;
+        Ok(())
+    }
+
     /// Return the VName signature format version recorded in this database.
     ///
     /// Returns `0` for legacy databases (pre-RFC-002) that have no such row,
@@ -5138,6 +5149,38 @@ LIMIT ?4",
                 .unwrap_or_else(|| "0".to_string());
             raw.parse::<u8>()
                 .with_context(|| format!("invalid signature_format_version in meta: {raw}"))
+        })()
+        .map_err(|e| StoreError::Database(e.to_string()))
+    }
+
+    /// Whether a stored node's id is the one this binary derives from its VName.
+    ///
+    /// The `signature_format_version` stamp is a claim; the ids are evidence.
+    /// `VName::id()` hashes `SIGNATURE_FORMAT_VERSION` first, so one node whose
+    /// stored id differs from its re-derived id proves the graph was built under
+    /// another format whatever the stamp says (#918). An empty graph is `true`.
+    pub fn node_ids_match_current_format(&self) -> Result<bool, StoreError> {
+        (|| -> AnyResult<bool> {
+            let row = self
+                .conn
+                .query_row(
+                    "SELECT id, corpus, root, path, language, signature FROM nodes LIMIT 1",
+                    [],
+                    |row| {
+                        let id = i64_to_node_id(row.get::<_, i64>(0)?);
+                        let vname = VName::new(
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, String>(3)?,
+                            row.get::<_, String>(4)?,
+                            row.get::<_, String>(5)?,
+                        );
+                        Ok((id, vname))
+                    },
+                )
+                .optional()
+                .context("reading one node to check its id format")?;
+            Ok(row.map_or(true, |(id, vname)| vname.id() == id))
         })()
         .map_err(|e| StoreError::Database(e.to_string()))
     }

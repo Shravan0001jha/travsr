@@ -1481,9 +1481,16 @@ pub fn init_repo_with_progress(
     // that way it looked like a brand-new database and the skew went unanswered
     // forever. The `files` table is what separates the two: a database nobody has
     // indexed has no hashes either, while the emptied one still has all of them.
+    //
+    // The stamp alone is not trusted either (#918). A 1.1.0 binary stamped the
+    // new format before its rebuild failed, leaving a current stamp over
+    // old-format ids that no plain `init` could get past. Re-deriving one
+    // stored node's id checks the claim against the evidence.
     let stored_sig_version = store.get_signature_format_version().unwrap_or(0);
     let indexed_before = nodes_before > 0 || store.file_hash_count().unwrap_or(0) > 0;
-    let format_skew = indexed_before && stored_sig_version != SIGNATURE_FORMAT_VERSION;
+    let ids_current = store.node_ids_match_current_format().unwrap_or(false);
+    let format_skew =
+        indexed_before && (stored_sig_version != SIGNATURE_FORMAT_VERSION || !ids_current);
     if format_skew {
         eprintln!(
             "index format changed (v{stored_sig_version} -> v{SIGNATURE_FORMAT_VERSION}), \
@@ -1573,6 +1580,12 @@ pub fn init_repo_with_progress(
             .clear_file_hashes()
             .map_err(|e| anyhow::anyhow!("{e}"))
             .context("clearing file hash cache before rebuild")?;
+        // The purge removed every Phase B edge, so a `phase_b_commit` still at
+        // HEAD would tell the already-done gate and `arm_phase_b_if_pending`
+        // that Phase B is current over a graph that has none of it.
+        store
+            .delete_meta("phase_b_commit")
+            .context("clearing the Phase B marker before rebuild")?;
         tracing::info!(purged, cleared, "purged graph for full re-parse");
     }
 
@@ -9013,6 +9026,70 @@ mod tests {
             .unwrap();
         assert_eq!(packages, 1, "the package node must be rebuilt exactly once");
         assert_eq!(untracked(), 1, "and still be the only untracked node");
+    }
+
+    /// #918's on-disk state: a 1.1.0 binary stamped the current format, then
+    /// failed its rebuild, and the hash cache was already cleared. The stamp
+    /// read current, so `format_skew` was false, init took the incremental path
+    /// and the path-less package node collided with its re-keyed self on
+    /// `idx_nodes_vname` on every plain run. The ids have to override the stamp.
+    #[test]
+    fn init_repo_rebuilds_when_the_stamp_lies_about_the_ids() {
+        let tmp = tempfile::tempdir().unwrap();
+        git_init(tmp.path());
+        std::fs::create_dir_all(tmp.path().join(".github/workflows")).unwrap();
+        std::fs::write(
+            tmp.path().join(".github/workflows/ci.yml"),
+            "jobs:\n  build:\n    steps:\n      - uses: actions/checkout@v7\n",
+        )
+        .unwrap();
+        assert_eq!(init_repo(tmp.path()).unwrap().files_indexed, 1);
+
+        let db_path = tmp.path().join(".travsr/graph.db");
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute_batch("UPDATE nodes SET id = -id - 1; DELETE FROM files;")
+                .unwrap();
+        }
+        assert_eq!(
+            travsr_store::SqliteStore::open(&db_path)
+                .unwrap()
+                .get_signature_format_version()
+                .unwrap(),
+            travsr_core::SIGNATURE_FORMAT_VERSION,
+            "the fixture's stamp must claim the current format"
+        );
+
+        let rebuilt = init_repo(tmp.path())
+            .expect("a current stamp over old-format ids must rebuild, not collide");
+        assert_eq!(rebuilt.files_indexed, 1);
+        let store = travsr_store::SqliteStore::open(&db_path).unwrap();
+        assert!(store.node_ids_match_current_format().unwrap());
+    }
+
+    /// The purge removes every Phase B edge, so the marker saying Phase B is
+    /// current for HEAD has to go with them. Left in place, the already-done
+    /// gate and `arm_phase_b_if_pending` both read the empty call graph as
+    /// current until the next commit.
+    #[test]
+    fn init_repo_format_rebuild_clears_the_phase_b_marker() {
+        let tmp = tempfile::tempdir().unwrap();
+        git_init(tmp.path());
+        std::fs::write(tmp.path().join("a.ts"), "export class A { go() {} }").unwrap();
+        assert_eq!(init_repo(tmp.path()).unwrap().files_indexed, 1);
+
+        let db_path = tmp.path().join(".travsr/graph.db");
+        {
+            let mut store = travsr_store::SqliteStore::open(&db_path).unwrap();
+            store.set_meta("phase_b_commit", "abc123").unwrap();
+            store
+                .set_signature_format_version(travsr_core::SIGNATURE_FORMAT_VERSION - 1)
+                .unwrap();
+        }
+
+        assert_eq!(init_repo(tmp.path()).unwrap().files_indexed, 1);
+        let store = travsr_store::SqliteStore::open(&db_path).unwrap();
+        assert_eq!(store.get_meta("phase_b_commit").unwrap(), None);
     }
 
     /// The stamp guards the rebuild, so it cannot be written until the rebuild
