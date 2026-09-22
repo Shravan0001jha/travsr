@@ -14677,28 +14677,23 @@ mod snippet_tests {
             .find("fn:gamma")
             .unwrap_or_else(|| panic!("the sink must appear; got: {result}"));
 
-        match result.find("nearby context") {
-            Some(ctx_at) => {
-                assert!(
-                    ctx_at > path_at,
-                    "context must follow the path, never lead it; got: {result}"
-                );
-                assert!(
-                    sink_at < ctx_at,
-                    "the sink terminates the path and must not fall in the corridor; got: {result}"
-                );
-                assert!(
-                    result[ctx_at..].contains("fn:delta"),
-                    "an off-route neighbour belongs in the corridor; got: {result}"
-                );
-            }
-            // A corridor is not guaranteed for every graph; when there is none,
-            // the path section must still be labelled and hold the sink.
-            None => assert!(
-                sink_at > path_at,
-                "sink must be inside the path; got: {result}"
-            ),
-        }
+        // `delta` hangs off the route, so this fixture always has a corridor.
+        // Requiring it keeps the boundary assertions below from being skipped.
+        let ctx_at = result
+            .find("nearby context")
+            .unwrap_or_else(|| panic!("the fixture must yield a corridor; got: {result}"));
+        assert!(
+            ctx_at > path_at,
+            "context must follow the path, never lead it; got: {result}"
+        );
+        assert!(
+            path_at < sink_at && sink_at < ctx_at,
+            "the sink terminates the path and must not fall in the corridor; got: {result}"
+        );
+        assert!(
+            result[ctx_at..].contains("fn:delta"),
+            "an off-route neighbour belongs in the corridor; got: {result}"
+        );
     }
 
     // ── #377 truncation signals ───────────────────────────────────────────────
