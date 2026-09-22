@@ -48,10 +48,11 @@ pub fn run(provenance: &str) -> Result<()> {
         .with_context(|| format!("reading {}", rules_path.display()))?;
     let store = crate::daemon_client::open_read_store(&db_path)?;
 
-    let report = travsr_mcp::check_architecture_invariants(&store, &rules, provenance);
-    println!("{}", report.trim());
+    let report = travsr_mcp::check_architecture_invariants(&store, &rules, provenance)
+        .map_err(|e| anyhow::anyhow!("{}: {e}", rules_path.display()))?;
+    println!("{}", report.text.trim());
 
-    if report.contains("VIOLATIONS FOUND") {
+    if report.violations > 0 {
         anyhow::bail!("architecture invariants violated");
     }
     Ok(())

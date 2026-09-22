@@ -3882,6 +3882,15 @@ pub fn get_architecture_brief(
 ) -> String {
     use std::collections::{BTreeMap, BTreeSet, HashMap};
 
+    // An unknown filter matches no edge, which the brief would otherwise report
+    // as analysis that has not run.
+    if !PROVENANCE_FILTERS.contains(&provenance) {
+        return sanitize_for_mcp(&format!(
+            "unknown provenance '{provenance}'. Use 'ratified' for confirmed edges, '' for \
+             everything, or name one provenance exactly (tree-sitter, lsif, scip, live)."
+        ));
+    }
+
     let nodes = match store.all_nodes() {
         Ok(n) => n,
         Err(e) => {
@@ -3949,8 +3958,19 @@ pub fn get_architecture_brief(
         by_id.insert(n.id, n);
     }
     if let Ok(edges) = store.all_edges() {
-        for (_, dst, _, prov) in &edges {
-            if !provenance_allowed(provenance, prov) {
+        for (_, dst, kind, prov) in &edges {
+            // References only. `defines/binding` runs from a type to each of its
+            // members, so counting it ranked types by how many members they have.
+            if !matches!(
+                kind.as_str(),
+                "ref/call"
+                    | "ref/field"
+                    | "ref/imports"
+                    | "is-implementation"
+                    | "overrides"
+                    | "ffi/call"
+            ) || !provenance_allowed(provenance, prov)
+            {
                 continue;
             }
             if let Some(n) = by_id.get(dst) {
@@ -4237,6 +4257,7 @@ pub fn get_architecture_brief(
 /// constraints projects actually write down in prose, and prose is exactly what
 /// drifts. CLAUDE.md's own dependency section had been missing two real edges.
 #[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Invariant {
     #[serde(default)]
     name: String,
@@ -4254,10 +4275,23 @@ struct Invariant {
     because: String,
 }
 
+/// Unknown keys are an error, not ignored: a misspelled `mayDependsOn` would
+/// otherwise be dropped and its rule would hold over nothing.
 #[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct InvariantFile {
+    #[serde(rename = "$comment", default)]
+    _comment: Option<String>,
     #[serde(default)]
     invariants: Vec<Invariant>,
+}
+
+/// What `check_architecture_invariants` found: the report to print, and how
+/// many rules it found broken. The caller keys its exit code on `violations`,
+/// not on the wording of `text`.
+pub struct InvariantReport {
+    pub text: String,
+    pub violations: usize,
 }
 
 /// Components and the weighted edges between them, at the same granularity and
@@ -4312,28 +4346,27 @@ fn component_dependency_graph(
 /// which prints it to a terminal. Escaping `->` to `-&gt;` for a reader that
 /// does not exist would be the only effect.
 ///
-/// Returns a report; the caller decides whether a violation is fatal. A rule
-/// naming a component the graph does not have FAILS rather than passing
-/// vacuously, because renaming a crate would otherwise silently retire the rule
-/// that exists to protect it, which is the one failure mode a guard must not
-/// have.
+/// Returns a report; the caller decides whether a violation is fatal. A rules
+/// file that does not parse is an `Err`, never a report, so a gate cannot pass
+/// on a file it could not read. A rule naming a component the graph does not
+/// have FAILS rather than passing vacuously, because renaming a crate would
+/// otherwise silently retire the rule that exists to protect it, which is the
+/// one failure mode a guard must not have.
 pub fn check_architecture_invariants(
     store: &SqliteStore,
     rules_json: &str,
     provenance: &str,
-) -> String {
-    let parsed: InvariantFile = match serde_json::from_str(rules_json) {
-        Ok(v) => v,
-        Err(e) => return format!("could not read the invariants file: {e}"),
-    };
+) -> Result<InvariantReport, String> {
+    let parsed: InvariantFile = serde_json::from_str(rules_json)
+        .map_err(|e| format!("could not read the invariants file: {e}"))?;
     if parsed.invariants.is_empty() {
-        return "no invariants declared.".to_string();
+        return Ok(InvariantReport {
+            text: "no invariants declared.".to_string(),
+            violations: 0,
+        });
     }
 
     let (components, edges) = component_dependency_graph(store, provenance);
-    if components.is_empty() {
-        return "no components: this index has no indexed source files.".to_string();
-    }
     let names: Vec<String> = components.iter().cloned().collect();
     let mut adj: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
     for (a, b) in edges.keys() {
@@ -4345,6 +4378,11 @@ pub fn check_architecture_invariants(
         .collect();
 
     let mut out = String::new();
+    // No early return here: on an empty index every rule naming a component must
+    // still fail as "not a component in this graph", not pass by being skipped.
+    if components.is_empty() {
+        out.push_str("no components: this index has no indexed source files.\n");
+    }
     let mut violations = 0usize;
     for rule in &parsed.invariants {
         let name = if rule.name.is_empty() {
@@ -4444,7 +4482,10 @@ pub fn check_architecture_invariants(
     if violations > 0 {
         out.push_str("VIOLATIONS FOUND\n");
     }
-    out
+    Ok(InvariantReport {
+        text: out,
+        violations,
+    })
 }
 
 // ── get_subsystem_brief ───────────────────────────────────────────────────────
@@ -4470,10 +4511,9 @@ fn subsystem_component_of(path: &str) -> String {
             }
         }
     }
-    match path.rfind('/') {
-        Some(i) => path[..i].to_string(),
-        None => path.to_string(),
-    }
+    // A root-level file goes to `(root)`, as in the repo map, rather than
+    // becoming a component named after itself.
+    repo_map_dir_of(path)
 }
 
 fn simple_symbol(sig: &str) -> &str {
@@ -12631,7 +12671,8 @@ mod tests {
             {"name":"gone","components":["crates/removed"],"mayDependOn":[],"because":"r2"},
             {"name":"beta is fine","components":["crates/beta"],"mayDependOn":[],"because":"r3"}
         ]}"#;
-        let out = check_architecture_invariants(&store, rules, "");
+        let report = check_architecture_invariants(&store, rules, "").unwrap();
+        let out = &report.text;
 
         assert!(out.contains("VIOLATED alpha is pure"), "{out}");
         assert!(out.contains("depends on 'crates/beta'"), "{out}");
@@ -12640,9 +12681,95 @@ mod tests {
         assert!(out.contains("VIOLATED gone"), "{out}");
         assert!(out.contains("not a component in this graph"), "{out}");
         assert!(out.contains("holds    beta is fine"), "{out}");
-        assert!(
-            out.contains("VIOLATIONS FOUND"),
+        assert_eq!(
+            report.violations, 2,
             "the caller keys its exit code on this:\n{out}"
+        );
+
+        // A misspelled key must be rejected, not dropped. Dropped, the rule has
+        // no constraint left and holds over nothing.
+        let misspelled = r#"{"invariants":[
+            {"name":"alpha is pure","components":["crates/alpha"],"mayDependsOn":[]}
+        ]}"#;
+        let err = check_architecture_invariants(&store, misspelled, "")
+            .err()
+            .expect("an unknown rule key must be an error");
+        assert!(err.contains("mayDependsOn"), "{err}");
+
+        // An empty index must still fail a rule that names a component, rather
+        // than returning before any rule is checked.
+        let empty = make_store(&[], &[]);
+        let report = check_architecture_invariants(&empty, rules, "").unwrap();
+        assert_eq!(report.violations, 3, "{}", report.text);
+        assert!(
+            report
+                .text
+                .contains("rule names 'crates/alpha', which is not a component"),
+            "{}",
+            report.text
+        );
+    }
+
+    #[test]
+    fn invariants_reject_a_rules_file_that_does_not_parse() {
+        // Returned as a report, a parse error carried no violation marker and
+        // `travsr invariants` exited 0 on a file it could not read.
+        let store = make_store(&[make_node("crates/alpha/src/lib.rs", "fn:a")], &[]);
+        let trailing_comma = r#"{"invariants":[
+            {"name":"alpha is pure","components":["crates/alpha"],"mayDependOn":[]},
+        ]}"#;
+        assert!(check_architecture_invariants(&store, trailing_comma, "").is_err());
+        // The shipped file's top-level `$comment` must still parse.
+        let commented = r#"{"$comment":"why","invariants":[{"name":"n","acyclic":true}]}"#;
+        assert!(check_architecture_invariants(&store, commented, "").is_ok());
+    }
+
+    #[test]
+    fn a_root_level_file_belongs_to_the_root_component() {
+        // `main.go` at the root was its own component named after the file.
+        assert_eq!(subsystem_component_of("main.go"), "(root)");
+        assert_eq!(subsystem_component_of("cmd/tool/main.go"), "cmd/tool");
+        assert_eq!(subsystem_component_of("pkg/util/x.go"), "pkg/util");
+    }
+
+    #[test]
+    fn architecture_brief_ranks_types_by_references_not_members() {
+        // Counting every edge kind ranked a type by how many members it defines:
+        // `defines/binding` from a type to each member folded into the type.
+        use travsr_core::EdgeKind;
+        let big = make_node("crates/a/src/lib.rs", "struct:Big");
+        let used = make_node("crates/a/src/lib.rs", "struct:Used");
+        let user = make_node("crates/b/src/lib.rs", "fn:user");
+        let mut nodes = vec![big.clone(), used.clone(), user.clone()];
+        let mut edges = vec![(user.id, used.id, EdgeKind::RefCall)];
+        for m in ["x", "y", "z"] {
+            let member = make_node("crates/a/src/lib.rs", &format!("method:Big.{m}"));
+            edges.push((big.id, member.id, EdgeKind::DefinesBinding));
+            nodes.push(member);
+        }
+        let store = make_store(&nodes, &edges);
+        let out = get_architecture_brief(&store, "", 30_000);
+        assert!(
+            out.contains("most referenced types: Used (1), Big (0)"),
+            "only references may count toward a type's rank:\n{out}"
+        );
+    }
+
+    #[test]
+    fn architecture_brief_names_an_unknown_provenance() {
+        // A typo matched no edges and the brief blamed missing analysis.
+        use travsr_core::EdgeKind;
+        let a = make_node("crates/alpha/src/lib.rs", "fn:a");
+        let b = make_node("crates/beta/src/lib.rs", "fn:b");
+        let store = make_store(&[a.clone(), b.clone()], &[(a.id, b.id, EdgeKind::RefCall)]);
+        let out = get_architecture_brief(&store, "ratifed", 8_000);
+        assert!(
+            out.contains("unknown provenance 'ratifed'"),
+            "must name the filter as the cause:\n{out}"
+        );
+        assert!(
+            !out.contains("has not run"),
+            "must not blame missing analysis:\n{out}"
         );
     }
 
@@ -13054,6 +13181,28 @@ mod tests {
         assert!(
             result.contains("dependents: 1"),
             "core dependents shown:\n{result}"
+        );
+    }
+
+    #[test]
+    fn get_repo_map_counts_direct_dependents_only() {
+        // a -> b -> c: c has one direct dependent. A transitive count gives it
+        // two, and on a funnel-shaped graph lets a leaf outrank what it serves.
+        use travsr_core::EdgeKind;
+        let a = make_node("alpha/lib.rs", "fn:a");
+        let b = make_node("beta/lib.rs", "fn:b");
+        let c = make_node("gamma/lib.rs", "fn:c");
+        let store = make_store(
+            &[a.clone(), b.clone(), c.clone()],
+            &[
+                (a.id, b.id, EdgeKind::RefCall),
+                (b.id, c.id, EdgeKind::RefCall),
+            ],
+        );
+        let result = get_repo_map(&store);
+        assert!(
+            result.contains("gamma  dependents: 1 "),
+            "c must count one direct dependent, not two:\n{result}"
         );
     }
 
