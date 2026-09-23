@@ -1595,6 +1595,28 @@ mod tests {
         }
     }
 
+    /// An sbt project one level down is handed its own directory, so the
+    /// SemanticDB paths it reports are rebased to the repo root. Invoked at the
+    /// repo root, they landed as `src/Animal.scala` ghost nodes.
+    #[test]
+    fn scala_is_invoked_at_its_sbt_directory() {
+        use super::build_roots;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("scala/src")).expect("mkdir");
+        std::fs::write(root.join("scala/build.sbt"), "").expect("write");
+        let files = vec!["scala/src/Animal.scala".to_string()];
+        assert_eq!(
+            build_roots(
+                root,
+                &files,
+                crate::phase_b::catalog::build_manifests("scala")
+            ),
+            vec![root.join("scala")]
+        );
+    }
+
     /// #724 Finding 5: the directory a build-driven analyzer is handed.
     #[test]
     fn build_roots_are_the_outermost_manifest_directories_above_the_source_files() {
