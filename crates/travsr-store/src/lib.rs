@@ -5824,13 +5824,13 @@ LIMIT ?4",
             .iter()
             .map(|p| p.callee_def_path.as_str())
             .collect();
-        let mut span_cache: std::collections::HashMap<&str, Vec<FnSpan>> =
+        let mut span_cache: std::collections::HashMap<&str, Vec<(FnSpan, String)>> =
             std::collections::HashMap::with_capacity(unique_paths.len());
         for path in unique_paths {
             let mut stmt = self
                 .conn
                 .prepare_cached(
-                    "SELECT id, line, end_line FROM nodes \
+                    "SELECT id, line, end_line, kind FROM nodes \
                      WHERE corpus = ?1 AND path = ?2 \
                        AND line IS NOT NULL AND end_line IS NOT NULL \
                      ORDER BY (end_line - line) ASC, id ASC",
@@ -5838,11 +5838,14 @@ LIMIT ?4",
                 .context("resolve_lsif_positional_refs: prepare")?;
             let spans = stmt
                 .query_map(params![corpus, path], |row| {
-                    Ok(FnSpan {
-                        id: row.get(0)?,
-                        line: row.get(1)?,
-                        end_line: row.get(2)?,
-                    })
+                    Ok((
+                        FnSpan {
+                            id: row.get(0)?,
+                            line: row.get(1)?,
+                            end_line: row.get(2)?,
+                        },
+                        row.get(3)?,
+                    ))
                 })
                 .context("resolve_lsif_positional_refs: query")?
                 .collect::<rusqlite::Result<Vec<_>>>()
@@ -5853,12 +5856,25 @@ LIMIT ?4",
         let mut out = Vec::with_capacity(positional.len());
         for p in positional {
             let def_line = p.callee_def_line as i64;
-            let Some(callee_i64) = span_cache
+            let Some((span, kind)) = span_cache
                 .get(p.callee_def_path.as_str())
-                .and_then(|spans| find_narrowest_enclosing(spans, def_line))
+                .and_then(|spans| {
+                    spans
+                        .iter()
+                        .find(|(s, _)| s.line <= def_line && s.end_line >= def_line)
+                })
             else {
                 continue; // fail closed: callee def resolves to no node
             };
+            // A trait or impl that only encloses the definition is its
+            // container, not the callee: a required trait method has no node of
+            // its own. Fail closed as above. Neither is ever called, so a call
+            // landing on one is always that case; a mention of the trait itself
+            // starts on its own line.
+            if matches!(kind.as_str(), "trait" | "impl") && (p.is_call || span.line != def_line) {
+                continue;
+            }
+            let callee_i64 = span.id;
             out.push(travsr_core::ScipRef {
                 caller_path: p.caller_path.clone(),
                 caller_line: p.caller_line,
@@ -17208,6 +17224,57 @@ mod tests {
                 .any(|(s, d, k, _)| *s == g.id && *d == h.id && k == "ref/call"),
             "the genuine g → h call must survive"
         );
+    }
+
+    /// A required trait method (`fn name(&self) -> &str;`) has no node, so the
+    /// narrowest span around its definition line is the trait itself. That is
+    /// a container, not the callee: `self.name()` became a `ref/call` to
+    /// `trait:Animal`. A tuple struct starts on its own definition line and
+    /// stays callable.
+    #[test]
+    fn lsif_positional_callee_is_never_a_merely_enclosing_trait() {
+        let corpus = "c";
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let tr = Node::new(
+            VName::new(corpus, "", "a.rs", "rust", "trait:Animal"),
+            "trait",
+        )
+        .with_line(1)
+        .with_end_line(7);
+        let describe = Node::new(
+            VName::new(corpus, "", "a.rs", "rust", "method:Animal.describe"),
+            "method",
+        )
+        .with_line(4)
+        .with_end_line(6);
+        let point = Node::new(
+            VName::new(corpus, "", "a.rs", "rust", "struct:Point"),
+            "struct",
+        )
+        .with_line(9)
+        .with_end_line(9);
+        store
+            .write_scip_attributed_batch(corpus, &[tr.clone(), describe, point.clone()], &[])
+            .unwrap();
+        let at = |def_line: u32, is_call: bool| travsr_core::LsifPositionalRef {
+            caller_path: "a.rs".to_string(),
+            caller_line: 5,
+            callee_def_path: "a.rs".to_string(),
+            callee_def_line: def_line,
+            is_call,
+            caller_col: None,
+        };
+        // `name` defined on line 2 (inside the trait), `Point` on line 9, a
+        // mention of the trait on its own line 1, and a call that lands on that
+        // line (a one-line `trait Named { fn name(&self); }`): never callable.
+        let refs = store
+            .resolve_lsif_positional_refs(
+                corpus,
+                &[at(2, true), at(9, true), at(1, false), at(1, true)],
+            )
+            .unwrap();
+        let callees: Vec<_> = refs.iter().map(|r| r.callee_id).collect();
+        assert_eq!(callees, vec![point.id, tr.id]);
     }
 
     /// `--fix` remediation for DBs written before the guard: `fsck` counts and
