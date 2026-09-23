@@ -301,6 +301,10 @@ travsr init --no-connect             Index the repo without wiring detected AI t
 travsr connect                       Detect installed AI coding tools and wire each to the Travsr MCP server
 travsr connect --print               Show what connect would write, without touching the filesystem
 travsr connect --remove              Undo a previous connect run
+travsr init --guard[=strict]         Also install the Claude Code PreToolUse guard (advisory, or blocking)
+travsr connect --guard[=strict]      Install the guard without re-indexing (--remove takes it back out)
+travsr guard                         The hook handler itself: reads a hook payload on stdin, writes a decision
+travsr guard --explain               Say on stderr why the guard decided what it did
 travsr daemon start/stop/status      Start, stop, or check the background daemon
 travsr daemon restart                Stop the running daemon and start a fresh one
 travsr daemon stop-embed             Pause background embedding (resume-embed to undo)
@@ -363,6 +367,112 @@ hand-authored config is skipped rather than clobbered. Pass `--commit` to
 opt into committing the generated files instead, `--tool <id>` to wire a
 single tool, `--print` to preview without writing, or `--remove` to undo a
 previous run.
+
+### The PreToolUse guard (Claude Code only)
+
+Wiring the MCP server makes the graph *reachable*. It does not make an agent
+use it: the pull toward `Grep`, `Read` and `bash: rg` is strong, and a rules
+file is read once per turn and skimmed. `travsr init --guard` installs a
+`PreToolUse` hook that runs at the exact moment the agent reaches for text
+search, and either names the Travsr call that answers the same question or
+refuses and names it.
+
+```bash
+travsr init --guard              # advisory: never blocks, attaches the redirect
+travsr init --guard=strict       # strict: denies reads the graph can answer
+travsr connect --guard[=strict]  # same, without re-indexing
+travsr connect --remove          # take the hook back out
+```
+
+**Advisory** never blocks anything. It allows the call and attaches the
+replacement, so the nudge lands where it is load-bearing:
+
+> Travsr has indexed this repository and holds `charge_payment`. It can answer
+> this structurally: call `find_references(symbol="charge_payment")` for every
+> use site, or `get_callers(symbol="charge_payment")` for the callers, instead
+> of Grep.
+
+**Strict** denies that call instead, with the same replacement in the refusal,
+and allows everything else. It is the mode that makes the graph non-optional.
+
+The level is stored in `.travsr/config.toml` as `guard.mode`, so `travsr guard`
+and the installed hook can never disagree about policy — the hook entry only
+names the binary to run. Change it at any time without touching
+`.claude/settings.json`:
+
+```bash
+travsr config set guard.mode strict --repo
+```
+
+**What the guard inspects.** `Grep`, `Glob`, a whole-file `Read`, and `Bash`
+invocations of `grep`, `rg`, `find`, `ag`, `ack` and `ls -R`. A `Bash` command
+is recognised only when the entire command line is one of those programs and
+nothing else: a pipeline, a `&&` chain, a redirect or a command substitution is
+passed through untouched, and so is a program that merely spells one of those
+names inside its own (`my-rg-wrapper`). Everything outside that set reaches the
+guard and leaves it with no decision at all, so your own permission settings
+still apply to it.
+
+**What it never blocks.** The guard only ever refuses a read the graph can
+actually replace, so it cannot become an outage:
+
+- no `.travsr/graph.db`, or one that is locked or will not open
+- an index that does not describe your current `HEAD`, or a `HEAD` it cannot
+  resolve
+- a path the index does not carry: untracked, ignored, vendored, binary, a
+  lockfile, a `.md`, a config file
+- a symbol the graph has never heard of — which is exactly when `grep` is the
+  right tool
+- a regex rather than a symbol name, a ranged `Read`, or any file discovery
+  (`Glob`, `find`, `ls -R`): the graph indexes code files only, so it cannot
+  faithfully answer a question about the whole tree
+- its own failure, or a decision that exceeds its 200 ms deadline
+
+**Why did it (not) block?** `travsr guard --explain` prints the one-line reason
+behind the decision on stderr, leaving stdout (the decision channel) untouched,
+so it is safe to leave on in the installed hook:
+
+```bash
+travsr guard --explain
+# travsr guard: index is at a1b2c3d, HEAD is at 9f8e7d6
+```
+
+The deadline is a hard bound, not a target. `TRAVSR_GUARD_DEADLINE_MS` raises it
+for one command if you need to tell "the graph cannot answer this" apart from
+"the guard ran out of time" on a slow filesystem; raising it can only make the
+guard slower, never more permissive.
+
+**Strict mode always lets you back out.** At most one redirect per symbol per
+session: a repeat search for the same term is allowed, and so is any search for
+a symbol you have already asked Travsr about. So "query the graph, get nothing,
+grep to confirm" works, and the guard can never hold an agent in a loop.
+
+**Turning it off.**
+
+```bash
+travsr config set guard.mode off --repo   # this repo, until you turn it back on
+travsr connect --remove                   # remove the hook and clear the level
+```
+
+`TRAVSR_GUARD=off` is the escape hatch. It is read by the guard process, which
+the agent launches, so set it in the environment you start Claude Code from and
+it holds for that whole session:
+
+```bash
+TRAVSR_GUARD=off claude
+```
+
+**Claude Code only.** This is enforcement, and enforcement needs a pre-tool
+contract to hook into. Claude Code is the only host Travsr wires that has one.
+Cursor, Copilot, Gemini CLI, Antigravity, Codex, Windsurf and Zed get the MCP
+wiring and the optional `--rules` guidance, and nothing here changes that —
+they are not enforced, and this section does not claim otherwise.
+
+`.claude/settings.json` is yours: the hook is merged into it, every other key
+and every other hook is preserved, re-running never duplicates the entry, a
+file that is not strict JSON is skipped rather than rewritten, and `--remove`
+takes out the travsr entry and nothing else. It is not git-ignored, because it
+is a shared, committed file.
 
 **GPU acceleration (optional).** `travsr embed init` installs a CPU-only sidecar
 by default, which works everywhere with nothing to set up. Set

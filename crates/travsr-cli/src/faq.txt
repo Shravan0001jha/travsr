@@ -123,6 +123,19 @@ $ travsr mcp --stdio
 - undo it later      travsr connect --remove
 connect records the absolute path of the binary it was run from, so an agent started days later launches the same travsr you tested with. Run it again after moving or upgrading the binary, and remember the agent only reads its config at startup.
 
+## how do I stop my agent reaching for grep?
+
+> Install the guard, a hook that intervenes at the moment it does.
+1. nudge it, never block :: travsr init --guard
+2. or refuse reads the graph can answer :: travsr init --guard=strict
+3. take the hook back out :: travsr connect --remove
+- matched      Grep, Glob, Read, and shell grep/rg/find/ag/ack/ls -R
+- advisory     allows the call and names the Travsr call to use instead
+- strict       denies it, with that same call in the refusal
+- turn it off  TRAVSR_GUARD=off
+Wiring MCP makes the graph reachable; it does not make an agent prefer it. The guard runs at the exact point the agent reaches for text search and hands it the replacement, which is worth more there than in a rules file it re-reads and skims every turn. It refuses only what the graph can genuinely answer: a missing, stale or unreadable index, an unknown symbol, a regex, a file the index does not carry, or its own 200ms deadline all let the call straight through. In strict mode you get at most one redirect per symbol per session, so a search you repeat is always allowed. Claude Code only, because it is the one host with a pre-tool contract to hook.
+$ travsr init --guard
+
 ## what tools does the MCP server expose?
 > Twenty-six, grouped by the kind of question they answer.
 - structure   get_callers, get_dependencies, get_blast_radius

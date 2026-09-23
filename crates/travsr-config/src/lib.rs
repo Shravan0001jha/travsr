@@ -196,6 +196,22 @@ pub static KEYS: &[KeySpec] = &[
     // directives like `travsr_plugin_host=debug`), and every troubleshooting
     // message in the CLI tells people to use it, so a key that silently
     // overrode it would break the documented path.
+    // #916: the PreToolUse guard's enforcement level. Policy lives here rather
+    // than in `.claude/settings.json` so `travsr guard` and the installed hook
+    // cannot disagree: the hook entry only names the binary to run, and one
+    // `travsr config set guard.mode ...` (or the `TRAVSR_GUARD` env var, which
+    // is the documented escape hatch) changes what that binary decides.
+    //
+    // Default `off`: a plain `travsr init` must never start denying an agent's
+    // tool calls in a repo where nobody asked for it.
+    KeySpec {
+        key: "guard.mode",
+        description:
+            "Claude Code PreToolUse guard: off | advisory | strict. advisory nudges toward the graph, strict denies graph-answerable reads.",
+        env: Some("TRAVSR_GUARD"),
+        default_display: "off",
+        validate: validate_guard_mode,
+    },
     KeySpec {
         key: "log.level",
         description:
@@ -205,6 +221,13 @@ pub static KEYS: &[KeySpec] = &[
         validate: validate_log_level,
     },
 ];
+
+/// The values [`validate_guard_mode`] accepts, least enforcing first. Also the
+/// order `travsr init --guard=<mode>` documents them in.
+pub const GUARD_MODES: &[&str] = &["off", "advisory", "strict"];
+
+/// Default guard mode when no layer sets one: the guard is opt-in (#916).
+pub const DEFAULT_GUARD_MODE: &str = "off";
 
 /// The levels [`validate_log_level`] accepts, coarsest first. Also the order the
 /// Health panel's Level control lists them in.
@@ -263,6 +286,26 @@ fn validate_log_level(s: &str) -> Result<toml::Value> {
     bail!(
         "log level must be one of: {} (got '{s}')",
         LOG_LEVELS.join(", ")
+    )
+}
+
+/// One of the three guard modes, lowercased. Deliberately a closed set rather
+/// than a boolean: "on" would still have to choose between nudging and
+/// blocking, and those differ enough that the choice has to be written down.
+///
+/// The same spellings are accepted from `TRAVSR_GUARD`, which is how the
+/// documented `TRAVSR_GUARD=off` escape hatch works without a second code path:
+/// it is the env layer of this key. A value this build does not recognise is
+/// rejected by `set` and, at read time, falls back to [`DEFAULT_GUARD_MODE`] —
+/// the guard must never block because its own configuration was mistyped.
+fn validate_guard_mode(s: &str) -> Result<toml::Value> {
+    let t = s.trim().to_ascii_lowercase();
+    if GUARD_MODES.contains(&t.as_str()) {
+        return Ok(toml::Value::String(t));
+    }
+    bail!(
+        "guard mode must be one of: {} (got '{s}')",
+        GUARD_MODES.join(", ")
     )
 }
 
