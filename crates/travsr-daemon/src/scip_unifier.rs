@@ -117,8 +117,9 @@ pub fn unify_all(
     // re-deriving it would mean re-parsing the SCIP descriptor.
     // Carries the path and the container-qualified candidates too, for the
     // overload-collapse rung, which is same-file and ignores line distance.
+    // Carries the language too: the cross-file rung only matches within it.
     #[allow(clippy::type_complexity)]
-    let mut unmatched: Vec<(NodeId, &str, Vec<String>, &str, &str, Vec<String>)> = Vec::new();
+    let mut unmatched: Vec<(NodeId, &str, Vec<String>, &str, &str, Vec<String>, &str)> = Vec::new();
     // #825: first-seen detail for each callable/type SCIP symbol that becomes an
     // attempt, so the residual misses (`attempted - unified`) can be named in
     // `travsr status`. Keyed by scip symbol to match the per-symbol counters.
@@ -264,6 +265,7 @@ pub fn unify_all(
                 parsed.kind,
                 node.vname.path.as_str(),
                 travsr_indexer::scip_unifier::overload_collapse_signatures(&parsed),
+                node.vname.language.as_str(),
             )),
             Err(e) => tracing::warn!(symbol = %scip_sym, "G1: DB lookup: {e:#}"),
         }
@@ -274,7 +276,7 @@ pub fn unify_all(
     // C/C++ header/source). Alias it onto that node so it is dropped as a
     // duplicate and its edges/refs rewrite onto the real node, and credit its
     // symbol as unified so the miss-rate does not penalize the benign twin.
-    for (node_id, sym, candidates, kind, path, overload_sigs) in unmatched {
+    for (node_id, sym, candidates, kind, path, overload_sigs, language) in unmatched {
         // Rung 1: the symbol unified in another file, so this occurrence is
         // the benign twin.
         if let Some(&ts_id) = sym_to_ts.get(sym) {
@@ -357,7 +359,16 @@ pub fn unify_all(
         // of a different symbol; it is what an out-of-line definition looks
         // like. The kind restriction above is what addresses the risk the
         // review actually described.
-        match store.find_unique_ts_node_across_files(corpus, &candidates) {
+        match store.find_unique_ts_node_across_files(
+            corpus,
+            // A header is shared across the C family and tagged by content,
+            // so a `.cpp` definition's declaration may sit in a `c` header.
+            match language {
+                "c" | "cpp" | "objectivec" => &["c", "cpp", "objectivec"],
+                _ => std::slice::from_ref(&language),
+            },
+            &candidates,
+        ) {
             Ok(Some(ts_id)) => {
                 aliases.push((sym.to_string(), ts_id));
                 alias_map.insert(node_id, ts_id);
@@ -515,6 +526,88 @@ mod tests {
         assert_eq!(m.symbol, "App.missing");
         assert_eq!(m.path, "lib/app.rb");
         assert_eq!(m.line, 99);
+    }
+
+    #[test]
+    fn cross_file_unification_spans_the_c_family_header() {
+        // A C-compatible header is tagged `c` even when a `.cpp` file defines
+        // what it declares; the out-of-line definition must still meet it.
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let decl = Node::new(
+            VName::new("c", "", "src/widget.h", "c", "method:Widget.draw"),
+            "method",
+        )
+        .with_line(3)
+        .with_end_line(3);
+        let anchor = Node::new(
+            VName::new("c", "", "src/widget.cpp", "cpp", "fn:main"),
+            "function",
+        )
+        .with_line(40)
+        .with_end_line(42);
+        store
+            .write_phase_b_batch(&[decl.clone(), anchor], &[], "scip")
+            .unwrap();
+        let def = Node::new(
+            VName::new(
+                "c",
+                "",
+                "src/widget.cpp",
+                "cpp",
+                "scip:src/widget.cpp:cxx . . $ Widget#draw(49f6e7a06ebc5aa8).",
+            ),
+            "function",
+        )
+        .with_line(12);
+        let mut refs: Vec<ScipRef> = Vec::new();
+        let out = unify_all(&mut store, "c", std::slice::from_ref(&def), &mut refs);
+        assert_eq!(out.alias_map.get(&def.id), Some(&decl.id));
+    }
+
+    #[test]
+    fn cross_file_unification_never_crosses_languages() {
+        // A Scala def with no Scala twin must not alias onto the only
+        // `method:Animal.name` in the corpus when that one is Ruby: the refs
+        // redirected through the alias became a Scala -> Ruby `ref/call`.
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let scala_class = Node::new(
+            VName::new("c", "", "scala/src/Animal.scala", "scala", "class:Animal"),
+            "class",
+        )
+        .with_line(1)
+        .with_end_line(6);
+        let ruby_name = Node::new(
+            VName::new("c", "", "ruby/src/animal.rb", "ruby", "method:Animal.name"),
+            "method",
+        )
+        .with_line(4)
+        .with_end_line(4);
+        store
+            .write_phase_b_batch(&[scala_class, ruby_name.clone()], &[], "scip")
+            .unwrap();
+
+        let sdb = Node::new(
+            VName::new(
+                "c",
+                "",
+                "scala/src/Animal.scala",
+                "scala",
+                "sdb:_empty_/Animal#name().",
+            ),
+            "method",
+        )
+        .with_line(2);
+        let mut refs = vec![ScipRef {
+            caller_path: "scala/src/Animal.scala".to_string(),
+            caller_line: 4,
+            callee_id: sdb.id,
+            is_call: true,
+            caller_col: None,
+        }];
+        let out = unify_all(&mut store, "c", std::slice::from_ref(&sdb), &mut refs);
+
+        assert_eq!(out.alias_map.get(&sdb.id), None);
+        assert_eq!(refs[0].callee_id, sdb.id, "ref not redirected to Ruby");
     }
 
     #[test]

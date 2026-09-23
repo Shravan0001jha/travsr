@@ -6496,25 +6496,37 @@ LIMIT ?4",
     pub fn find_unique_ts_node_across_files(
         &self,
         corpus: &str,
+        languages: &[&str],
         signatures: &[String],
     ) -> anyhow::Result<Option<NodeId>> {
         if signatures.is_empty() {
             return Ok(None);
         }
-        let placeholders = (2..signatures.len() + 2)
+        let lang_placeholders = (2..languages.len() + 2)
+            .map(|i| format!("?{i}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let first_sig = languages.len() + 2;
+        let placeholders = (first_sig..signatures.len() + first_sig)
             .map(|i| format!("?{i}"))
             .collect::<Vec<_>>()
             .join(",");
         // LIMIT 2: enough to tell "exactly one" from "more than one" without
-        // reading a whole repo's worth of homonyms.
+        // reading a whole repo's worth of homonyms. Caller's languages only:
+        // another language's homonym is a collision, never the definition (#815).
         let sql = format!(
             "SELECT id FROM nodes \
-             WHERE corpus = ?1 AND signature IN ({placeholders}) AND line IS NOT NULL \
+             WHERE corpus = ?1 AND language IN ({lang_placeholders}) \
+             AND signature IN ({placeholders}) AND line IS NOT NULL \
              LIMIT 2"
         );
 
-        let mut bind: Vec<&dyn rusqlite::types::ToSql> = Vec::with_capacity(signatures.len() + 1);
+        let mut bind: Vec<&dyn rusqlite::types::ToSql> =
+            Vec::with_capacity(signatures.len() + languages.len() + 1);
         bind.push(&corpus);
+        for lang in languages {
+            bind.push(lang);
+        }
         for sig in signatures {
             bind.push(sig);
         }
