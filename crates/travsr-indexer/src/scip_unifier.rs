@@ -411,6 +411,13 @@ pub fn candidate_signatures(parsed: &ScipName<'_>) -> Vec<String> {
             let mut sigs = Vec::with_capacity(4);
             if let Some(c) = parsed.container {
                 sigs.push(format!("field:{c}.{name}"));
+                // A bespoke sidecar's dotted container, as in the function arm
+                // (`Zoo.Companion.MAX` vs `field:Zoo.MAX`).
+                if c.contains('.') {
+                    for seg in c.split('.') {
+                        sigs.push(format!("field:{seg}.{name}"));
+                    }
+                }
             }
             sigs.push(format!("var:{name}"));
             sigs.push(format!("const:{name}"));

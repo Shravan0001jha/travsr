@@ -154,10 +154,13 @@ pub fn unify_all(
                 }
             }
             None if matches!(node.vname.language.as_str(), "kotlin" | "swift" | "dart") => {
-                match travsr_indexer::scip_unifier::native_name_kind(
-                    &node.vname.signature,
-                    &node.kind,
-                ) {
+                // KLS gives properties and locals no kind (`sym:`); parse them as
+                // terms so a property meets its Phase A field.
+                let kind = match (node.vname.language.as_str(), node.kind.as_str()) {
+                    ("kotlin", "symbol") => "variable",
+                    (_, kind) => kind,
+                };
+                match travsr_indexer::scip_unifier::native_name_kind(&node.vname.signature, kind) {
                     Some(p) => (p, false),
                     None => continue,
                 }
@@ -208,13 +211,47 @@ pub fn unify_all(
         // unwrapping to 0 would let any same-named node on lines 1..=5 of the
         // file match wrongly. Skip instead.
         let Some(line) = node.line else {
+            // SemanticDB defines a `var`'s `_=` setter with no occurrence, so it
+            // has no line. Its field's signature is unique in its file, which
+            // makes the exact (path, signature) match safe without one.
+            if let (true, Some(c), Some(field)) = (
+                node.vname.language == "scala",
+                parsed.container,
+                parsed.name.strip_suffix("_="),
+            ) {
+                let sig = format!("field:{c}.{field}");
+                let path = node.vname.path.as_str();
+                if let Some(ts) = store
+                    .lookup_nodes_exact(&sig, Some(path))
+                    .unwrap_or_default()
+                    .into_iter()
+                    .find(|n| n.vname.path == path && n.vname.corpus == corpus)
+                {
+                    aliases.push((scip_sym.to_string(), ts.id));
+                    alias_map.insert(node.id, ts.id);
+                }
+            }
             continue;
         };
-        let candidates = travsr_indexer::scip_unifier::candidate_signatures(&parsed);
+        let mut candidates = travsr_indexer::scip_unifier::candidate_signatures(&parsed);
+        // A KLS `sym:` node is only ever a class property here; its bare
+        // `var:`/`const:` forms would let a local meet a nearby top-level one.
+        if node.vname.language == "kotlin" && node.kind == "symbol" {
+            candidates.retain(|c| c.starts_with("field:"));
+        }
         // The signatures below match only by span in the definition's own file
         // (rung 1). They are not package-qualified, so the cross-file rungs
         // never see them.
         let mut same_file = candidates.clone();
+        // SemanticDB models a Scala `var`/`val` read and write as a getter and
+        // `_=` setter on the field's own line, where Phase A wrote the field.
+        // Unified there, their references are `ref/field`, not calls.
+        if node.vname.language == "scala" && parsed.kind == "function" {
+            if let Some(c) = parsed.container {
+                let field = parsed.name.strip_suffix("_=").unwrap_or(parsed.name);
+                same_file.push(format!("field:{c}.{field}"));
+            }
+        }
         // A constructor with no declaration of its own (a Kotlin primary
         // constructor, an implicit JVM `<init>`, which Scala's sidecar kinds
         // `sym`) is defined on its class's line, and Phase A wrote only the
@@ -395,6 +432,38 @@ pub fn unify_all(
             }
             Ok(None) => {}
             Err(e) => tracing::warn!(symbol = %sym, "G1: cross-file lookup: {e:#}"),
+        }
+    }
+
+    // A Kotlin `sym:` node that met no Phase A term and sits inside a function
+    // (its container is a callable whose span encloses it) is a local variable:
+    // intra-function noise with no twin, dropped like a SCIP `local N`.
+    for node in nodes {
+        if node.vname.language != "kotlin"
+            || node.kind != "symbol"
+            || alias_map.contains_key(&node.id)
+        {
+            continue;
+        }
+        let (Some(line), Some(parsed)) = (
+            node.line,
+            travsr_indexer::scip_unifier::native_name_kind(&node.vname.signature, "variable"),
+        ) else {
+            continue;
+        };
+        let Some(container) = parsed.container else {
+            continue;
+        };
+        let callable = format!("fn:{container}");
+        let Some(owner) = travsr_indexer::scip_unifier::native_name_kind(&callable, "function")
+        else {
+            continue;
+        };
+        let owners = travsr_indexer::scip_unifier::candidate_signatures(&owner);
+        if let Ok(Some(_)) =
+            store.find_ts_node_for_unification(corpus, &node.vname.path, &owners, line as i64, 0)
+        {
+            dropped.insert(node.id);
         }
     }
 
@@ -626,6 +695,101 @@ mod tests {
     }
 
     #[test]
+    fn kotlin_property_unifies_and_local_is_dropped() {
+        // KLS reports properties and locals alike as untyped `sym:` symbols.
+        // A property has its Phase A field; a local has no twin and is noise,
+        // like a SCIP `local N`.
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let field = Node::new(
+            VName::new("c", "", "k/Animal.kt", "kotlin", "field:Zoo.animals"),
+            "field",
+        )
+        .with_line(8)
+        .with_end_line(8);
+        store
+            .write_phase_b_batch(std::slice::from_ref(&field), &[], "scip")
+            .unwrap();
+        let property = Node::new(
+            VName::new("c", "", "k/Animal.kt", "kotlin", "sym:Zoo.animals"),
+            "symbol",
+        )
+        .with_line(8)
+        .with_end_line(8);
+        let local = Node::new(
+            VName::new("c", "", "k/Main.kt", "kotlin", "sym:main.dog"),
+            "symbol",
+        )
+        .with_line(3)
+        .with_end_line(3);
+        let main = Node::new(
+            VName::new("c", "", "k/Main.kt", "kotlin", "fn:main"),
+            "function",
+        )
+        .with_line(1)
+        .with_end_line(12);
+        store
+            .write_phase_b_batch(std::slice::from_ref(&main), &[], "scip")
+            .unwrap();
+        // Untyped too, but not inside a function: kept.
+        let entry = Node::new(
+            VName::new("c", "", "k/Color.kt", "kotlin", "sym:Color.RED"),
+            "symbol",
+        )
+        .with_line(2)
+        .with_end_line(2);
+        let mut refs: Vec<ScipRef> = Vec::new();
+        let nodes = [property.clone(), local.clone(), entry.clone()];
+        let out = unify_all(&mut store, "c", &nodes, &mut refs);
+        assert_eq!(out.alias_map.get(&property.id), Some(&field.id));
+        assert!(out.dropped.contains(&local.id));
+        assert!(!out.dropped.contains(&entry.id));
+        assert!(out.misses.is_empty(), "{:?}", out.misses);
+    }
+
+    #[test]
+    fn scala_var_accessors_unify_onto_the_field() {
+        // SemanticDB models a `var` read and write as getter/setter methods on
+        // the field's own line; Phase A wrote the field. Unmatched, every
+        // read and write was a `ref/call` to an orphan accessor.
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let field = Node::new(
+            VName::new("c", "", "s/A.scala", "scala", "field:Zoo.animals"),
+            "field",
+        )
+        .with_line(8)
+        .with_end_line(8);
+        store
+            .write_phase_b_batch(std::slice::from_ref(&field), &[], "scip")
+            .unwrap();
+        let sdb = |sig: &str| {
+            Node::new(VName::new("c", "", "s/A.scala", "scala", sig), "method")
+                .with_line(8)
+                .with_end_line(8)
+        };
+        let getter = sdb("sdb:_empty_/Zoo#animals().");
+        // The setter has no definition occurrence, so no line.
+        let setter = Node::new(
+            VName::new(
+                "c",
+                "",
+                "s/A.scala",
+                "scala",
+                "sdb:_empty_/Zoo#`animals_=`().",
+            ),
+            "method",
+        );
+        let mut refs: Vec<ScipRef> = Vec::new();
+        let out = unify_all(
+            &mut store,
+            "c",
+            &[getter.clone(), setter.clone()],
+            &mut refs,
+        );
+        assert_eq!(out.alias_map.get(&getter.id), Some(&field.id));
+        assert_eq!(out.alias_map.get(&setter.id), Some(&field.id));
+    }
+
+    #[test]
     fn constructor_class_fallback_stays_in_its_own_file() {
         // The class fallback is a same-file span match. Across files a bare
         // `class:Zoo` is not package-qualified, so the unique one elsewhere may
@@ -661,6 +825,61 @@ mod tests {
         let mut refs: Vec<ScipRef> = Vec::new();
         let out = unify_all(&mut store, "c", std::slice::from_ref(&ctor), &mut refs);
         assert_eq!(out.alias_map.get(&ctor.id), None);
+    }
+
+    #[test]
+    fn kotlin_companion_property_meets_its_field() {
+        // KLS nests the container (`Zoo.Companion`); Phase A qualifies by the
+        // nearest named type (`field:Zoo.MAX`).
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let field = Node::new(
+            VName::new("c", "", "k/Zoo.kt", "kotlin", "field:Zoo.MAX"),
+            "field",
+        )
+        .with_line(3)
+        .with_end_line(3);
+        store
+            .write_phase_b_batch(std::slice::from_ref(&field), &[], "scip")
+            .unwrap();
+        let prop = Node::new(
+            VName::new("c", "", "k/Zoo.kt", "kotlin", "sym:Zoo.Companion.MAX"),
+            "symbol",
+        )
+        .with_line(3)
+        .with_end_line(3);
+        let mut refs: Vec<ScipRef> = Vec::new();
+        let out = unify_all(&mut store, "c", std::slice::from_ref(&prop), &mut refs);
+        assert_eq!(out.alias_map.get(&prop.id), Some(&field.id));
+    }
+
+    #[test]
+    fn kotlin_local_never_meets_a_nearby_top_level_property() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let top = Node::new(
+            VName::new("c", "", "k/Main.kt", "kotlin", "var:logger"),
+            "variable",
+        )
+        .with_line(5)
+        .with_end_line(5);
+        let main = Node::new(
+            VName::new("c", "", "k/Main.kt", "kotlin", "fn:main"),
+            "function",
+        )
+        .with_line(7)
+        .with_end_line(12);
+        store
+            .write_phase_b_batch(&[top, main], &[], "scip")
+            .unwrap();
+        let local = Node::new(
+            VName::new("c", "", "k/Main.kt", "kotlin", "sym:main.logger"),
+            "symbol",
+        )
+        .with_line(8)
+        .with_end_line(8);
+        let mut refs: Vec<ScipRef> = Vec::new();
+        let out = unify_all(&mut store, "c", std::slice::from_ref(&local), &mut refs);
+        assert_eq!(out.alias_map.get(&local.id), None);
+        assert!(out.dropped.contains(&local.id));
     }
 
     #[test]
