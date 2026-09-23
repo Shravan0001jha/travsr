@@ -272,6 +272,11 @@ fn is_dsl_meta_scope(s: &str) -> bool {
             return false;
         }
     }
+    // scip-java's constructor marker: a real definition with a Phase A twin
+    // (`method:Type.Type`), which dropping it as a DSL block left unreachable.
+    if inner == "init" {
+        return false;
+    }
     inner.chars().next().is_some_and(|c| c.is_alphabetic()) && unwrap_meta_container(s) == s
 }
 
@@ -325,7 +330,9 @@ pub fn candidate_signatures(parsed: &ScipName<'_>) -> Vec<String> {
                 // `class:`/`struct:`/`interface:`/`enum:` for the type and
                 // qualifies a `constructor_declaration` by its enclosing type
                 // container, so Phase A never emits `fn:Foo` for a C# type.
-                if name == ".ctor" {
+                // scip-java's marker is `<init>`, against the same
+                // `method:Type.Type` from Java's `constructor_declaration`.
+                if name == ".ctor" || name == "<init>" {
                     sigs.push(format!("method:{c}.{c}"));
                     sigs.push(format!("fn:{c}.{c}"));
                 }

@@ -211,6 +211,21 @@ pub fn unify_all(
             continue;
         };
         let candidates = travsr_indexer::scip_unifier::candidate_signatures(&parsed);
+        // The signatures below match only by span in the definition's own file
+        // (rung 1). They are not package-qualified, so the cross-file rungs
+        // never see them.
+        let mut same_file = candidates.clone();
+        // A constructor with no declaration of its own (a Kotlin primary
+        // constructor, an implicit JVM `<init>`, which Scala's sidecar kinds
+        // `sym`) is defined on its class's line, and Phase A wrote only the
+        // class it constructs: `new Zoo()` constructs the class, as `Zoo()`
+        // does in Python. An explicit constructor still wins as the narrower
+        // span containing its line.
+        if node.kind == "constructor" || parsed.name == "<init>" {
+            if let Some(c) = parsed.container {
+                same_file.push(format!("class:{c}"));
+            }
+        }
         let scip_line = line as i64;
         let is_callable_type = matches!(parsed.kind, "function" | "class");
         // A normal callable/type def is an attempt up front — a miss raises the
@@ -235,7 +250,7 @@ pub fn unify_all(
         match store.find_ts_node_for_unification(
             corpus,
             &node.vname.path,
-            &candidates,
+            &same_file,
             scip_line,
             MAX_LINE_DELTA,
         ) {
@@ -526,6 +541,126 @@ mod tests {
         assert_eq!(m.symbol, "App.missing");
         assert_eq!(m.path, "lib/app.rb");
         assert_eq!(m.line, 99);
+    }
+
+    #[test]
+    fn java_constructor_unifies_onto_its_phase_a_constructor() {
+        // scip-java names a constructor `Dog#`<init>`().`; Phase A wrote
+        // `method:Dog.Dog`. Unmatched, `new Dog(...)` reached no node.
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let ctor = Node::new(
+            VName::new("c", "", "java/src/Dog.java", "java", "method:Dog.Dog"),
+            "constructor",
+        )
+        .with_line(2)
+        .with_end_line(4);
+        store
+            .write_phase_b_batch(std::slice::from_ref(&ctor), &[], "scip")
+            .unwrap();
+        let sig = "scip:java/src/Dog.java:scip-java maven . . Dog#`<init>`().";
+        let scip = Node::new(
+            VName::new("c", "", "java/src/Dog.java", "java", sig),
+            "constructor",
+        )
+        .with_line(2)
+        .with_end_line(4);
+        // An implicit constructor has no Phase A node; scip-java defines it on
+        // the class line, and the class is what `new Zoo()` constructs.
+        let class = Node::new(
+            VName::new("c", "", "java/src/Zoo.java", "java", "class:Zoo"),
+            "class",
+        )
+        .with_line(4)
+        .with_end_line(16);
+        store
+            .write_phase_b_batch(std::slice::from_ref(&class), &[], "scip")
+            .unwrap();
+        let implicit = Node::new(
+            VName::new(
+                "c",
+                "",
+                "java/src/Zoo.java",
+                "java",
+                "scip:java/src/Zoo.java:scip-java maven . . Zoo#`<init>`().",
+            ),
+            "constructor",
+        )
+        .with_line(4)
+        .with_end_line(4);
+        let mut refs: Vec<ScipRef> = Vec::new();
+        let out = unify_all(
+            &mut store,
+            "c",
+            &[scip.clone(), implicit.clone()],
+            &mut refs,
+        );
+        assert_eq!(out.alias_map.get(&scip.id), Some(&ctor.id));
+        assert_eq!(out.alias_map.get(&implicit.id), Some(&class.id));
+        assert!(out.misses.is_empty(), "{:?}", out.misses);
+    }
+
+    #[test]
+    fn kotlin_primary_constructor_unifies_onto_its_class() {
+        // A primary constructor lives in the class header; Phase A Kotlin has
+        // no constructor capture, only the class it constructs.
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let class = Node::new(
+            VName::new("c", "", "k/Animal.kt", "kotlin", "class:Animal"),
+            "class",
+        )
+        .with_line(1)
+        .with_end_line(6);
+        store
+            .write_phase_b_batch(std::slice::from_ref(&class), &[], "scip")
+            .unwrap();
+        let ctor = Node::new(
+            VName::new("c", "", "k/Animal.kt", "kotlin", "method:Animal.Animal"),
+            "constructor",
+        )
+        .with_line(1)
+        .with_end_line(1);
+        let mut refs: Vec<ScipRef> = Vec::new();
+        let out = unify_all(&mut store, "c", std::slice::from_ref(&ctor), &mut refs);
+        assert_eq!(out.alias_map.get(&ctor.id), Some(&class.id));
+        assert!(out.misses.is_empty(), "{:?}", out.misses);
+    }
+
+    #[test]
+    fn constructor_class_fallback_stays_in_its_own_file() {
+        // The class fallback is a same-file span match. Across files a bare
+        // `class:Zoo` is not package-qualified, so the unique one elsewhere may
+        // be another package's class.
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let elsewhere = Node::new(
+            VName::new("c", "", "other/Zoo.java", "java", "class:Zoo"),
+            "class",
+        )
+        .with_line(1)
+        .with_end_line(9);
+        let here = Node::new(
+            VName::new("c", "", "java/src/Zoo.java", "java", "method:Zoo.add"),
+            "method",
+        )
+        .with_line(30)
+        .with_end_line(32);
+        store
+            .write_phase_b_batch(&[elsewhere, here], &[], "scip")
+            .unwrap();
+        let ctor = Node::new(
+            VName::new(
+                "c",
+                "",
+                "java/src/Zoo.java",
+                "java",
+                "scip:java/src/Zoo.java:scip-java maven . . Zoo#`<init>`().",
+            ),
+            "constructor",
+        )
+        .with_line(4)
+        .with_end_line(4);
+        let mut refs: Vec<ScipRef> = Vec::new();
+        let out = unify_all(&mut store, "c", std::slice::from_ref(&ctor), &mut refs);
+        assert_eq!(out.alias_map.get(&ctor.id), None);
     }
 
     #[test]
