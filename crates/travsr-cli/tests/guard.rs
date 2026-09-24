@@ -731,28 +731,76 @@ fn no_daemon_is_required() {
 /// lives in the binary crate, which an integration test cannot reach.
 const DEADLINE_MS: u64 = 200;
 
-/// The timeout fail-open, end to end. With a one-millisecond budget no decision
-/// can possibly be reached, so a call that is otherwise a certain `deny` has to
-/// come back allowed, which is the property, stated the only way that cannot
-/// pass by accident.
+/// The timeout fail-open, end to end.
+///
+/// The decision is made unreachable by never closing stdin: the guard blocks
+/// reading the payload, so nothing but the deadline can end the wait. That is
+/// also a real shape, a host that writes the payload and holds the pipe.
+///
+/// A very small budget does not work here and is how this test first went
+/// wrong. `TRAVSR_GUARD_DEADLINE_MS=1` races the decision rather than
+/// forbidding it, and on a release build with a warm cache the decision wins:
+/// CI came back with the `deny` the baseline below asserts, which is correct
+/// behaviour and a useless test. Blocking the read removes the race.
 #[test]
 fn a_missed_deadline_allows() {
+    use std::io::Write as _;
+    use std::process::Stdio;
+
     let tmp = indexed_repo();
     let dir = tmp.path();
     set_mode(dir, "strict");
-    let payload = with_session(grep_for("charge_payment"), "s-deadline");
 
-    assert_denies(&guard(dir, payload.clone()), "the baseline, given time");
-    let out = guard_env(
-        dir,
-        with_session(grep_for("charge_payment"), "s-deadline-2"),
-        &[("TRAVSR_GUARD_DEADLINE_MS", "1")],
+    // The same payload is a certain `deny` when the guard is given time, which
+    // is what makes the allow below attributable to the deadline alone.
+    assert_denies(
+        &guard(dir, with_session(grep_for("charge_payment"), "s-deadline")),
+        "the baseline, given time",
     );
-    assert_allows(&out, "a decision that could not be reached in time");
+
+    let payload = with_session(grep_for("charge_payment"), "s-deadline-2").to_string();
+    let started = std::time::Instant::now();
+    let mut child = StdCommand::new(assert_cmd::cargo::cargo_bin("travsr"))
+        .arg("guard")
+        .env("TRAVSR_DISABLE_REGISTRY", "1")
+        .env("HOME", dir)
+        .env("USERPROFILE", dir)
+        .env("TRAVSR_GUARD_DEADLINE_MS", DEADLINE_MS.to_string())
+        .current_dir(dir)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("the guard must spawn");
+
+    // Held open deliberately, and not dropped until the child has exited.
+    let mut pipe = child.stdin.take().expect("stdin must be piped");
+    pipe.write_all(payload.as_bytes())
+        .expect("writing the payload");
+    pipe.flush().expect("flushing the payload");
+
+    let out = child
+        .wait_with_output()
+        .expect("the guard must exit on its own");
+    drop(pipe);
+
+    assert!(
+        out.status.success(),
+        "a guard that ran out of time must still exit 0; got {:?}",
+        out.status.code()
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert_allows(&stdout, "a decision that could not be reached in time");
     assert_eq!(
-        verdict(&out),
+        verdict(&stdout),
         None,
-        "a guard that did not decide must say nothing, not auto-approve; {out}"
+        "a guard that did not decide must say nothing, not auto-approve; {stdout}"
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(60),
+        "the guard waited {:?} on a read that never finishes; the deadline is \
+         the only thing that can end that wait",
+        started.elapsed()
     );
 }
 
