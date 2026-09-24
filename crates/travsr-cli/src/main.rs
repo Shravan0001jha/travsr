@@ -14,6 +14,7 @@ mod faq;
 mod fsck;
 mod git_bounded;
 mod graph;
+mod guard;
 mod index;
 mod init;
 mod install;
@@ -83,6 +84,35 @@ enum Command {
         /// Skip auto-detecting AI coding tools and wiring them to Travsr.
         #[arg(long)]
         no_connect: bool,
+        /// Install the Claude Code PreToolUse guard, which intercepts Grep,
+        /// Glob, Read and shell grep/rg/find/ag/ack/`ls -R` and points the
+        /// agent at the Travsr call that answers the same question.
+        ///
+        /// `--guard` is advisory: it never blocks, it attaches the replacement
+        /// call. `--guard=strict` denies a read the graph can answer, naming
+        /// the call that replaces it, and allows everything else.
+        ///
+        /// Off unless asked for. The level is stored in .travsr/config.toml;
+        /// TRAVSR_GUARD=off turns it off for one command, and
+        /// `travsr connect --remove` takes the hook back out.
+        ///
+        /// Claude Code only: no other host has a pre-tool contract to hook.
+        #[arg(
+            long,
+            value_name = "MODE",
+            // The guard is installed by the connect pass, so `--no-connect`
+            // would silently discard it. An error beats a flag that does
+            // nothing.
+            conflicts_with = "no_connect",
+            num_args = 0..=1,
+            // `--guard=strict`, or a bare `--guard`. Requiring the `=` is what
+            // keeps `travsr connect --guard --print` from reading `--print`
+            // as the level.
+            require_equals = true,
+            default_missing_value = "advisory",
+            value_enum
+        )]
+        guard: Option<guard::GuardMode>,
     },
     /// Detect AI coding tools and wire them to the Travsr MCP server + rules.
     Connect {
@@ -108,6 +138,48 @@ enum Command {
         /// nudged toward the graph rather than left to choose.
         #[arg(long)]
         rules: bool,
+        /// Install the Claude Code PreToolUse guard at this level: `--guard`
+        /// for advisory (never blocks, names the Travsr call the agent should
+        /// have made) or `--guard=strict` to deny reads the graph can answer.
+        ///
+        /// The level is stored in .travsr/config.toml, so `travsr guard` and
+        /// the installed hook always agree on it. `--remove` takes both back
+        /// out; TRAVSR_GUARD=off is the per-command escape hatch.
+        #[arg(
+            long,
+            value_name = "MODE",
+            num_args = 0..=1,
+            // `--guard=strict`, or a bare `--guard`. Requiring the `=` is what
+            // keeps `travsr connect --guard --print` from reading `--print`
+            // as the level.
+            require_equals = true,
+            default_missing_value = "advisory",
+            value_enum
+        )]
+        guard: Option<guard::GuardMode>,
+    },
+    /// Claude Code PreToolUse hook handler: reads a hook payload on stdin and
+    /// writes a permission decision on stdout.
+    ///
+    /// Not meant to be run by hand. `travsr init --guard` registers it in
+    /// .claude/settings.json; it then runs on every Grep, Glob, Read and Bash
+    /// call and, depending on `guard.mode`, either attaches the Travsr call
+    /// that answers the same question (advisory) or denies the read and names
+    /// it (strict). It never blocks a call it cannot replace: a missing, stale
+    /// or unreadable index, an unrecognised command, its own failure or a
+    /// missed deadline all let the call through.
+    ///
+    /// TRAVSR_GUARD=off disables it for one command.
+    Guard {
+        /// Print, on stderr, the one-line reason behind the decision.
+        ///
+        /// "The guard is installed and nothing is blocked" has a dozen
+        /// causes that look identical from outside: the mode is off, the
+        /// index is stale, the symbol is unknown, the command was not
+        /// recognised. This says which. stdout is unchanged, so it is safe
+        /// to leave on in a hook.
+        #[arg(long)]
+        explain: bool,
     },
     /// Start the Travsr daemon (git hook + file watcher + MCP server).
     Daemon {
@@ -810,6 +882,7 @@ async fn run(cli: Cli) -> Result<()> {
             force,
             allow_unsandboxed_lsif,
             no_connect,
+            guard,
         } => init::run(
             quiet,
             json,
@@ -818,13 +891,18 @@ async fn run(cli: Cli) -> Result<()> {
             force,
             allow_unsandboxed_lsif,
             no_connect,
+            guard,
         )?,
+        // Before anything that prints: stdout is the hook's decision channel,
+        // the same way `travsr mcp --stdio`'s is the protocol channel.
+        Command::Guard { explain } => guard::run(explain)?,
         Command::Connect {
             tool,
             print,
             remove,
             commit,
             rules,
+            guard,
         } => {
             let cwd = std::env::current_dir()?;
             // Write command: `connect` creates files in the resolved root, so it
@@ -841,6 +919,7 @@ async fn run(cli: Cli) -> Result<()> {
                     remove,
                     commit,
                     rules,
+                    guard,
                     report: connect::Report::Stdout,
                 },
             )?;
