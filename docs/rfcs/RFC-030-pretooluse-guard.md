@@ -34,7 +34,7 @@ enforcement levels.
 ### Why it lives in the binary
 
 A script in `.claude/hooks/` has to be kept in sync with the CLI by hand, made
-executable, and written twice — once for a POSIX shell and once for Windows,
+executable, and written twice: once for a POSIX shell and once for Windows,
 where #252's Python hook never ran at all. A subcommand of the binary the user
 already installed has none of those problems, and it can open the graph
 directly rather than shelling out to the CLI it is part of.
@@ -76,7 +76,7 @@ applies".
 The guard emits the first only for a call it has positively recognised as
 read-only, and the second for everything else. Collapsing them would mean that
 a `Bash` command the guard failed to parse got auto-approved on the strength of
-its first word — so `grep foo && rm -rf build` would spend the user's
+its first word, so `grep foo && rm -rf build` would spend the user's
 permission prompt on the `rm`. That is why `guard::shell` refuses to recognise
 anything but a single simple command with no operator, no substitution and no
 redirect in it, and why an unrecognised command yields no decision at all.
@@ -106,8 +106,8 @@ The daemon is deliberately not in that table: the guard opens the store itself
 and never needs the daemon, so a daemon that is down is not a condition it has
 to handle.
 
-The open is read-only first, writable as a fallback — the order
-`daemon_client::open_read_store` already uses, and for the same reason: SQLite
+The open is read-only first, writable as a fallback, the order
+`daemon_client::open_read_store` already uses, and for the same reason. SQLite
 cannot open a WAL database read-only unless the `-shm` file exists, and after
 the last writer closes it does not, so the usual state of an idle repo is one
 where the read-only open fails outright. Preferring it is still right, because
@@ -120,17 +120,17 @@ process. This matters because `SqliteStore::open_read_only` carries a five
 second busy timeout for a database the daemon is mid-write on, and that is the
 agent's latency budget, not ours.
 
-`TRAVSR_GUARD_DEADLINE_MS` overrides the budget, clamped to 1 ms – 60 s so the
-bound can be moved but never removed. It is a diagnostic — for telling "the
+`TRAVSR_GUARD_DEADLINE_MS` overrides the budget, clamped to 1 ms to 60 s so the
+bound can be moved but never removed. It is a diagnostic, for telling "the
 graph cannot answer this" apart from "the guard ran out of time", and for
-driving the timeout path from a test — not a setting, which is why it is an
+driving the timeout path from a test, not a setting, which is why it is an
 environment variable rather than a `guard.*` config key. Raising it can only
 make the guard slower, never more permissive.
 
 The ceiling is generous on purpose. Opening SQLite is single-digit milliseconds
 in a release build and can be *seconds* in an unoptimised one, on a network
 filesystem, or on a machine whose endpoint security scans every file a process
-touches — measured at ~15 s for a 180 KB index in a debug build on Windows with
+touches; measured at ~15 s for a 180 KB index in a debug build on Windows with
 EDR. A ceiling that could not reach those cases would make the diagnostic
 useless in exactly the situations someone reaches for it. It is also why the
 integration suite passes an explicit deadline: what the guard *decides* and how
@@ -144,7 +144,7 @@ printing the reason is reading this file.
 
 `HEAD` is read out of `.git` directly rather than through `git rev-parse`.
 Spawning a process is the one operation on this path with an unbounded worst
-case — a credential helper, an antivirus scanning the executable — and reading
+case (a credential helper, an antivirus scanning the executable), and reading
 two small files has no such tail.
 
 ## The strict-mode release valve
@@ -170,7 +170,7 @@ Travsr about a symbol but not what came back. Two releases, both scoped to one
 
 State is one JSON file under `.travsr/`, which `init` already git-ignores. It
 is pruned on every write: a 24 hour TTL, 64 sessions, 256 terms per session.
-Every read and write fails open — no state means no release, which falls back
+Every read and write fails open: no state means no release, which falls back
 to (2).
 
 ## Consequences
@@ -182,7 +182,7 @@ to (2).
 - Advisory mode auto-approves the matched read-only calls, because that is what
   `permissionDecision: "allow"` means. The match set is `Grep`, `Glob`, a
   whole-file `Read` and a single read-only search command, so nothing that
-  writes or executes is in it — but it is a change to how those specific calls
+  writes or executes is in it, but it is a change to how those specific calls
   are permitted, and it happens only when the guard is explicitly enabled.
 - File discovery is never blocked, only nudged. The graph indexes code files, so
   it cannot enumerate the untracked, ignored, generated and non-code files a

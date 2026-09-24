@@ -396,7 +396,7 @@ replacement, so the nudge lands where it is load-bearing:
 and allows everything else. It is the mode that makes the graph non-optional.
 
 The level is stored in `.travsr/config.toml` as `guard.mode`, so `travsr guard`
-and the installed hook can never disagree about policy — the hook entry only
+and the installed hook can never disagree about policy: the hook entry only
 names the binary to run. Change it at any time without touching
 `.claude/settings.json`:
 
@@ -421,7 +421,7 @@ actually replace, so it cannot become an outage:
   resolve
 - a path the index does not carry: untracked, ignored, vendored, binary, a
   lockfile, a `.md`, a config file
-- a symbol the graph has never heard of — which is exactly when `grep` is the
+- a symbol the graph has never heard of, which is exactly when `grep` is the
   right tool
 - a regex rather than a symbol name, a ranged `Read`, or any file discovery
   (`Glob`, `find`, `ls -R`): the graph indexes code files only, so it cannot
@@ -465,7 +465,7 @@ TRAVSR_GUARD=off claude
 **Claude Code only.** This is enforcement, and enforcement needs a pre-tool
 contract to hook into. Claude Code is the only host Travsr wires that has one.
 Cursor, Copilot, Gemini CLI, Antigravity, Codex, Windsurf and Zed get the MCP
-wiring and the optional `--rules` guidance, and nothing here changes that —
+wiring and the optional `--rules` guidance, and nothing here changes that:
 they are not enforced, and this section does not claim otherwise.
 
 `.claude/settings.json` is yours: the hook is merged into it, every other key

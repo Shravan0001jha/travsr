@@ -62,7 +62,7 @@ pub struct ToolInput {
     pub limit: Option<u64>,
 
     // The Travsr MCP tools' own arguments. The installed hook matches them too,
-    // so the guard can see that the agent has been to the graph — which is what
+    // so the guard can see that the agent has been to the graph, which is what
     // releases the strict-mode valve (see `guard::session`). It never decides
     // anything about these calls; it observes and allows.
     /// `get_callers`, `find_references`: the symbol being asked about.
@@ -104,7 +104,7 @@ pub enum Permission {
 /// guard has not positively identified would auto-approve whatever that command
 /// turns out to be, so the guard emits it only for calls it has recognised as
 /// read-only, and passes everything else through untouched. Both outcomes
-/// satisfy the fail-open rule — neither blocks — but only one of them spends
+/// satisfy the fail-open rule (neither blocks), but only one of them spends
 /// the user's permission settings to do it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HookOutput {
@@ -116,7 +116,7 @@ pub enum HookOutput {
         reason: String,
         /// Text folded into the agent's context. `permissionDecisionReason` is
         /// surfaced to the agent on a `deny` but is display-only on an `allow`,
-        /// so advisory mode — whose entire product is the redirect it teaches —
+        /// so advisory mode, whose entire product is the redirect it teaches,
         /// carries the same text here as well or it teaches nothing.
         context: Option<String>,
     },

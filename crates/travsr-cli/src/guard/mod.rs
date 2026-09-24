@@ -1,4 +1,4 @@
-//! `travsr guard` — the Claude Code `PreToolUse` handler (#916).
+//! `travsr guard`: the Claude Code `PreToolUse` handler (#916).
 //!
 //! `travsr init` wires the MCP server and, optionally, a rules file. Both are
 //! advice. The agent still reaches for `Grep`, `Read` and `bash: rg` because
@@ -17,11 +17,11 @@
 //! The guard blocks nothing it cannot replace. Two distinct outputs both mean
 //! "do not block", and the difference matters:
 //!
-//! * **Neutral** — exit 0, no JSON. The host applies its normal permission
+//! * **Neutral**: exit 0, no JSON. The host applies its normal permission
 //!   flow. This is what the guard emits whenever it has *not* positively
 //!   identified a read-only call: an unmatched tool, a compound shell command,
 //!   an unreadable payload, a missed deadline, `guard.mode = off`.
-//! * **`permissionDecision: "allow"`** — the host's *auto-approve*. Emitted
+//! * **`permissionDecision: "allow"`**: the host's *auto-approve*. Emitted
 //!   only for a call the guard has recognised as read-only and is deliberately
 //!   letting through, which is the only case where spending the user's
 //!   permission settings is something they asked for.
@@ -54,7 +54,7 @@ use payload::HookInput;
 ///
 /// 200 ms is the budget the issue sets, and it is a ceiling on pathology rather
 /// than a target: the measured work is a handful of indexed SQLite lookups and
-/// two small file reads. What it actually bounds is the tail — a database the
+/// two small file reads. What it actually bounds is the tail: a database the
 /// daemon holds mid-checkpoint, a cold page cache, a network filesystem.
 pub const GUARD_DEADLINE: Duration = Duration::from_millis(200);
 
@@ -167,7 +167,7 @@ pub fn run(explain: bool) -> anyhow::Result<()> {
         // `catch_unwind` as well as the hook above: the hook decides what a
         // panic prints, this decides that the panic does not escape the thread
         // before the value is sent. Without it a panic in `decide` still
-        // disconnects the channel, so the outcome is the same — but only by
+        // disconnects the channel, so the outcome is the same, but only by
         // way of a path that is harder to reason about than an explicit one.
         let outcome =
             std::panic::catch_unwind(decide).unwrap_or_else(|_| policy::Decision::internal_error());
@@ -226,7 +226,7 @@ fn read_payload() -> Option<HookInput> {
 /// The repository the payload's `cwd` belongs to.
 ///
 /// Falls back to the guard's own working directory when the payload carries no
-/// `cwd`, and to `None` when neither is inside a repository — which is a
+/// `cwd`, and to `None` when neither is inside a repository, which is a
 /// fail-open condition, since a repo with no `.travsr` has no graph to redirect
 /// to either.
 fn repo_root_for(input: &HookInput) -> Option<PathBuf> {

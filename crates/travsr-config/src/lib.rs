@@ -296,7 +296,7 @@ fn validate_log_level(s: &str) -> Result<toml::Value> {
 /// The same spellings are accepted from `TRAVSR_GUARD`, which is how the
 /// documented `TRAVSR_GUARD=off` escape hatch works without a second code path:
 /// it is the env layer of this key. A value this build does not recognise is
-/// rejected by `set` and, at read time, falls back to [`DEFAULT_GUARD_MODE`] —
+/// rejected by `set` and, at read time, falls back to [`DEFAULT_GUARD_MODE`]:
 /// the guard must never block because its own configuration was mistyped.
 fn validate_guard_mode(s: &str) -> Result<toml::Value> {
     let t = s.trim().to_ascii_lowercase();

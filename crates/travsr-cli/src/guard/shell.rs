@@ -2,8 +2,8 @@
 //!
 //! The guard has to answer one question about a shell command: *is this whole
 //! command line nothing but a single invocation of `grep`, `rg`, `find`, `ag`,
-//! `ack`, or `ls -R`?* Anything else — a pipeline, a `&&` chain, a command
-//! substitution, a redirect — is left alone.
+//! `ack`, or `ls -R`?* Anything else (a pipeline, a `&&` chain, a command
+//! substitution, a redirect) is left alone.
 //!
 //! "Whole command line" is not fussiness. The guard's `allow` is the host's
 //! *auto-approve*, not merely "do not block", so answering yes to
@@ -46,7 +46,7 @@ const CONTENT_TOOLS: [&str; 4] = ["grep", "rg", "ag", "ack"];
 /// Returns `None` for: any of `| & ; ( ) < > ` $ \n`, an unterminated quote, or
 /// a backslash escape outside quotes. Refusing on `$` costs the guard a few
 /// legitimate `grep "$pat" .` calls, which then take the normal permission
-/// flow — the right way to be wrong, since the alternative is reasoning about
+/// flow, which is the right way to be wrong, since the alternative is reasoning about
 /// a value this process cannot see.
 fn simple_words(command: &str) -> Option<Vec<String>> {
     // Cheap pre-filter for the operators, before any per-character work. `!`

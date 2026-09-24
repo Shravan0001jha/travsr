@@ -2,8 +2,8 @@
 //!
 //! Split from `mod.rs` so the decision is a pure-ish function of
 //! (payload, mode, repo) and can be exercised without a subprocess, a stdin
-//! pipe, or a deadline. `mod.rs` owns the process-shaped concerns — reading
-//! stdin, the 200 ms deadline, the panic hook — and this owns the judgement.
+//! pipe, or a deadline. `mod.rs` owns the process-shaped concerns (reading
+//! stdin, the 200 ms deadline, the panic hook), and this owns the judgement.
 //!
 //! The rule the whole module is built around: **a redirect is only honest when
 //! the graph can actually answer the question.** Every branch that cannot
@@ -100,7 +100,7 @@ pub fn classify(input: &HookInput) -> Option<Request> {
 ///
 /// Matched on the trailing segment rather than a fixed prefix, because an MCP
 /// tool name is `mcp__<server>__<tool>` and the server is named by whoever
-/// wrote the client's config — `travsr` from `travsr connect`, but not
+/// wrote the client's config: `travsr` from `travsr connect`, but not
 /// necessarily from a hand-written one.
 fn travsr_tool_term(tool: &str, input: &HookInput) -> Option<Option<String>> {
     const GRAPH_TOOLS: [&str; 7] = [
@@ -137,15 +137,15 @@ struct Index {
 }
 
 /// Open the repo's graph for reading, or say why it could not be: no
-/// `.travsr/graph.db`, a database that will not open (locked, corrupt,
-/// mid-migration), an empty index, or an index that does not describe the
+/// `.travsr/graph.db`, a database that will not open (locked or corrupt),
+/// an empty index, or an index that does not describe the
 /// current `HEAD`. Every `Err` here is a fail-open condition.
 ///
 /// The read-only open is tried first and a writable one is the fallback, the
 /// same order `daemon_client::open_read_store` uses and for the same reason:
 /// SQLite cannot open a WAL database read-only unless the `-shm` file already
 /// exists, and after the last writer closes it does not. The usual state of an
-/// idle repo — indexed once, daemon since exited — is therefore one where the
+/// idle repo (indexed once, daemon since exited) is therefore one where the
 /// read-only open fails outright. Preferring it is still right, because it is
 /// the open that cannot migrate or checkpoint the user's index as a side effect
 /// of deciding whether to allow a `grep`; the fallback only widens that to what
@@ -466,7 +466,7 @@ fn redirect_for(index: &Index, cwd: Option<&str>, request: &Request) -> Option<R
                      get_context(query=\"{stem}\", include_snippets=true) for the symbols in \
                      it with their source inline, or get_dependencies(file=\"{rel}\") for \
                      what it imports, instead of reading the whole file. Read it directly \
-                     when you need something the graph does not carry — run this again and \
+                     when you need something the graph does not carry; run this again and \
                      it will be allowed."
                 ),
             })
@@ -526,8 +526,8 @@ fn advisory_note(request: &Request) -> Option<String> {
 /// The account exists because "the guard is installed and nothing is being
 /// blocked" has a dozen causes that all look identical from outside: the mode
 /// is off, the index is stale, the symbol is unknown, the command was not
-/// recognised. `travsr guard --explain` prints it on stderr — never stdout,
-/// which belongs to the decision — so the question is answerable without
+/// recognised. `travsr guard --explain` prints it on stderr, never stdout,
+/// which belongs to the decision, so the question is answerable without
 /// reading this file.
 #[derive(Debug)]
 pub struct Decision {
@@ -622,7 +622,7 @@ pub fn decide(input: &HookInput, mode: GuardMode, repo_root: Option<&Path>) -> D
         ),
         // The graph cannot answer this one. Strict must not block it; advisory
         // still has something worth saying, because the index exists and is
-        // current — `open_index` already established both.
+        // current; `open_index` already established both.
         (GuardMode::Strict, None) => pass("the graph cannot answer this"),
         (GuardMode::Advisory, None) => match advisory_note(&request) {
             Some(note) => Decision::new(
@@ -832,8 +832,8 @@ mod tests {
         );
     }
 
-    /// A root that still carries a `.` — which is what a `cwd` of "." resolves
-    /// to — must not stop every file path under it from being made relative.
+    /// A root that still carries a `.`, which is what a `cwd` of "." resolves
+    /// to, must not stop every file path under it from being made relative.
     #[test]
     fn a_root_carrying_a_dot_component_still_matches() {
         let root = PathBuf::from(if cfg!(windows) {

@@ -758,7 +758,7 @@ const COMMAND_GROUPS: &[(&str, &[&str])] = &[
     // `guard` sits next to `connect` because that is what installs it: a reader
     // who has just run `connect --guard` and wants to know what now runs on
     // every tool call finds it in the same place. It is not hidden the way
-    // `hook-run` is — the hook invokes it rather than a person, but unlike a git
+    // `hook-run` is: the hook invokes it rather than a person, but unlike a git
     // hook its behaviour is configurable and worth being able to look up.
     ("Set up a repo", &["init", "connect", "guard", "lang"]),
     (

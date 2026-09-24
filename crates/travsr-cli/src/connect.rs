@@ -221,8 +221,8 @@ fn zed_instruction_file(repo: &Path) -> PathBuf {
 /// Which tools fire the guard.
 ///
 /// A pipe-separated list of exact tool names, which the host documents as
-/// matching each of them exactly. `Bash` is unavoidably broad — every shell
-/// command reaches the guard — which is why `guard::shell` refuses to recognise
+/// matching each of them exactly. `Bash` is unavoidably broad (every shell
+/// command reaches the guard), which is why `guard::shell` refuses to recognise
 /// anything but a single read-only search invocation.
 ///
 /// The travsr MCP tools are here so the guard can *see* that the agent has
@@ -293,7 +293,7 @@ fn is_guard_handler(handler: &Value) -> bool {
 /// Every other key, every other hook event, and every other `PreToolUse` group
 /// is preserved: the file is parsed, one entry is added or refreshed, and the
 /// whole thing is written back. A file that is not strict JSON is skipped
-/// rather than replaced, the same rule `merge_json_server` follows — a
+/// rather than replaced, the same rule `merge_json_server` follows: a
 /// `settings.json` with a trailing comma in it is still the user's
 /// configuration, and clobbering it would lose more than this feature is worth.
 ///
@@ -382,8 +382,8 @@ fn merge_json_hook(path: &Path, matcher: &str, handler: &Value) -> Result<Outcom
 
 /// Strip the travsr handler and nothing else.
 ///
-/// Empty containers are pruned on the way out — a group left with no handlers,
-/// a `PreToolUse` left with no groups, a `hooks` left with no events — because
+/// Empty containers are pruned on the way out (a group left with no handlers,
+/// a `PreToolUse` left with no groups, a `hooks` left with no events), because
 /// each of those is a husk travsr created and the user did not. The file itself
 /// is never deleted: it is theirs, and settings they can still read beat a
 /// missing file they have to wonder about.
@@ -1605,7 +1605,7 @@ pub fn run(repo_root: &Path, opts: &ConnectOpts) -> Result<()> {
 
     // #916: the enforcement level is stored config, not something the hook
     // entry carries. That is what keeps `travsr guard` and the installed hook
-    // from ever disagreeing — the hook only names a binary — and it is why
+    // from ever disagreeing (the hook only names a binary), and it is why
     // `travsr config set guard.mode strict` is a complete way to change the
     // policy without touching `.claude/settings.json` at all.
     //
@@ -1655,7 +1655,7 @@ pub fn run(repo_root: &Path, opts: &ConnectOpts) -> Result<()> {
 
     // #916: `--guard` asked for enforcement and got none. The mode is stored
     // either way (above), so the hook lands the moment Claude Code is
-    // installed and `travsr connect` runs again — but saying nothing here
+    // installed and `travsr connect` runs again, but saying nothing here
     // would leave "I ran init --guard=strict" and "nothing is enforced"
     // looking like the same state.
     if guard_persist.is_some() && !guard_wired && !opts.dry_run {
@@ -2885,7 +2885,7 @@ mod tests {
         ));
         let after = read_json(&path);
         let entries = guard_entries(&after);
-        assert_eq!(entries.len(), 1, "refreshed, not duplicated — {after}");
+        assert_eq!(entries.len(), 1, "refreshed, not duplicated; {after}");
         assert_eq!(entries[0], hook());
         assert!(
             after["hooks"]["PreToolUse"]
@@ -2893,7 +2893,7 @@ mod tests {
                 .unwrap()
                 .iter()
                 .any(|g| g["matcher"] == GUARD_MATCHER),
-            "and the matcher moved with it — {after}"
+            "and the matcher moved with it; {after}"
         );
     }
 
@@ -2921,7 +2921,7 @@ mod tests {
         let after = read_json(&path);
         assert_eq!(
             after["hooks"]["PreToolUse"][0]["matcher"], "Bash",
-            "the user's shared matcher must not be widened — {after}"
+            "the user's shared matcher must not be widened; {after}"
         );
         assert_eq!(
             guard_entries(&after).len(),
@@ -3013,7 +3013,7 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&path).unwrap(), once);
     }
 
-    /// `hooks` existed only because travsr put it there, so it goes too —
+    /// `hooks` existed only because travsr put it there, so it goes too,
     /// but the rest of the file, and the file itself, stay.
     #[test]
     fn removal_prunes_only_the_containers_travsr_created() {
@@ -3030,7 +3030,7 @@ mod tests {
         assert_eq!(after["theme"], "dark");
         assert!(
             after.get("hooks").is_none(),
-            "an empty `hooks` husk is ours, not theirs — {after}"
+            "an empty `hooks` husk is ours, not theirs; {after}"
         );
     }
 
@@ -3085,7 +3085,7 @@ mod tests {
             assert_eq!(
                 has_hook,
                 tool.id() == "claude-code",
-                "{} — only Claude Code has a pre-tool contract to hook",
+                "{}: only Claude Code has a pre-tool contract to hook",
                 tool.id()
             );
         }

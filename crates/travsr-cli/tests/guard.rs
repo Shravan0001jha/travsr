@@ -7,7 +7,7 @@
 //!
 //! The invariant almost every test here asserts is the same one:
 //! **the guard did not block the call.** It is spelled [`assert_allows`]
-//! throughout, and it accepts both shapes that mean it — an explicit
+//! throughout, and it accepts both shapes that mean it: an explicit
 //! `permissionDecision: "allow"` and an empty stdout, which the host documents
 //! as "no decision; normal permission flow applies". Where the distinction
 //! matters the test says so explicitly.
@@ -159,7 +159,7 @@ fn verdict(stdout: &str) -> Option<String> {
 fn assert_allows(stdout: &str, what: &str) {
     match verdict(stdout).as_deref() {
         None | Some("allow") => {}
-        other => panic!("{what}: expected the call to go through, got {other:?} — {stdout}"),
+        other => panic!("{what}: expected the call to go through, got {other:?}; {stdout}"),
     }
 }
 
@@ -168,7 +168,7 @@ fn assert_denies(stdout: &str, what: &str) {
     assert_eq!(
         verdict(stdout).as_deref(),
         Some("deny"),
-        "{what}: expected a deny — {stdout}"
+        "{what}: expected a deny; {stdout}"
     );
 }
 
@@ -237,7 +237,7 @@ fn every_matched_operation_is_allowed_with_a_redirect_in_advisory_mode() {
         assert_eq!(
             verdict(&out).as_deref(),
             Some("allow"),
-            "advisory must never block, and must say something: {what} — {out}"
+            "advisory must never block, and must say something: {what}; {out}"
         );
         let d = decision(&out).unwrap();
         let reason = d["permissionDecisionReason"].as_str().unwrap_or_default();
@@ -247,7 +247,7 @@ fn every_matched_operation_is_allowed_with_a_redirect_in_advisory_mode() {
         );
         assert!(
             reason.contains("Travsr") || reason.contains("travsr"),
-            "{what}: the redirect must name where to go instead — {reason}"
+            "{what}: the redirect must name where to go instead; {reason}"
         );
         // The teaching surface: `permissionDecisionReason` is display-only on
         // an allow, so the nudge has to ride in as context or the agent never
@@ -270,7 +270,7 @@ fn an_unrelated_bash_command_is_passed_through_untouched() {
             verdict(&out),
             None,
             "`{cmd}` is outside the match set: the guard must emit no decision \
-             at all, so the user's own permission settings still apply — {out}"
+             at all, so the user's own permission settings still apply; {out}"
         );
     }
 }
@@ -293,7 +293,7 @@ fn a_compound_command_is_never_auto_approved() {
             verdict(&out),
             None,
             "`{cmd}` must not be auto-approved on the strength of its first word \
-             — {out}"
+            ; {out}"
         );
     }
 }
@@ -330,7 +330,7 @@ fn strict_denies_a_search_the_graph_can_answer_and_names_the_replacement() {
         .to_string();
     assert!(
         reason.contains("find_references(symbol=\"charge_payment\")"),
-        "the deny has to hand over the exact call, arguments and all — {reason}"
+        "the deny has to hand over the exact call, arguments and all; {reason}"
     );
 }
 
@@ -347,7 +347,7 @@ fn strict_denies_a_whole_file_read_of_an_indexed_file() {
         .to_string();
     assert!(
         reason.contains("get_context") && reason.contains("src/pay.rs"),
-        "the deny must name the file and the call that replaces the read — {reason}"
+        "the deny must name the file and the call that replaces the read; {reason}"
     );
 }
 
@@ -586,7 +586,7 @@ fn an_empty_index_allows() {
 ///
 /// The marker is stamped directly rather than by making a commit. `travsr init`
 /// installs a post-commit hook, so committing re-indexes and the tree never
-/// goes stale — which is the whole point of that hook, and useless as a fixture
+/// goes stale, which is the whole point of that hook, and useless as a fixture
 /// for the state it exists to prevent.
 #[test]
 fn a_stale_index_allows() {
@@ -664,7 +664,7 @@ fn the_environment_escape_hatch_allows_everything() {
             verdict(&out),
             None,
             "the escape hatch is 'get out of my way', not 'auto-approve things' \
-             — {out}"
+            ; {out}"
         );
     }
 }
@@ -733,7 +733,7 @@ const DEADLINE_MS: u64 = 200;
 
 /// The timeout fail-open, end to end. With a one-millisecond budget no decision
 /// can possibly be reached, so a call that is otherwise a certain `deny` has to
-/// come back allowed — which is the property, stated the only way that cannot
+/// come back allowed, which is the property, stated the only way that cannot
 /// pass by accident.
 #[test]
 fn a_missed_deadline_allows() {
@@ -752,7 +752,7 @@ fn a_missed_deadline_allows() {
     assert_eq!(
         verdict(&out),
         None,
-        "a guard that did not decide must say nothing, not auto-approve — {out}"
+        "a guard that did not decide must say nothing, not auto-approve; {out}"
     );
 }
 
@@ -812,7 +812,7 @@ fn an_unconfigured_repository_decides_nothing() {
         assert_eq!(
             verdict(&out),
             None,
-            "the guard is opt-in; an unconfigured repo must be untouched — {out}"
+            "the guard is opt-in; an unconfigured repo must be untouched; {out}"
         );
     }
 }
@@ -843,7 +843,7 @@ fn the_guard_flag_rejects_an_unknown_level() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         stderr.contains("foo") && stderr.contains("strict"),
-        "the error must name what was rejected and what is accepted — {stderr}"
+        "the error must name what was rejected and what is accepted; {stderr}"
     );
 }
 
@@ -855,7 +855,7 @@ fn the_guard_flag_is_documented_on_both_commands() {
         let help = String::from_utf8_lossy(&out.stdout);
         assert!(
             help.contains("--guard"),
-            "`travsr {cmd} --help` must document --guard — {help}"
+            "`travsr {cmd} --help` must document --guard; {help}"
         );
     }
     let tmp = tempfile::tempdir().unwrap();
@@ -866,7 +866,7 @@ fn the_guard_flag_is_documented_on_both_commands() {
     let help = String::from_utf8_lossy(&out.stdout);
     assert!(
         help.contains("stdin") && help.contains("stdout"),
-        "`travsr guard --help` must say what it reads and writes — {help}"
+        "`travsr guard --help` must say what it reads and writes; {help}"
     );
 }
 
@@ -951,7 +951,7 @@ fn guard_installs_one_pretooluse_entry_and_preserves_everything_else() {
     connect(dir, &["--guard"]);
 
     let root = settings(dir);
-    assert_eq!(guard_handlers(&root).len(), 1, "exactly one entry — {root}");
+    assert_eq!(guard_handlers(&root).len(), 1, "exactly one entry; {root}");
 
     // Unrelated keys.
     assert_eq!(root["theme"], "dark");
@@ -995,14 +995,14 @@ fn the_installed_hook_matches_the_tools_the_guard_inspects() {
     for tool in ["Grep", "Glob", "Read", "Bash"] {
         assert!(
             matcher.contains(tool),
-            "the guard inspects {tool}, so the matcher has to fire on it — {matcher}"
+            "the guard inspects {tool}, so the matcher has to fire on it; {matcher}"
         );
     }
     // And on the travsr tools, which is what feeds the release valve.
     assert!(
         matcher.contains("get_callers") && matcher.contains("find_references"),
         "the guard must see travsr queries go past or the strict valve cannot \
-         open — {matcher}"
+         open; {matcher}"
     );
     // Exec form, so a Windows path with a space in it needs no quoting.
     let handler = &group["hooks"][0];
@@ -1031,12 +1031,12 @@ fn repeated_init_and_connect_do_not_duplicate_the_hook() {
     assert_eq!(
         guard_handlers(&root).len(),
         1,
-        "five runs must leave exactly one entry — {root}"
+        "five runs must leave exactly one entry; {root}"
     );
     assert_eq!(
         root["hooks"]["PreToolUse"].as_array().unwrap().len(),
         2,
-        "the user's group plus ours, and no more — {root}"
+        "the user's group plus ours, and no more; {root}"
     );
 }
 
@@ -1048,7 +1048,7 @@ fn a_second_identical_run_reports_no_change() {
     let again = connect(dir, &["--guard"]);
     assert!(
         again.contains("ok .claude/settings.json"),
-        "an unchanged file must be reported as unchanged, not rewritten — {again}"
+        "an unchanged file must be reported as unchanged, not rewritten; {again}"
     );
 }
 
@@ -1059,7 +1059,7 @@ fn the_level_is_persisted_and_drives_the_guard() {
 
     connect(dir, &["--guard"]);
     let cfg = std::fs::read_to_string(dir.join(".travsr/config.toml")).unwrap();
-    assert!(cfg.contains("advisory"), "--guard stores advisory — {cfg}");
+    assert!(cfg.contains("advisory"), "--guard stores advisory; {cfg}");
     assert_eq!(
         verdict(&guard(
             dir,
@@ -1074,7 +1074,7 @@ fn the_level_is_persisted_and_drives_the_guard() {
     let cfg = std::fs::read_to_string(dir.join(".travsr/config.toml")).unwrap();
     assert!(
         cfg.contains("strict"),
-        "--guard=strict stores strict — {cfg}"
+        "--guard=strict stores strict; {cfg}"
     );
     assert_denies(
         &guard(dir, with_session(grep_for("charge_payment"), "s-p2")),
@@ -1105,7 +1105,7 @@ fn a_plain_init_installs_no_hook_and_leaves_one_alone() {
     let cfg = std::fs::read_to_string(dir.join(".travsr/config.toml")).unwrap();
     assert!(
         cfg.contains("strict"),
-        "and must not reset the level — {cfg}"
+        "and must not reset the level; {cfg}"
     );
 }
 
@@ -1120,7 +1120,7 @@ fn remove_strips_only_the_travsr_hook() {
     let root = settings(dir);
     assert!(
         guard_handlers(&root).is_empty(),
-        "ours must be gone — {root}"
+        "ours must be gone; {root}"
     );
     // Everything else, exactly as it was.
     assert_eq!(root["theme"], "dark");
@@ -1131,7 +1131,7 @@ fn remove_strips_only_the_travsr_hook() {
         "my-formatter"
     );
     let pre = root["hooks"]["PreToolUse"].as_array().unwrap();
-    assert_eq!(pre.len(), 1, "only the user's group is left — {root}");
+    assert_eq!(pre.len(), 1, "only the user's group is left; {root}");
     assert_eq!(pre[0]["hooks"][0]["command"], "my-own-check.sh");
 }
 
@@ -1146,7 +1146,7 @@ fn remove_clears_the_stored_level_so_the_guard_goes_quiet() {
     assert!(
         !cfg.contains("strict"),
         "a setting left behind after the hook is gone is one waiting to \
-         surprise whoever reinstalls it — {cfg}"
+         surprise whoever reinstalls it; {cfg}"
     );
     assert_eq!(
         verdict(&guard(dir, grep_for("charge_payment"))),
@@ -1209,7 +1209,7 @@ fn a_malformed_settings_file_is_skipped_not_clobbered() {
     );
     assert!(
         report.contains("skipped .claude/settings.json"),
-        "and the skip must be reported, not silent — {report}"
+        "and the skip must be reported, not silent; {report}"
     );
 }
 
@@ -1223,7 +1223,7 @@ fn the_settings_file_is_never_git_ignored() {
     let ignored = std::fs::read_to_string(dir.join(".gitignore")).unwrap_or_default();
     assert!(
         !ignored.contains(".claude/settings.json"),
-        "a shared, user-owned file must not be ignored — {ignored}"
+        "a shared, user-owned file must not be ignored; {ignored}"
     );
 }
 
@@ -1235,7 +1235,7 @@ fn print_writes_nothing() {
     let report = connect(dir, &["--guard=strict", "--print"]);
     assert!(
         report.contains(".claude/settings.json"),
-        "--print must say what it would do — {report}"
+        "--print must say what it would do; {report}"
     );
     assert_eq!(
         std::fs::read_to_string(dir.join(".claude/settings.json")).unwrap(),
@@ -1243,5 +1243,5 @@ fn print_writes_nothing() {
         "--print must touch nothing"
     );
     let cfg = std::fs::read_to_string(dir.join(".travsr/config.toml")).unwrap_or_default();
-    assert!(!cfg.contains("strict"), "not even the stored level — {cfg}");
+    assert!(!cfg.contains("strict"), "not even the stored level; {cfg}");
 }
