@@ -6787,7 +6787,7 @@ mod tests {
         .expect("write");
         let class = |name: &str| {
             travsr_core::Node::new(
-                travsr_core::VName::new("c", "", "a.rb", "ruby", &format!("scip:a.rb:x {name}#")),
+                travsr_core::VName::new("c", "", "a.rb", "ruby", format!("scip:a.rb:x {name}#")),
                 // scip-ruby emits no SymbolInformation kind.
                 "definition",
             )
