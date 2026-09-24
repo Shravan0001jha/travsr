@@ -512,11 +512,13 @@ fn advisory_note(request: &Request) -> Option<String> {
                  without walking the tree. Continuing with {via}."
             ),
         }),
-        Request::Read { path } => Some(format!(
-            "Travsr indexes this repository: get_context(query=\"{path}\", \
-             include_snippets=true) returns the relevant symbols with their source, which \
-             is usually cheaper than the whole file. Continuing with Read."
-        )),
+        // Nothing true to say. This arm is only reached once `redirect_for`
+        // has established the graph does not carry the file: it is a doc, a
+        // lockfile, a config, vendored, untracked, or outside the repository
+        // altogether. Nudging toward `get_context` there would send the agent
+        // at a call that cannot answer, which is worse than staying quiet. An
+        // indexed file takes the `Some` arm and gets the real redirect.
+        Request::Read { .. } => None,
         Request::TravsrQuery { .. } => None,
     }
 }
@@ -604,8 +606,10 @@ pub fn decide(input: &HookInput, mode: GuardMode, repo_root: Option<&Path>) -> D
         // become a loop the agent cannot leave.
         (GuardMode::Strict, Some(r)) => {
             if super::session::release(root, input.session_id.as_deref(), &r.key) {
+                // Released: the agent keeps the redirect but the call is not
+                // decided on, so the user's permission settings still apply.
                 Decision::new(
-                    HookOutput::allow(r.text),
+                    HookOutput::context(r.text),
                     format!("`{}` already redirected in this session", r.key),
                 )
             } else {
@@ -615,9 +619,9 @@ pub fn decide(input: &HookInput, mode: GuardMode, repo_root: Option<&Path>) -> D
                 )
             }
         }
-        // Advisory names the same call and gets out of the way.
+        // Advisory names the same call and decides nothing.
         (GuardMode::Advisory, Some(r)) => Decision::new(
-            HookOutput::allow(r.text),
+            HookOutput::context(r.text),
             format!("the graph answers `{}`, advisory does not block", r.key),
         ),
         // The graph cannot answer this one. Strict must not block it; advisory
@@ -626,7 +630,7 @@ pub fn decide(input: &HookInput, mode: GuardMode, repo_root: Option<&Path>) -> D
         (GuardMode::Strict, None) => pass("the graph cannot answer this"),
         (GuardMode::Advisory, None) => match advisory_note(&request) {
             Some(note) => Decision::new(
-                HookOutput::allow(note),
+                HookOutput::context(note),
                 "the graph cannot answer this exactly; nudged",
             ),
             None => pass("the graph cannot answer this"),
@@ -1006,16 +1010,30 @@ mod tests {
                 hint: None,
                 via: "Glob".into(),
             }),
-            advisory_note(&Request::Read {
-                path: "src/a.rs".into(),
-            }),
         ];
+        let mut checked = 0;
         for note in notes.into_iter().flatten() {
             let named: Vec<&String> = served.iter().filter(|t| note.contains(*t)).collect();
             assert!(
                 !named.is_empty(),
                 "a nudge that names no served tool teaches nothing: {note}"
             );
+            checked += 1;
         }
+        assert_eq!(checked, 2, "both nudges must exist to be worth checking");
+    }
+
+    /// A read this arm is reached for is one `redirect_for` has already placed
+    /// outside the graph: a doc, a lockfile, a config, something vendored or
+    /// out of the repository. `get_context` cannot answer for any of them, so
+    /// the honest nudge is no nudge.
+    #[test]
+    fn an_unindexed_read_gets_no_nudge() {
+        assert_eq!(
+            advisory_note(&Request::Read {
+                path: "README.md".into(),
+            }),
+            None
+        );
     }
 }

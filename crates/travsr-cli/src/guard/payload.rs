@@ -12,7 +12,7 @@
 //! Claude Code ignores that shape, so the guard would have been inert in
 //! exactly the mode that is supposed to block.
 
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
 /// What the host writes on the guard's stdin.
 ///
@@ -75,94 +75,89 @@ pub struct ToolInput {
     pub file: Option<String>,
 }
 
-/// The three decisions the host understands.
-///
-/// `Ask` is part of the contract and nothing here constructs it, deliberately.
-/// The guard's whole argument is that it knows which calls the graph can
-/// replace; handing that judgement to a permission prompt would put a decision
-/// in front of the user on every `grep` and teach the agent nothing either way.
-/// It stays in the enum because [`HookOutput::blocks`] has to classify it
-/// correctly if a later mode ever does emit it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Permission {
-    Allow,
-    #[allow(dead_code)]
-    Ask,
-    Deny,
-}
-
 /// What the guard writes on stdout.
 ///
-/// [`HookOutput::Neutral`] is not a fourth decision, it is the *absence* of one:
-/// exit 0 with no JSON, which the host documents as "no decision; normal
-/// permission flow applies". That distinction is load-bearing and is the reason
-/// this is an enum rather than an `Option<Permission>` field.
+/// **The guard never auto-approves anything.** `permissionDecision: "allow"`
+/// is not "do not block", it is "approve this without asking the user", and it
+/// overrides the permission rules the user configured for that tool. The guard
+/// has no standing to do that: its whole claim is that it knows which reads the
+/// graph can replace, which says nothing about which paths a user is willing to
+/// have read. An earlier version of this spent the auto-approve on every
+/// matched call in advisory mode, which silently lifted `Read` gating on
+/// `~/.ssh/id_rsa`, `.env` and anything else outside the repository, since
+/// those are exactly the paths `redirect_for` declines to vouch for. That is
+/// the same failure as auto-approving `grep foo && rm -rf build` on the
+/// strength of its first word, on a different tool.
 ///
-/// `permissionDecision: "allow"` does not mean "do not block", it means
-/// "approve this without asking the user". Emitting it for a `Bash` command the
-/// guard has not positively identified would auto-approve whatever that command
-/// turns out to be, so the guard emits it only for calls it has recognised as
-/// read-only, and passes everything else through untouched. Both outcomes
-/// satisfy the fail-open rule (neither blocks), but only one of them spends
-/// the user's permission settings to do it.
+/// So only one of these carries a `permissionDecision`, and it is a `deny`:
+///
+/// * [`Neutral`] writes nothing. The host documents that as "no decision;
+///   normal permission flow applies".
+/// * [`Context`] carries the redirect and no decision, so the agent is taught
+///   without the user's permission settings being spent to do it. This is
+///   every advisory output, and every strict output the release valve lets
+///   through.
+/// * [`Deny`] is the only decision the guard ever emits, only in strict mode,
+///   and only for a call `redirect_for` positively answered.
+///
+/// `allow` and `ask` are therefore never emitted. `ask` would put a prompt in
+/// front of the user on every `grep` and teach the agent nothing either way;
+/// `allow` is the hole described above.
+///
+/// [`Neutral`]: HookOutput::Neutral
+/// [`Context`]: HookOutput::Context
+/// [`Deny`]: HookOutput::Deny
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HookOutput {
     /// No JSON on stdout: the host applies its normal permission flow.
     Neutral,
-    /// An explicit decision, with the reason the agent gets to read.
-    Decide {
-        permission: Permission,
-        reason: String,
-        /// Text folded into the agent's context. `permissionDecisionReason` is
-        /// surfaced to the agent on a `deny` but is display-only on an `allow`,
-        /// so advisory mode, whose entire product is the redirect it teaches,
-        /// carries the same text here as well or it teaches nothing.
-        context: Option<String>,
-    },
+    /// Context for the agent, with no permission decision attached.
+    ///
+    /// `additionalContext` rather than `permissionDecisionReason`, because the
+    /// latter only exists alongside a decision and is display-only without one.
+    /// A host that does not recognise a `hookSpecificOutput` carrying no
+    /// decision simply ignores it, which degrades to [`Neutral`] and is still
+    /// correct.
+    ///
+    /// [`Neutral`]: HookOutput::Neutral
+    Context { text: String },
+    /// Deny, naming the Travsr call that replaces the blocked one.
+    Deny { reason: String },
 }
 
 impl HookOutput {
-    /// An explicit `allow` with a redirect the agent can act on.
-    pub fn allow(reason: impl Into<String>) -> Self {
-        let reason = reason.into();
-        HookOutput::Decide {
-            permission: Permission::Allow,
-            context: Some(reason.clone()),
-            reason,
-        }
+    /// Teach without deciding: the redirect reaches the agent and the host's
+    /// own permission flow is left exactly as it was.
+    pub fn context(text: impl Into<String>) -> Self {
+        HookOutput::Context { text: text.into() }
     }
 
-    /// A `deny` naming the Travsr call that replaces the blocked one.
+    /// The one decision the guard emits.
     pub fn deny(reason: impl Into<String>) -> Self {
-        HookOutput::Decide {
-            permission: Permission::Deny,
+        HookOutput::Deny {
             reason: reason.into(),
-            context: None,
         }
     }
 
     /// The bytes to write on stdout. Empty for [`HookOutput::Neutral`].
     pub fn render(&self) -> String {
-        match self {
-            HookOutput::Neutral => String::new(),
-            HookOutput::Decide {
-                permission,
-                reason,
-                context,
-            } => {
-                let mut specific = serde_json::json!({
-                    "hookEventName": "PreToolUse",
-                    "permissionDecision": permission,
-                    "permissionDecisionReason": reason,
-                });
-                if let Some(extra) = context {
-                    specific["additionalContext"] = serde_json::Value::String(extra.clone());
-                }
-                // `to_string` on an object built from `json!` cannot fail.
-                serde_json::json!({ "hookSpecificOutput": specific }).to_string()
-            }
-        }
+        let specific = match self {
+            HookOutput::Neutral => return String::new(),
+            HookOutput::Context { text } => serde_json::json!({
+                "hookEventName": "PreToolUse",
+                "additionalContext": text,
+            }),
+            // `permissionDecisionReason` is what the host surfaces to the agent
+            // on a deny, so the replacement call belongs there rather than in
+            // `additionalContext`, which would say the same thing twice.
+            HookOutput::Deny { reason } => serde_json::json!({
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "deny",
+                "permissionDecisionReason": reason,
+            }),
+        };
+        // `to_string` on an object built from `json!` cannot fail.
+        serde_json::json!({ "hookSpecificOutput": specific }).to_string()
     }
 
     /// Whether this output blocks the tool call. The property every fail-open
@@ -174,13 +169,7 @@ impl HookOutput {
     /// from a string comparison at each call site.
     #[cfg(test)]
     pub fn blocks(&self) -> bool {
-        matches!(
-            self,
-            HookOutput::Decide {
-                permission: Permission::Deny | Permission::Ask,
-                ..
-            }
-        )
+        matches!(self, HookOutput::Deny { .. })
     }
 }
 
@@ -204,15 +193,36 @@ mod tests {
     }
 
     #[test]
-    fn an_allow_carries_the_redirect_as_context_too() {
+    fn context_teaches_without_deciding() {
         let v: serde_json::Value =
-            serde_json::from_str(&HookOutput::allow("prefer find_references").render()).unwrap();
-        assert_eq!(v["hookSpecificOutput"]["permissionDecision"], "allow");
+            serde_json::from_str(&HookOutput::context("prefer find_references").render()).unwrap();
         assert_eq!(
             v["hookSpecificOutput"]["additionalContext"], "prefer find_references",
-            "advisory mode teaches through additionalContext; an allow's reason \
-             is display-only"
+            "the redirect has to reach the agent"
         );
+        assert!(
+            v["hookSpecificOutput"]["permissionDecision"].is_null(),
+            "and it must not carry a decision: {v}"
+        );
+    }
+
+    /// The property the whole type exists to hold. `allow` is the host's
+    /// auto-approve, so emitting it would lift the user's own permission rules
+    /// for that call, and the guard's claim to know which reads the graph can
+    /// replace says nothing about which paths a user will have read.
+    #[test]
+    fn nothing_the_guard_emits_ever_auto_approves() {
+        for out in [
+            HookOutput::Neutral,
+            HookOutput::context("a nudge"),
+            HookOutput::deny("a refusal"),
+        ] {
+            let rendered = out.render();
+            assert!(
+                !rendered.contains("\"allow\"") && !rendered.contains("\"ask\""),
+                "the guard must never approve on the user's behalf: {rendered}"
+            );
+        }
     }
 
     #[test]
@@ -222,9 +232,10 @@ mod tests {
     }
 
     #[test]
-    fn only_deny_and_ask_block() {
+    fn only_a_deny_blocks() {
         assert!(HookOutput::deny("x").blocks());
-        assert!(!HookOutput::allow("x").blocks());
+        assert!(!HookOutput::context("x").blocks());
+        assert!(!HookOutput::Neutral.blocks());
     }
 
     #[test]

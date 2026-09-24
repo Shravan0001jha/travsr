@@ -150,17 +150,47 @@ fn decision(stdout: &str) -> Option<Value> {
     Some(specific.clone())
 }
 
+/// The decision the guard made, if it made one.
+///
+/// `None` covers both shapes that mean "no decision": nothing on stdout at
+/// all, and a `hookSpecificOutput` that carries only `additionalContext`. An
+/// earlier version mapped the second to `Some("?")`, which was harmless while
+/// every emitted object carried a decision and became wrong the moment the
+/// guard stopped emitting `allow`.
 fn verdict(stdout: &str) -> Option<String> {
-    decision(stdout).map(|d| d["permissionDecision"].as_str().unwrap_or("?").to_string())
+    decision(stdout).and_then(|d| d["permissionDecision"].as_str().map(str::to_string))
+}
+
+/// The `additionalContext` the guard attached, if any.
+fn context(stdout: &str) -> Option<String> {
+    decision(stdout).and_then(|d| d["additionalContext"].as_str().map(str::to_string))
 }
 
 /// The property the whole fail-open contract reduces to: the call went through.
 #[track_caller]
 fn assert_allows(stdout: &str, what: &str) {
     match verdict(stdout).as_deref() {
-        None | Some("allow") => {}
+        None => {}
         other => panic!("{what}: expected the call to go through, got {other:?}; {stdout}"),
     }
+}
+
+/// The guard emitted no `permissionDecision`, so the user's own permission
+/// rules for that tool still apply.
+///
+/// The same check as [`assert_allows`] as long as `allow` is never emitted,
+/// and deliberately a separate name: that one states the fail-open contract
+/// ("the call went through"), this one states the no-auto-approve contract
+/// ("and the guard did not spend the user's permission settings to do it").
+/// If the two ever come apart, it will be because someone reintroduced
+/// `allow`, and the call sites say which property they were relying on.
+#[track_caller]
+fn assert_no_decision(stdout: &str, what: &str) {
+    assert_eq!(
+        verdict(stdout),
+        None,
+        "{what}: the guard must not decide on this call; {stdout}"
+    );
 }
 
 #[track_caller]
@@ -234,29 +264,70 @@ fn every_matched_operation_is_allowed_with_a_redirect_in_advisory_mode() {
 
     for (what, payload) in cases {
         let out = guard(dir, payload);
-        assert_eq!(
-            verdict(&out).as_deref(),
-            Some("allow"),
-            "advisory must never block, and must say something: {what}; {out}"
-        );
-        let d = decision(&out).unwrap();
-        let reason = d["permissionDecisionReason"].as_str().unwrap_or_default();
+        assert_no_decision(&out, what);
+        let note =
+            context(&out).unwrap_or_else(|| panic!("{what}: advisory must say something; {out}"));
         assert!(
-            !reason.trim().is_empty(),
-            "{what}: an advisory allow with no redirect teaches nothing"
+            !note.trim().is_empty(),
+            "{what}: an advisory nudge with no redirect teaches nothing"
         );
         assert!(
-            reason.contains("Travsr") || reason.contains("travsr"),
-            "{what}: the redirect must name where to go instead; {reason}"
-        );
-        // The teaching surface: `permissionDecisionReason` is display-only on
-        // an allow, so the nudge has to ride in as context or the agent never
-        // sees the thing the whole mode exists to tell it.
-        assert!(
-            d["additionalContext"].is_string(),
-            "{what}: an advisory nudge must reach the agent, not just the UI"
+            note.contains("Travsr") || note.contains("travsr"),
+            "{what}: the redirect must name where to go instead; {note}"
         );
     }
+}
+
+/// The hole this mode had, and the reason advisory carries no decision at all.
+///
+/// `redirect_for` returns `None` for exactly the paths the guard cannot vouch
+/// for: outside the repository, a lockfile, a `.env`, anything the index does
+/// not carry. Emitting `allow` for those would lift the user's own `Read`
+/// gating on `~/.ssh/id_rsa` and friends, which is the same failure as
+/// auto-approving `grep foo && rm -rf build` on the strength of its first word.
+#[test]
+fn advisory_never_auto_approves_a_read_it_cannot_vouch_for() {
+    let tmp = indexed_repo();
+    let dir = tmp.path();
+    set_mode(dir, "advisory");
+
+    let outside = if cfg!(windows) {
+        "C:\\Windows\\System32\\drivers\\etc\\hosts"
+    } else {
+        "/etc/hosts"
+    };
+    let cases: Vec<(&str, Value)> = vec![
+        ("a path outside the repository", read(outside)),
+        ("a dotenv file", read(".env")),
+        ("a lockfile", read("Cargo.lock")),
+        ("a markdown file", read("README.md")),
+        ("a vendored file", read("node_modules/dep/index.js")),
+        ("a file that does not exist", read("src/nope.rs")),
+    ];
+    for (what, payload) in cases {
+        let out = guard(dir, payload);
+        assert_no_decision(&out, what);
+        assert_eq!(
+            context(&out),
+            None,
+            "{what}: the graph cannot answer for this file, so there is nothing \
+             true to nudge toward; {out}"
+        );
+    }
+}
+
+/// The same rule on the search side: advisory teaches, it does not approve.
+#[test]
+fn advisory_decides_nothing_even_when_it_has_a_redirect() {
+    let tmp = indexed_repo();
+    let dir = tmp.path();
+    set_mode(dir, "advisory");
+    let out = guard(dir, with_session(grep_for("charge_payment"), "s-adv"));
+    assert_no_decision(&out, "a search the graph can answer");
+    assert!(
+        context(&out).is_some_and(|c| c.contains("find_references")),
+        "the redirect still has to reach the agent; {out}"
+    );
 }
 
 #[test]
@@ -1108,14 +1179,9 @@ fn the_level_is_persisted_and_drives_the_guard() {
     connect(dir, &["--guard"]);
     let cfg = std::fs::read_to_string(dir.join(".travsr/config.toml")).unwrap();
     assert!(cfg.contains("advisory"), "--guard stores advisory; {cfg}");
-    assert_eq!(
-        verdict(&guard(
-            dir,
-            with_session(grep_for("charge_payment"), "s-p1")
-        ))
-        .as_deref(),
-        Some("allow"),
-        "advisory never blocks"
+    assert_no_decision(
+        &guard(dir, with_session(grep_for("charge_payment"), "s-p1")),
+        "advisory never blocks",
     );
 
     connect(dir, &["--guard=strict"]);

@@ -14,21 +14,13 @@
 //!
 //! # Fail-open
 //!
-//! The guard blocks nothing it cannot replace. Two distinct outputs both mean
-//! "do not block", and the difference matters:
-//!
-//! * **Neutral**: exit 0, no JSON. The host applies its normal permission
-//!   flow. This is what the guard emits whenever it has *not* positively
-//!   identified a read-only call: an unmatched tool, a compound shell command,
-//!   an unreadable payload, a missed deadline, `guard.mode = off`.
-//! * **`permissionDecision: "allow"`**: the host's *auto-approve*. Emitted
-//!   only for a call the guard has recognised as read-only and is deliberately
-//!   letting through, which is the only case where spending the user's
-//!   permission settings is something they asked for.
-//!
-//! Collapsing the two would mean auto-approving whatever a `Bash` command
-//! turned out to be whenever the guard failed to understand it, which is the
-//! opposite of failing safe.
+//! The guard blocks nothing it cannot replace, and approves nothing at all. A
+//! `deny` is the only `permissionDecision` it ever emits; everything else is
+//! either silence or context, and both leave the host's own permission flow
+//! exactly as it was. See [`payload::HookOutput`] for why `allow` is not on
+//! that list: it is the host's *auto-approve*, and the guard's claim to know
+//! which reads the graph can replace says nothing about which paths a user is
+//! willing to have read.
 //!
 //! # Deadline
 //!
@@ -152,6 +144,11 @@ pub fn resolve_mode(repo_root: Option<&std::path::Path>) -> GuardMode {
 /// Always `Ok`. The caller exits 0, because a non-zero exit from a
 /// `PreToolUse` hook is a signal in its own right (2 blocks the call outright)
 /// and the guard must never block by accident.
+///
+/// Blocks the runtime worker it is called on, which is the right trade here: a
+/// one-shot CLI on a current-thread runtime with nothing else scheduled, and a
+/// deadline that bounds the wait at 200 ms. Making it async would buy a thread
+/// back from a process that is about to exit.
 pub fn run(explain: bool) -> anyhow::Result<()> {
     // The CLI installs a process-wide panic hook that prints and calls
     // `process::exit(1)`, which would take the whole process down before the

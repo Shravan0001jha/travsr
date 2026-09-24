@@ -384,8 +384,8 @@ travsr connect --guard[=strict]  # same, without re-indexing
 travsr connect --remove          # take the hook back out
 ```
 
-**Advisory** never blocks anything. It allows the call and attaches the
-replacement, so the nudge lands where it is load-bearing:
+**Advisory** decides nothing. It hands the agent the replacement and leaves the
+call alone, so the nudge lands where it is load-bearing:
 
 > Travsr has indexed this repository and holds `charge_payment`. It can answer
 > this structurally: call `find_references(symbol="charge_payment")` for every
@@ -393,7 +393,13 @@ replacement, so the nudge lands where it is load-bearing:
 > of Grep.
 
 **Strict** denies that call instead, with the same replacement in the refusal,
-and allows everything else. It is the mode that makes the graph non-optional.
+and leaves everything else alone. It is the mode that makes the graph
+non-optional.
+
+**The guard never approves anything on your behalf.** A refusal is the only
+decision it ever emits. It has no opinion on which paths you are willing to
+have read, only on which reads the graph can replace, so every other outcome
+leaves your own permission rules in force rather than spending them.
 
 The level is stored in `.travsr/config.toml` as `guard.mode`, so `travsr guard`
 and the installed hook can never disagree about policy: the hook entry only

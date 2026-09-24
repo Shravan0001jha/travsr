@@ -55,7 +55,7 @@ enforcement level before Claude Code is ever installed in it.
 
 | Level | Matched call the graph can answer | Everything else |
 |---|---|---|
-| `advisory` | `allow` + the replacement call, as `additionalContext` | `allow` + a one-line nudge |
+| `advisory` | the replacement call as `additionalContext`, no decision | a one-line nudge, no decision |
 | `strict` | `deny` + the replacement call | no decision |
 
 `advisory` is the default when the guard is enabled, because the nudge is worth
@@ -66,20 +66,38 @@ non-optional.
 Neither is installed by a plain `travsr init`. A silent `init` must not start
 denying an agent's tool calls in a repository where nobody asked for it.
 
-## Two ways to not block, and why they are different
+## The guard never approves anything
 
 `permissionDecision: "allow"` is the host's **auto-approve**, not "do not
-block": it bypasses the user's own permission settings for that call. Exit 0
-with no JSON is the host's documented "no decision; normal permission flow
-applies".
+block": it lifts the user's own permission rules for that call. Exit 0 with no
+JSON is the host's documented "no decision; normal permission flow applies",
+and that is what "do not block" actually is.
 
-The guard emits the first only for a call it has positively recognised as
-read-only, and the second for everything else. Collapsing them would mean that
-a `Bash` command the guard failed to parse got auto-approved on the strength of
-its first word, so `grep foo && rm -rf build` would spend the user's
-permission prompt on the `rm`. That is why `guard::shell` refuses to recognise
-anything but a single simple command with no operator, no substitution and no
-redirect in it, and why an unrecognised command yields no decision at all.
+So a refusal is the only decision the guard emits. Its claim is that it knows
+which reads the graph can replace, and that says nothing whatever about which
+paths a user is willing to have read. There are three outputs and only one of
+them carries a `permissionDecision`:
+
+| Output | On the wire | When |
+|---|---|---|
+| Neutral | nothing | outside the match set, or any fail-open condition |
+| Context | `additionalContext`, no decision | every advisory output, and every strict output the valve released |
+| Deny | `permissionDecision: "deny"` + the replacement | strict, graph-answerable, not released |
+
+The first draft of this got that wrong in advisory mode, and the review caught
+it. Advisory emitted `allow` for every matched call, including the
+`redirect_for` `None` arm, which is exactly the set the guard had just declined
+to vouch for: a `Read` of `~/.ssh/id_rsa` or `.env` or anything outside the
+repository was auto-approved, lifting the user's `Read` gating on the very
+paths the guard deliberately excludes. That is the same failure as
+auto-approving `grep foo && rm -rf build` on the strength of its first word,
+on a different tool. Dropping `allow` entirely closes the class rather than
+the instance, and costs nothing: advisory never wanted to approve, it wanted to
+teach.
+
+The shell parser's strictness remains for the same underlying reason. It
+refuses anything but a single simple command with no operator, substitution or
+redirect, so the guard never forms an opinion about a command it cannot read.
 
 ## Fail-open
 
@@ -179,11 +197,13 @@ to (2).
   Antigravity, Codex, Windsurf and Zed have no pre-tool contract to hook, and
   the README says so rather than implying otherwise. #252's resource injection
   is the portable half.
-- Advisory mode auto-approves the matched read-only calls, because that is what
-  `permissionDecision: "allow"` means. The match set is `Grep`, `Glob`, a
-  whole-file `Read` and a single read-only search command, so nothing that
-  writes or executes is in it, but it is a change to how those specific calls
-  are permitted, and it happens only when the guard is explicitly enabled.
+- Advisory mode has no effect on whether a call is permitted. It attaches
+  context and nothing else, so a repository that turns the guard on does not
+  thereby change what its agent is allowed to read.
+- A host that does not recognise a `hookSpecificOutput` carrying
+  `additionalContext` with no `permissionDecision` ignores it. That degrades
+  the nudge to silence, which is still correct: the fallback for every output
+  but `deny` is "the host decides as it would have anyway".
 - File discovery is never blocked, only nudged. The graph indexes code files, so
   it cannot enumerate the untracked, ignored, generated and non-code files a
   glob legitimately finds. Answering "here is the subset I know about" to a
