@@ -152,6 +152,7 @@ impl SandboxedChild {
 pub fn build_unsandboxed_command(
     program: &str,
     args: &[&str],
+    repo_root: &std::path::Path,
     scratch: &std::path::Path,
     language: &str,
 ) -> SandboxedSpawn {
@@ -172,7 +173,8 @@ pub fn build_unsandboxed_command(
         }
     }
 
-    let access = toolchain::toolchain_access(language);
+    // Repo-aware so an Android `local.properties` can name the SDK (#904).
+    let access = toolchain::toolchain_access_in(language, Some(repo_root));
     for (k, v) in &access.env {
         cmd.env(k, v);
     }
@@ -409,7 +411,7 @@ mod tests {
         std::env::set_var("TRAVSR_TEST_FAKE_SECRET", "s3cr3t");
         std::env::set_var("SYSTEMROOT", "C:\\Windows");
         let scratch = std::env::temp_dir();
-        let spawn = build_unsandboxed_command("java", &["-version"], &scratch, "java");
+        let spawn = build_unsandboxed_command("java", &["-version"], &scratch, &scratch, "java");
         // Off Windows, `SandboxedSpawn` has only the `Wrapped` variant
         // (AppContainer is windows-only), so this pattern is irrefutable and rustc
         // flags the `else` as unreachable. It is refutable on Windows, so allow the

@@ -17,7 +17,7 @@
 //! env (e.g. java → `~/.gradle`, `~/.m2`, `JAVA_HOME`).
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// Extra sandbox grants a language's Phase B analyzer needs beyond the repo +
@@ -202,12 +202,23 @@ pub fn grant_path_has_symlink(root: &std::path::Path, subpath: &str) -> bool {
 
 /// Compute the toolchain grants for a language's Phase B analyzer.
 /// Empty for languages with no out-of-repo toolchain needs.
+///
+/// Repo-independent form; the sandbox builders use [`toolchain_access_in`] so
+/// a grant the repo itself names (`sdk.dir` in an Android `local.properties`)
+/// is honoured too.
 pub fn toolchain_access(language: &str) -> ToolchainAccess {
+    toolchain_access_in(language, None)
+}
+
+/// [`toolchain_access`] for an analyzer that is about to run against
+/// `repo_root`. Only the JVM languages read anything from the repo today
+/// (#904, `android_sdk_root`); every other arm ignores it.
+pub fn toolchain_access_in(language: &str, repo_root: Option<&Path>) -> ToolchainAccess {
     match language {
         "go" => go_access(),
         "dart" => dart_access(),
-        "java" => java_access(),
-        "kotlin" => kotlin_access(),
+        "java" => java_access(repo_root),
+        "kotlin" => kotlin_access(repo_root),
         "scala" => scala_access(),
         "php" => php_access(),
         "csharp" => csharp_access(),
@@ -428,16 +439,90 @@ fn tool_bin_dir(tool: &str) -> Option<PathBuf> {
         .or_else(|| exe.parent().map(|p| p.to_path_buf()))
 }
 
+/// The Android SDK an Android Gradle Plugin build reads, when one is installed
+/// (#904). AGP itself resolves the SDK in this order: `sdk.dir` in the
+/// project's `local.properties`, then `ANDROID_HOME`, then the deprecated
+/// `ANDROID_SDK_ROOT`. The IDE's default install location is tried last, for
+/// the machine where Android Studio manages the SDK and nothing names it in the
+/// environment. Only a directory that exists is returned: an unset or stale
+/// setting grants nothing rather than a path that is not there.
+///
+/// `local.properties` is repo-controlled, so it is read as data: a directory
+/// path only, never executed, and granted read-only like `JAVA_HOME`.
+fn android_sdk_root(repo_root: Option<&Path>) -> Option<PathBuf> {
+    let from_repo = repo_root
+        .map(|r| r.join("local.properties"))
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|text| parse_local_properties_sdk_dir(&text));
+    let from_env = ["ANDROID_HOME", "ANDROID_SDK_ROOT"]
+        .iter()
+        .filter_map(std::env::var_os)
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from);
+    let default = if cfg!(target_os = "windows") {
+        std::env::var_os("LOCALAPPDATA").map(|p| PathBuf::from(p).join("Android").join("Sdk"))
+    } else if cfg!(target_os = "macos") {
+        home().map(|h| h.join("Library").join("Android").join("sdk"))
+    } else {
+        home().map(|h| h.join("Android").join("Sdk"))
+    };
+    from_repo
+        .into_iter()
+        .chain(from_env)
+        .chain(default)
+        .find(|p| p.is_dir())
+}
+
+/// The `sdk.dir` value of a `local.properties` file, unescaped.
+///
+/// The file is in `java.util.Properties` format, so Android Studio writes a
+/// Windows path as `sdk.dir=C\:\\Users\\me\\AppData\\Local\\Android\\Sdk`: a
+/// backslash escapes the character after it, and `:` and `=` are escaped
+/// because they are key/value separators. Comments start with `#` or `!`.
+fn parse_local_properties_sdk_dir(text: &str) -> Option<PathBuf> {
+    let line = text
+        .lines()
+        .map(str::trim_start)
+        .filter(|l| !l.starts_with('#') && !l.starts_with('!'))
+        .find_map(|l| {
+            let (key, value) = l.split_once(['=', ':'])?;
+            (key.trim() == "sdk.dir").then(|| value.trim())
+        })?;
+    let mut out = String::with_capacity(line.len());
+    let mut chars = line.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => match chars.next() {
+                Some('n') => out.push('\n'),
+                Some('t') => out.push('\t'),
+                Some(escaped) => out.push(escaped),
+                None => {}
+            },
+            other => out.push(other),
+        }
+    }
+    (!out.is_empty()).then(|| PathBuf::from(out))
+}
+
 /// `scip-java index` drives Gradle (and Maven) to resolve dependencies. Needs:
 ///   - `JAVA_HOME`       (read) — JDK installation dir
 ///   - `~/.gradle`       (read+write) — Gradle daemon, caches, wrapper downloads
 ///   - `~/.m2`           (read) — Maven local repository
 ///   - `HOME` + `GRADLE_USER_HOME` env vars so Gradle finds its home
+///   - the Android SDK   (read) + `ANDROID_HOME`, when one is installed (#904):
+///     an Android Gradle Plugin build cannot configure without
+///     `platforms/android-NN/android.jar`, and the cleared sandbox env used to
+///     drop the variable that names the SDK even when the user had set it
+///   - `~/.android`      (read+write) — AGP's per-user state (analytics
+///     settings, debug keystore), created on first use; only when an SDK exists
 ///
 /// Also the base grant set for `kotlin_access`: kotlin-language-server drives
 /// the same Gradle/Maven classpath resolution under the hood, even though it
 /// isn't scip-java itself (see `kotlin_access` for what it additionally needs).
-fn java_access() -> ToolchainAccess {
+///
+/// `repo_root` lets `local.properties` name the SDK, as AGP itself allows; a
+/// caller without a repo context passes `None` and the environment decides.
+fn java_access(repo_root: Option<&Path>) -> ToolchainAccess {
     let mut read_paths = Vec::new();
     let mut write_paths = Vec::new();
     let mut env = Vec::new();
@@ -476,6 +561,25 @@ fn java_access() -> ToolchainAccess {
         env.push(("HOME".to_string(), h.to_string_lossy().into_owned()));
     }
 
+    // #904: Android SDK, read-only, plus the variable AGP reads to find it.
+    // Nothing is granted when no SDK is installed: a repo that is not Android
+    // never needs it, and a repo that is gets AGP's own "SDK location not
+    // found", which the java sidecar turns into a diagnostic naming the SDK.
+    if let Some(sdk) = android_sdk_root(repo_root) {
+        tracing::debug!(path = %sdk.display(), "java_access: Android SDK grant (read)");
+        read_paths.push(sdk.clone());
+        env.push((
+            "ANDROID_HOME".to_string(),
+            sdk.to_string_lossy().into_owned(),
+        ));
+        if let Some(h) = home() {
+            let dot_android = h.join(".android");
+            tracing::debug!(path = %dot_android.display(), exists = dot_android.exists(), "java_access: ~/.android grant (read+write)");
+            read_paths.push(dot_android.clone());
+            write_paths.push(dot_android);
+        }
+    }
+
     // G5: scip-java (and kotlin-language-server) drive Gradle/Maven, which invoke
     // `java`. Grant execute on JAVA_HOME/bin so the sandbox can run it; the JDK
     // root is already in read_paths. Gradle/Maven caches stay read-only.
@@ -503,8 +607,8 @@ fn java_access() -> ToolchainAccess {
 /// image load: the wrapper spawned (it lives in the granted `~/.travsr/bin`),
 /// but the launcher it execs, and the jars under `server/lib` it reads, were
 /// both unreachable — 0 nodes, 0 edges, no error surfaced.
-fn kotlin_access() -> ToolchainAccess {
-    let mut access = java_access();
+fn kotlin_access(repo_root: Option<&Path>) -> ToolchainAccess {
+    let mut access = java_access(repo_root);
     if let Some(h) = home() {
         let kls = h.join(".travsr").join("kls");
         tracing::debug!(path = %kls.display(), exists = kls.exists(), "kotlin_access: KLS install dir grant (read+execute)");
@@ -1354,5 +1458,84 @@ mod tests {
             strip_windows_verbatim(PathBuf::from("/home/user/repo")),
             PathBuf::from("/home/user/repo")
         );
+    }
+}
+
+#[cfg(test)]
+mod android_sdk_tests {
+    use super::{android_sdk_root, parse_local_properties_sdk_dir};
+    use std::path::PathBuf;
+
+    // Android Studio writes `local.properties` in java.util.Properties form, so
+    // a Windows path arrives with every `:` and `\` escaped. Both spellings of
+    // the separator, comments and surrounding whitespace are handled.
+    #[test]
+    fn local_properties_sdk_dir_is_unescaped() {
+        assert_eq!(
+            parse_local_properties_sdk_dir(concat!(
+                "## This file must *NOT* be checked into Version Control Systems\n",
+                "# Location of the SDK.\n",
+                r"sdk.dir=C\:\\Users\\me\\AppData\\Local\\Android\\Sdk",
+                "\n"
+            )),
+            Some(PathBuf::from(r"C:\Users\me\AppData\Local\Android\Sdk"))
+        );
+        assert_eq!(
+            parse_local_properties_sdk_dir("  sdk.dir = /Users/me/Library/Android/sdk \n"),
+            Some(PathBuf::from("/Users/me/Library/Android/sdk"))
+        );
+        assert_eq!(
+            parse_local_properties_sdk_dir("sdk.dir:/opt/android-sdk"),
+            Some(PathBuf::from("/opt/android-sdk"))
+        );
+        // Another key, a commented-out key, or no value: nothing.
+        assert_eq!(parse_local_properties_sdk_dir("ndk.dir=/opt/ndk\n"), None);
+        assert_eq!(
+            parse_local_properties_sdk_dir("# sdk.dir=/opt/android-sdk\n"),
+            None
+        );
+        assert_eq!(parse_local_properties_sdk_dir("sdk.dir=\n"), None);
+        assert_eq!(parse_local_properties_sdk_dir(""), None);
+    }
+
+    // The repo's own `local.properties` names the SDK first, as it does for AGP
+    // itself, and only a directory that exists is granted: a stale entry falls
+    // through instead of granting a path that is not there (#904).
+    #[test]
+    fn local_properties_names_the_sdk_when_it_exists() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let sdk = tmp.path().join("sdk");
+        std::fs::create_dir_all(sdk.join("platforms")).expect("mkdir");
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("mkdir");
+        std::fs::write(
+            repo.join("local.properties"),
+            format!(
+                "sdk.dir={}\n",
+                sdk.display().to_string().replace('\\', "\\\\")
+            ),
+        )
+        .expect("write");
+        assert_eq!(android_sdk_root(Some(&repo)), Some(sdk));
+
+        // A `local.properties` naming a directory that does not exist grants
+        // nothing on its own account (the environment may still name one).
+        std::fs::write(repo.join("local.properties"), "sdk.dir=/no/such/sdk\n").expect("write");
+        assert_ne!(
+            android_sdk_root(Some(&repo)),
+            Some(PathBuf::from("/no/such/sdk"))
+        );
+
+        // No repo context and no `local.properties`: the environment decides.
+        let no_props = tmp.path().join("plain");
+        std::fs::create_dir_all(&no_props).expect("mkdir");
+        assert_ne!(
+            android_sdk_root(Some(&no_props)),
+            Some(sdk_path_never_named(&tmp))
+        );
+    }
+
+    fn sdk_path_never_named(tmp: &tempfile::TempDir) -> PathBuf {
+        tmp.path().join("sdk")
     }
 }

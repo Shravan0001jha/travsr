@@ -174,6 +174,19 @@ fn crashed_langs(payload: &StatusPayload) -> Vec<String> {
     warned_langs(payload, "crashed")
 }
 
+/// #904: the sidecars' own warning diagnostics from the last Phase B run, as
+/// the daemon persisted them (`phase_b_diagnostics`, a JSON array). An absent,
+/// empty or unparsable value is no diagnostics: the field is informational and
+/// must never keep `status` from printing the rest.
+fn sidecar_diagnostics(payload: &StatusPayload) -> Vec<travsr_plugin_host::SidecarDiagnostic> {
+    payload
+        .phase_b_diagnostics
+        .as_deref()
+        .filter(|raw| !raw.trim().is_empty())
+        .and_then(|raw| serde_json::from_str(raw).ok())
+        .unwrap_or_default()
+}
+
 /// Languages named by a `<kind>:<lang>` entry in the `phase_b_warnings` meta, for
 /// the given `kind`. Used to reconcile the `semantic:` field with the per-language
 /// warnings printed below it, so the summary line never contradicts them.
@@ -540,6 +553,15 @@ pub fn run() -> anyhow::Result<()> {
         }
     }
 
+    // #904: what the analyzers themselves said about the last run, in their
+    // own words. The classes above can only name a shape (`zero_nodes:java`);
+    // this is where "the Android SDK was not found" reaches the user without
+    // a RUST_LOG re-run. Printed after the classes so it reads as the reason
+    // for the warning above it.
+    for d in sidecar_diagnostics(&payload) {
+        eprintln!("warning: '{}' analysis: {} [{}]", d.lang, d.message, d.code);
+    }
+
     // M1 / #738: warn when Rust's full cross-file edges are degraded. The
     // sandbox remedy is per-OS: only Linux has a sandbox the user can install
     // (bubblewrap); Windows and macOS have none to add here, so the only path
@@ -694,6 +716,7 @@ mod tests {
             signature_format_version: travsr_core::SIGNATURE_FORMAT_VERSION,
             phase_b_commit: Some(phase_b.to_string()),
             phase_b_warnings: None,
+            phase_b_diagnostics: None,
             rust_lsif_degraded: None,
             rerank: String::new(),
             phase_b_dirty: dirty,
@@ -702,6 +725,28 @@ mod tests {
             dart_deps_unresolved: None,
             scip_unification_miss_list: None,
         }
+    }
+
+    // #904: the sidecars' own diagnostics round-trip from the persisted JSON,
+    // and anything that is not that JSON (absent, empty, garbage from an older
+    // daemon) is simply no diagnostics rather than a failed `status`.
+    #[test]
+    fn sidecar_diagnostics_parse_the_persisted_json_and_tolerate_garbage() {
+        let mut p = payload("abc", "abc", false);
+        assert!(sidecar_diagnostics(&p).is_empty());
+        p.phase_b_diagnostics = Some(String::new());
+        assert!(sidecar_diagnostics(&p).is_empty());
+        p.phase_b_diagnostics = Some("not json".into());
+        assert!(sidecar_diagnostics(&p).is_empty());
+        p.phase_b_diagnostics = Some(
+            r#"[{"lang":"java","code":"java.android-sdk-missing","message":"the Android SDK this Android Gradle Plugin build needs was not found"}]"#
+                .into(),
+        );
+        let got = sidecar_diagnostics(&p);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].lang, "java");
+        assert_eq!(got[0].code, "java.android-sdk-missing");
+        assert!(got[0].message.contains("Android SDK"));
     }
 
     #[test]

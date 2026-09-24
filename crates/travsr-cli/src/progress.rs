@@ -568,6 +568,19 @@ pub fn print_summary(stats: &InitStats, elapsed: Duration, quiet: bool, daemon_r
                     }
                 }
             }
+            // #904: what the sidecars themselves said about the run. A missing
+            // Android SDK arrives here in AGP's own words, so the user is not
+            // sent to `travsr status` (or to RUST_LOG) to learn what "produced
+            // no symbols" meant.
+            for d in &report.diagnostics {
+                println!(
+                    "  {} {} analysis: {} [{}]",
+                    pal.orange("⚠"),
+                    d.lang,
+                    d.message,
+                    d.code,
+                );
+            }
             if !report.produced_no_references.is_empty() {
                 let langs = report.produced_no_references.join(", ");
                 println!(

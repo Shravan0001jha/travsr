@@ -247,6 +247,12 @@ pub struct StatusPayload {
     /// H3: warnings from the last Phase B run (crashed/version_mismatch/needs_approval).
     /// Empty string = no warnings.
     pub phase_b_warnings: Option<String>,
+    /// #904: JSON array of the sidecars' own warning diagnostics from the last
+    /// Phase B run (`[{"lang","code","message"}]`), or empty/None. Lets
+    /// `travsr status` name the actual cause (a missing Android SDK) where the
+    /// warning classes above can only name the shape (`zero_nodes:java`).
+    #[serde(default)]
+    pub phase_b_diagnostics: Option<String>,
     /// M1 / #738: rust-analyzer LSIF degradation for the last semantic pass.
     /// "sandbox_unavailable" = ra was skipped (OS sandbox missing); "all_refs_dropped"
     /// = ra ran but every reference failed resolution (0 edges landed). Empty = healthy.
@@ -315,6 +321,7 @@ pub fn status_query(store: &SqliteStore) -> anyhow::Result<StatusPayload> {
         signature_format_version: store.get_signature_format_version()?,
         phase_b_commit: store.get_meta("phase_b_commit")?,
         phase_b_warnings: store.get_meta("phase_b_warnings")?,
+        phase_b_diagnostics: store.get_meta("phase_b_diagnostics")?,
         rust_lsif_degraded: store.get_meta("rust_lsif_degraded")?,
         rerank: crate::rerank::rerank_status().to_string(),
         phase_b_dirty: store.get_meta("phase_b_dirty")?.as_deref() == Some("1"),
