@@ -8589,15 +8589,6 @@ mod tests {
         );
     }
 
-    /// A Phase B cycle whose deep-analysis pass produced nothing for a language
-    /// must record it under the same `emitter_missing:` / `emitter_failed:`
-    /// classes the TypeScript path uses, so `travsr status` downgrades
-    /// `semantic: complete` and names the analyzer.
-    ///
-    /// Before this, `run_ra_lsif` returning `Err` was logged and dropped: the
-    /// language kept only its tree-sitter heuristics while every surface
-    /// reported a clean success. An analyzer that is merely absent is NOT
-    /// recorded here; that is a capability question `lang list` answers.
     /// #904: a sidecar's own warning (the Android SDK was missing) is persisted
     /// as `phase_b_diagnostics` for `travsr status` and carried on the report
     /// for the `init` summary; a clean run clears it so a fixed cause does not
@@ -8660,6 +8651,15 @@ mod tests {
         );
     }
 
+    /// A Phase B cycle whose deep-analysis pass produced nothing for a language
+    /// must record it under the same `emitter_missing:` / `emitter_failed:`
+    /// classes the TypeScript path uses, so `travsr status` downgrades
+    /// `semantic: complete` and names the analyzer.
+    ///
+    /// Before this, `run_ra_lsif` returning `Err` was logged and dropped: the
+    /// language kept only its tree-sitter heuristics while every surface
+    /// reported a clean success. An analyzer that is merely absent is NOT
+    /// recorded here; that is a capability question `lang list` answers.
     #[test]
     fn write_phase_b_results_records_rust_and_python_lsif_skips() {
         travsr_indexer::sandbox::reset_ra_lsif_sandbox_skip();

@@ -381,7 +381,7 @@ impl Sidecar {
         // explicit user permission; here it means "run as a plain child".
         if unsandboxed {
             return Ok(crate::sandbox::build_unsandboxed_command(
-                program, args, repo_root, scratch, language,
+                program, args, scratch, language,
             ));
         }
         crate::sandbox::windows::build_sandboxed_command(

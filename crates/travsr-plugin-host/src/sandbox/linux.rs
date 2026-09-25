@@ -46,7 +46,7 @@ pub fn build_sandboxed_command(
 
     // Per-language toolchain grants (e.g. go module/build caches + GO*/HOME env).
     // Empty for languages with no out-of-repo needs.
-    let tc = crate::sandbox::toolchain::toolchain_access_in(language, Some(repo_root));
+    let tc = crate::sandbox::toolchain::toolchain_access(language);
 
     let mut cmd = Command::new("bwrap");
 

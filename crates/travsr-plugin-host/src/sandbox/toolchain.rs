@@ -202,23 +202,12 @@ pub fn grant_path_has_symlink(root: &std::path::Path, subpath: &str) -> bool {
 
 /// Compute the toolchain grants for a language's Phase B analyzer.
 /// Empty for languages with no out-of-repo toolchain needs.
-///
-/// Repo-independent form; the sandbox builders use [`toolchain_access_in`] so
-/// a grant the repo itself names (`sdk.dir` in an Android `local.properties`)
-/// is honoured too.
 pub fn toolchain_access(language: &str) -> ToolchainAccess {
-    toolchain_access_in(language, None)
-}
-
-/// [`toolchain_access`] for an analyzer that is about to run against
-/// `repo_root`. Only the JVM languages read anything from the repo today
-/// (#904, `android_sdk_root`); every other arm ignores it.
-pub fn toolchain_access_in(language: &str, repo_root: Option<&Path>) -> ToolchainAccess {
     match language {
         "go" => go_access(),
         "dart" => dart_access(),
-        "java" => java_access(repo_root),
-        "kotlin" => kotlin_access(repo_root),
+        "java" => java_access(),
+        "kotlin" => kotlin_access(),
         "scala" => scala_access(),
         "php" => php_access(),
         "csharp" => csharp_access(),
@@ -440,20 +429,20 @@ fn tool_bin_dir(tool: &str) -> Option<PathBuf> {
 }
 
 /// The Android SDK an Android Gradle Plugin build reads, when one is installed
-/// (#904). AGP itself resolves the SDK in this order: `sdk.dir` in the
-/// project's `local.properties`, then `ANDROID_HOME`, then the deprecated
-/// `ANDROID_SDK_ROOT`. The IDE's default install location is tried last, for
-/// the machine where Android Studio manages the SDK and nothing names it in the
-/// environment. Only a directory that exists is returned: an unset or stale
-/// setting grants nothing rather than a path that is not there.
+/// (#904): `ANDROID_HOME`, then the deprecated `ANDROID_SDK_ROOT`, then the
+/// IDE's default install location for the machine where Android Studio manages
+/// the SDK and nothing names it in the environment.
 ///
-/// `local.properties` is repo-controlled, so it is read as data: a directory
-/// path only, never executed, and granted read-only like `JAVA_HOME`.
-fn android_sdk_root(repo_root: Option<&Path>) -> Option<PathBuf> {
-    let from_repo = repo_root
-        .map(|r| r.join("local.properties"))
-        .and_then(|p| std::fs::read_to_string(p).ok())
-        .and_then(|text| parse_local_properties_sdk_dir(&text));
+/// AGP itself consults `sdk.dir` in the project's `local.properties` first.
+/// That source is deliberately NOT read here: the file is repo content, and
+/// the build this sandbox confines is repo code with network access, so a
+/// directory it names would turn into a read grant chosen by the repo
+/// (`sdk.dir=/Users/victim` binds the whole home directory). The environment
+/// and the IDE default are the user's own, like `JAVA_HOME`. A repo whose
+/// `local.properties` points somewhere else fails inside the sandbox with
+/// AGP's own message, which the java sidecar turns into a diagnostic naming
+/// `ANDROID_HOME`.
+fn android_sdk_root() -> Option<PathBuf> {
     let from_env = ["ANDROID_HOME", "ANDROID_SDK_ROOT"]
         .iter()
         .filter_map(std::env::var_os)
@@ -466,42 +455,25 @@ fn android_sdk_root(repo_root: Option<&Path>) -> Option<PathBuf> {
     } else {
         home().map(|h| h.join("Android").join("Sdk"))
     };
-    from_repo
-        .into_iter()
-        .chain(from_env)
-        .chain(default)
-        .find(|p| p.is_dir())
+    first_android_sdk(from_env.chain(default))
 }
 
-/// The `sdk.dir` value of a `local.properties` file, unescaped.
-///
-/// The file is in `java.util.Properties` format, so Android Studio writes a
-/// Windows path as `sdk.dir=C\:\\Users\\me\\AppData\\Local\\Android\\Sdk`: a
-/// backslash escapes the character after it, and `:` and `=` are escaped
-/// because they are key/value separators. Comments start with `#` or `!`.
-fn parse_local_properties_sdk_dir(text: &str) -> Option<PathBuf> {
-    let line = text
-        .lines()
-        .map(str::trim_start)
-        .filter(|l| !l.starts_with('#') && !l.starts_with('!'))
-        .find_map(|l| {
-            let (key, value) = l.split_once(['=', ':'])?;
-            (key.trim() == "sdk.dir").then(|| value.trim())
-        })?;
-    let mut out = String::with_capacity(line.len());
-    let mut chars = line.chars();
-    while let Some(c) = chars.next() {
-        match c {
-            '\\' => match chars.next() {
-                Some('n') => out.push('\n'),
-                Some('t') => out.push('\t'),
-                Some(escaped) => out.push(escaped),
-                None => {}
-            },
-            other => out.push(other),
-        }
-    }
-    (!out.is_empty()).then(|| PathBuf::from(out))
+/// The first candidate that is an Android SDK, in order. The environment is
+/// the user's own, but it is still checked for the SDK's shape rather than
+/// mere existence: a stale `ANDROID_HOME` left pointing at a directory that is
+/// no longer an SDK would otherwise become a read grant on whatever is there
+/// now. `platforms/` or `platform-tools/` is what every SDK install carries
+/// (`sdkmanager` creates them; `android.jar` lives under the first), and a
+/// symlinked root is refused the way the write-grant guard refuses one.
+fn first_android_sdk(candidates: impl IntoIterator<Item = PathBuf>) -> Option<PathBuf> {
+    candidates.into_iter().find(|p| looks_like_android_sdk(p))
+}
+
+fn looks_like_android_sdk(root: &Path) -> bool {
+    let is_real_dir = std::fs::symlink_metadata(root)
+        .map(|md| md.is_dir() && !md.file_type().is_symlink())
+        .unwrap_or(false);
+    is_real_dir && (root.join("platforms").is_dir() || root.join("platform-tools").is_dir())
 }
 
 /// `scip-java index` drives Gradle (and Maven) to resolve dependencies. Needs:
@@ -512,17 +484,15 @@ fn parse_local_properties_sdk_dir(text: &str) -> Option<PathBuf> {
 ///   - the Android SDK   (read) + `ANDROID_HOME`, when one is installed (#904):
 ///     an Android Gradle Plugin build cannot configure without
 ///     `platforms/android-NN/android.jar`, and the cleared sandbox env used to
-///     drop the variable that names the SDK even when the user had set it
-///   - `~/.android`      (read+write) — AGP's per-user state (analytics
-///     settings, debug keystore), created on first use; only when an SDK exists
+///     drop the variable that names the SDK even when the user had set it.
+///     `~/.android` (ADB key, debug keystore) is NOT granted: indexing only
+///     compiles, AGP treats its analytics and keystore state as best-effort,
+///     and no failure without the grant has been measured.
 ///
 /// Also the base grant set for `kotlin_access`: kotlin-language-server drives
 /// the same Gradle/Maven classpath resolution under the hood, even though it
 /// isn't scip-java itself (see `kotlin_access` for what it additionally needs).
-///
-/// `repo_root` lets `local.properties` name the SDK, as AGP itself allows; a
-/// caller without a repo context passes `None` and the environment decides.
-fn java_access(repo_root: Option<&Path>) -> ToolchainAccess {
+fn java_access() -> ToolchainAccess {
     let mut read_paths = Vec::new();
     let mut write_paths = Vec::new();
     let mut env = Vec::new();
@@ -565,19 +535,13 @@ fn java_access(repo_root: Option<&Path>) -> ToolchainAccess {
     // Nothing is granted when no SDK is installed: a repo that is not Android
     // never needs it, and a repo that is gets AGP's own "SDK location not
     // found", which the java sidecar turns into a diagnostic naming the SDK.
-    if let Some(sdk) = android_sdk_root(repo_root) {
+    if let Some(sdk) = android_sdk_root() {
         tracing::debug!(path = %sdk.display(), "java_access: Android SDK grant (read)");
         read_paths.push(sdk.clone());
         env.push((
             "ANDROID_HOME".to_string(),
             sdk.to_string_lossy().into_owned(),
         ));
-        if let Some(h) = home() {
-            let dot_android = h.join(".android");
-            tracing::debug!(path = %dot_android.display(), exists = dot_android.exists(), "java_access: ~/.android grant (read+write)");
-            read_paths.push(dot_android.clone());
-            write_paths.push(dot_android);
-        }
     }
 
     // G5: scip-java (and kotlin-language-server) drive Gradle/Maven, which invoke
@@ -607,8 +571,8 @@ fn java_access(repo_root: Option<&Path>) -> ToolchainAccess {
 /// image load: the wrapper spawned (it lives in the granted `~/.travsr/bin`),
 /// but the launcher it execs, and the jars under `server/lib` it reads, were
 /// both unreachable — 0 nodes, 0 edges, no error surfaced.
-fn kotlin_access(repo_root: Option<&Path>) -> ToolchainAccess {
-    let mut access = java_access(repo_root);
+fn kotlin_access() -> ToolchainAccess {
+    let mut access = java_access();
     if let Some(h) = home() {
         let kls = h.join(".travsr").join("kls");
         tracing::debug!(path = %kls.display(), exists = kls.exists(), "kotlin_access: KLS install dir grant (read+execute)");
@@ -1463,79 +1427,77 @@ mod tests {
 
 #[cfg(test)]
 mod android_sdk_tests {
-    use super::{android_sdk_root, parse_local_properties_sdk_dir};
+    use super::{first_android_sdk, looks_like_android_sdk};
     use std::path::PathBuf;
 
-    // Android Studio writes `local.properties` in java.util.Properties form, so
-    // a Windows path arrives with every `:` and `\` escaped. Both spellings of
-    // the separator, comments and surrounding whitespace are handled.
+    // The environment names the SDK in order (`ANDROID_HOME` before the
+    // deprecated `ANDROID_SDK_ROOT`, the IDE default last) and the first one
+    // that is an SDK wins. Existence alone is not enough: a stale variable
+    // left pointing at a directory that is no longer an SDK grants nothing,
+    // so the sandbox never binds an arbitrary user directory on its account
+    // (#904 review). Candidates are passed in, so this holds without touching
+    // the process environment.
     #[test]
-    fn local_properties_sdk_dir_is_unescaped() {
+    fn first_candidate_that_is_an_sdk_wins() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let missing = tmp.path().join("missing");
+        let not_an_sdk = tmp.path().join("not-an-sdk");
+        std::fs::create_dir_all(&not_an_sdk).expect("mkdir");
+        let sdk = tmp.path().join("sdk");
+        std::fs::create_dir_all(sdk.join("platforms").join("android-36")).expect("mkdir");
+        let later_sdk = tmp.path().join("later-sdk");
+        std::fs::create_dir_all(later_sdk.join("platform-tools")).expect("mkdir");
+
         assert_eq!(
-            parse_local_properties_sdk_dir(concat!(
-                "## This file must *NOT* be checked into Version Control Systems\n",
-                "# Location of the SDK.\n",
-                r"sdk.dir=C\:\\Users\\me\\AppData\\Local\\Android\\Sdk",
-                "\n"
-            )),
-            Some(PathBuf::from(r"C:\Users\me\AppData\Local\Android\Sdk"))
+            first_android_sdk([
+                missing.clone(),
+                not_an_sdk.clone(),
+                sdk.clone(),
+                later_sdk.clone()
+            ]),
+            Some(sdk.clone()),
+            "the first candidate that is an SDK, not the first that exists"
         );
         assert_eq!(
-            parse_local_properties_sdk_dir("  sdk.dir = /Users/me/Library/Android/sdk \n"),
-            Some(PathBuf::from("/Users/me/Library/Android/sdk"))
+            first_android_sdk([later_sdk.clone(), sdk.clone()]),
+            Some(later_sdk),
+            "order is precedence"
         );
-        assert_eq!(
-            parse_local_properties_sdk_dir("sdk.dir:/opt/android-sdk"),
-            Some(PathBuf::from("/opt/android-sdk"))
-        );
-        // Another key, a commented-out key, or no value: nothing.
-        assert_eq!(parse_local_properties_sdk_dir("ndk.dir=/opt/ndk\n"), None);
-        assert_eq!(
-            parse_local_properties_sdk_dir("# sdk.dir=/opt/android-sdk\n"),
-            None
-        );
-        assert_eq!(parse_local_properties_sdk_dir("sdk.dir=\n"), None);
-        assert_eq!(parse_local_properties_sdk_dir(""), None);
+        assert_eq!(first_android_sdk([missing, not_an_sdk]), None);
+        assert_eq!(first_android_sdk(Vec::<PathBuf>::new()), None);
     }
 
-    // The repo's own `local.properties` names the SDK first, as it does for AGP
-    // itself, and only a directory that exists is granted: a stale entry falls
-    // through instead of granting a path that is not there (#904).
+    // Either marker directory identifies an SDK (`sdkmanager` creates both,
+    // but a platforms-only or platform-tools-only install is still one); a
+    // plain directory, a file, or nothing at all does not.
     #[test]
-    fn local_properties_names_the_sdk_when_it_exists() {
+    fn an_sdk_is_recognised_by_its_marker_directories() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        assert!(!looks_like_android_sdk(root));
+        std::fs::write(root.join("platforms"), "").expect("write");
+        assert!(
+            !looks_like_android_sdk(root),
+            "a file named platforms is not a directory"
+        );
+        std::fs::remove_file(root.join("platforms")).expect("rm");
+        std::fs::create_dir_all(root.join("platform-tools")).expect("mkdir");
+        assert!(looks_like_android_sdk(root));
+        assert!(!looks_like_android_sdk(&root.join("platform-tools")));
+        assert!(!looks_like_android_sdk(&root.join("nope")));
+    }
+
+    // A symlinked root is refused, as the write-grant guard refuses one: the
+    // grant would otherwise land on whatever the link points at.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_sdk_root_is_refused() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let sdk = tmp.path().join("sdk");
         std::fs::create_dir_all(sdk.join("platforms")).expect("mkdir");
-        let repo = tmp.path().join("repo");
-        std::fs::create_dir_all(&repo).expect("mkdir");
-        std::fs::write(
-            repo.join("local.properties"),
-            format!(
-                "sdk.dir={}\n",
-                sdk.display().to_string().replace('\\', "\\\\")
-            ),
-        )
-        .expect("write");
-        assert_eq!(android_sdk_root(Some(&repo)), Some(sdk));
-
-        // A `local.properties` naming a directory that does not exist grants
-        // nothing on its own account (the environment may still name one).
-        std::fs::write(repo.join("local.properties"), "sdk.dir=/no/such/sdk\n").expect("write");
-        assert_ne!(
-            android_sdk_root(Some(&repo)),
-            Some(PathBuf::from("/no/such/sdk"))
-        );
-
-        // No repo context and no `local.properties`: the environment decides.
-        let no_props = tmp.path().join("plain");
-        std::fs::create_dir_all(&no_props).expect("mkdir");
-        assert_ne!(
-            android_sdk_root(Some(&no_props)),
-            Some(sdk_path_never_named(&tmp))
-        );
-    }
-
-    fn sdk_path_never_named(tmp: &tempfile::TempDir) -> PathBuf {
-        tmp.path().join("sdk")
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&sdk, &link).expect("symlink");
+        assert!(looks_like_android_sdk(&sdk));
+        assert!(!looks_like_android_sdk(&link));
     }
 }

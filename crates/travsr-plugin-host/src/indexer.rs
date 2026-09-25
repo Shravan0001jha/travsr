@@ -1351,7 +1351,10 @@ impl PluginIndexer {
             // #904: keep the sidecar's own account of the run. Warnings only:
             // an `Info` record is advice for the log, not a state of the index.
             // Sanitized and bounded the way the transport treats a record
-            // before logging it, since this copy outlives the run.
+            // before logging it, since this copy outlives the run. One record
+            // per (language, code): with N build roots and one missing SDK the
+            // sidecar reports the same thing N times, which would print N times
+            // and could fill the cap ahead of another language's record.
             for d in std::mem::take(&mut r.diagnostics) {
                 if outcome.diagnostics.len() >= MAX_PERSISTED_DIAGNOSTICS {
                     break;
@@ -1364,6 +1367,13 @@ impl PluginIndexer {
                 } else {
                     "plugin.invalid-code".to_string()
                 };
+                if outcome
+                    .diagnostics
+                    .iter()
+                    .any(|kept| kept.lang == r.lang && kept.code == code)
+                {
+                    continue;
+                }
                 outcome.diagnostics.push(SidecarDiagnostic {
                     lang: r.lang.clone(),
                     code,

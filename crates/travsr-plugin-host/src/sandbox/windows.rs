@@ -385,7 +385,7 @@ pub fn build_sandboxed_command(
         repo_root: repo_root.to_path_buf(),
         scratch_dir: scratch_dir.to_path_buf(),
         policy: policy.clone(),
-        toolchain: crate::sandbox::toolchain::toolchain_access_in(language, Some(repo_root)),
+        toolchain: crate::sandbox::toolchain::toolchain_access(language),
         repo_write: crate::sandbox::toolchain::repo_write_subpaths(language),
         language: language.to_string(),
         stdin: StdioCfg::Inherit,
