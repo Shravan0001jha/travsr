@@ -200,14 +200,17 @@ pub fn grant_path_has_symlink(root: &std::path::Path, subpath: &str) -> bool {
     false
 }
 
-/// Compute the toolchain grants for a language's Phase B analyzer.
-/// Empty for languages with no out-of-repo toolchain needs.
-pub fn toolchain_access(language: &str) -> ToolchainAccess {
+/// Compute the toolchain grants for a language's Phase B analyzer about to
+/// run against `repo_root`. Empty for languages with no out-of-repo toolchain
+/// needs. Only the JVM arms look at the repo (#904: whether it is an Android
+/// build decides whether the SDK is granted); nothing under it is ever read as
+/// a path to grant.
+pub fn toolchain_access(language: &str, repo_root: &Path) -> ToolchainAccess {
     match language {
         "go" => go_access(),
         "dart" => dart_access(),
-        "java" => java_access(),
-        "kotlin" => kotlin_access(),
+        "java" => java_access(repo_root),
+        "kotlin" => kotlin_access(repo_root),
         "scala" => scala_access(),
         "php" => php_access(),
         "csharp" => csharp_access(),
@@ -458,22 +461,107 @@ fn android_sdk_root() -> Option<PathBuf> {
     first_android_sdk(from_env.chain(default))
 }
 
-/// The first candidate that is an Android SDK, in order. The environment is
-/// the user's own, but it is still checked for the SDK's shape rather than
-/// mere existence: a stale `ANDROID_HOME` left pointing at a directory that is
-/// no longer an SDK would otherwise become a read grant on whatever is there
-/// now. `platforms/` or `platform-tools/` is what every SDK install carries
-/// (`sdkmanager` creates them; `android.jar` lives under the first), and a
-/// symlinked root is refused the way the write-grant guard refuses one.
+/// The first candidate that is an Android SDK, in order, as the directory to
+/// grant. The environment is the user's own, but it is still checked for the
+/// SDK's shape rather than mere existence: a stale `ANDROID_HOME` left
+/// pointing at a directory that is no longer an SDK would otherwise become a
+/// read grant on whatever is there now. `platforms/` or `platform-tools/` is
+/// what every SDK install carries (`sdkmanager` creates them; `android.jar`
+/// lives under the first). A symlinked root (`~/Android/Sdk -> /data/sdk`, a
+/// common way to keep the SDK on another disk) is resolved and the target is
+/// granted, since the sandbox layers bind real paths; the shape check runs on
+/// the resolved directory.
 fn first_android_sdk(candidates: impl IntoIterator<Item = PathBuf>) -> Option<PathBuf> {
-    candidates.into_iter().find(|p| looks_like_android_sdk(p))
+    candidates.into_iter().find_map(|p| android_sdk_at(&p))
 }
 
-fn looks_like_android_sdk(root: &Path) -> bool {
-    let is_real_dir = std::fs::symlink_metadata(root)
-        .map(|md| md.is_dir() && !md.file_type().is_symlink())
-        .unwrap_or(false);
-    is_real_dir && (root.join("platforms").is_dir() || root.join("platform-tools").is_dir())
+fn android_sdk_at(root: &Path) -> Option<PathBuf> {
+    let real = strip_windows_verbatim(std::fs::canonicalize(root).ok()?);
+    let is_sdk =
+        real.is_dir() && (real.join("platforms").is_dir() || real.join("platform-tools").is_dir());
+    is_sdk.then_some(real)
+}
+
+/// Whether the repository at `root` builds with the Android Gradle Plugin,
+/// which is the only build that needs the SDK grant (#904). Without this gate
+/// every Java and Kotlin repo on a machine with Android Studio installed would
+/// pay for a grant it never uses, and on Windows that grant is an ACL walk of
+/// the whole SDK per repo (33.6s measured on a 595 MB SDK, minutes on a full
+/// one with the NDK and system images).
+///
+/// Repo content decides only WHETHER the user's own SDK path is granted,
+/// never WHICH path, so this reads nothing as a path. The AGP plugin id
+/// (`com.android.application`, `com.android.library`, ...) appears in the
+/// module build file that applies it, in the root build file that declares
+/// it, or only in `gradle/libs.versions.toml` when a version catalog names it
+/// (`alias(libs.plugins.android.application)` in the build files carries no
+/// literal). Build files are looked for a few levels down so `android/app/`
+/// (Flutter, React Native) is seen. A `local.properties` next to the settings
+/// file is Android Studio's own marker and counts too; its content is not
+/// read.
+fn repo_uses_android_gradle_plugin(root: &Path) -> bool {
+    const MARKER: &str = "com.android";
+    if root.join("local.properties").is_file() {
+        return true;
+    }
+    if file_mentions(&root.join("gradle").join("libs.versions.toml"), MARKER) {
+        return true;
+    }
+    gradle_build_files(root, 3).any(|f| file_mentions(&f, MARKER))
+}
+
+/// Gradle settings and build files under `root`, at most `depth` directory
+/// levels down. Skips the directories that never hold a module's build file
+/// and can be enormous (`build`, `.gradle`, `node_modules`, hidden dirs).
+fn gradle_build_files(root: &Path, depth: usize) -> impl Iterator<Item = PathBuf> {
+    const NAMES: [&str; 4] = [
+        "settings.gradle",
+        "settings.gradle.kts",
+        "build.gradle",
+        "build.gradle.kts",
+    ];
+    let mut found = Vec::new();
+    let mut pending: Vec<(PathBuf, usize)> = vec![(root.to_path_buf(), 0)];
+    while let Some((dir, level)) = pending.pop() {
+        for name in NAMES {
+            let f = dir.join(name);
+            if f.is_file() {
+                found.push(f);
+            }
+        }
+        if level == depth {
+            continue;
+        }
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with('.') || matches!(name.as_ref(), "build" | "node_modules") {
+                continue;
+            }
+            if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                pending.push((entry.path(), level + 1));
+            }
+        }
+    }
+    found.into_iter()
+}
+
+/// Whether `file` contains `needle`. A build file is a few KB; the read is
+/// capped so a repo cannot make this expensive.
+fn file_mentions(file: &Path, needle: &str) -> bool {
+    const MAX_BYTES: u64 = 1024 * 1024;
+    let Ok(f) = std::fs::File::open(file) else {
+        return false;
+    };
+    let mut text = String::new();
+    use std::io::Read as _;
+    if f.take(MAX_BYTES).read_to_string(&mut text).is_err() {
+        return false;
+    }
+    text.contains(needle)
 }
 
 /// `scip-java index` drives Gradle (and Maven) to resolve dependencies. Needs:
@@ -481,18 +569,21 @@ fn looks_like_android_sdk(root: &Path) -> bool {
 ///   - `~/.gradle`       (read+write) — Gradle daemon, caches, wrapper downloads
 ///   - `~/.m2`           (read) — Maven local repository
 ///   - `HOME` + `GRADLE_USER_HOME` env vars so Gradle finds its home
-///   - the Android SDK   (read) + `ANDROID_HOME`, when one is installed (#904):
-///     an Android Gradle Plugin build cannot configure without
-///     `platforms/android-NN/android.jar`, and the cleared sandbox env used to
-///     drop the variable that names the SDK even when the user had set it.
-///     `~/.android` (ADB key, debug keystore) is NOT granted: indexing only
-///     compiles, AGP treats its analytics and keystore state as best-effort,
-///     and no failure without the grant has been measured.
+///   - the Android SDK   (read) + `ANDROID_HOME`, when one is installed AND
+///     the repo builds with the Android Gradle Plugin (#904): an AGP build
+///     cannot configure without `platforms/android-NN/android.jar`, and the
+///     cleared sandbox env used to drop the variable that names the SDK even
+///     when the user had set it. `~/.android` (ADB key, debug keystore) is NOT
+///     granted: indexing only compiles, AGP treats its analytics and keystore
+///     state as best-effort, and no failure without the grant has been measured.
 ///
 /// Also the base grant set for `kotlin_access`: kotlin-language-server drives
 /// the same Gradle/Maven classpath resolution under the hood, even though it
 /// isn't scip-java itself (see `kotlin_access` for what it additionally needs).
-fn java_access() -> ToolchainAccess {
+///
+/// `repo_root` is the repository the analyzer is about to run against; it
+/// decides whether the SDK grant applies (`repo_uses_android_gradle_plugin`).
+fn java_access(repo_root: &Path) -> ToolchainAccess {
     let mut read_paths = Vec::new();
     let mut write_paths = Vec::new();
     let mut env = Vec::new();
@@ -532,10 +623,15 @@ fn java_access() -> ToolchainAccess {
     }
 
     // #904: Android SDK, read-only, plus the variable AGP reads to find it.
-    // Nothing is granted when no SDK is installed: a repo that is not Android
-    // never needs it, and a repo that is gets AGP's own "SDK location not
-    // found", which the java sidecar turns into a diagnostic naming the SDK.
-    if let Some(sdk) = android_sdk_root() {
+    // Only for a repo that builds with AGP, and only when an SDK is installed:
+    // a repo that is not Android never needs it (and on Windows would pay an
+    // ACL walk of the SDK for nothing), and an Android repo without an SDK
+    // gets AGP's own "SDK location not found", which the java sidecar turns
+    // into a diagnostic naming the SDK.
+    if let Some(sdk) = repo_uses_android_gradle_plugin(repo_root)
+        .then(android_sdk_root)
+        .flatten()
+    {
         tracing::debug!(path = %sdk.display(), "java_access: Android SDK grant (read)");
         read_paths.push(sdk.clone());
         env.push((
@@ -571,8 +667,8 @@ fn java_access() -> ToolchainAccess {
 /// image load: the wrapper spawned (it lives in the granted `~/.travsr/bin`),
 /// but the launcher it execs, and the jars under `server/lib` it reads, were
 /// both unreachable — 0 nodes, 0 edges, no error surfaced.
-fn kotlin_access() -> ToolchainAccess {
-    let mut access = java_access();
+fn kotlin_access(repo_root: &Path) -> ToolchainAccess {
+    let mut access = java_access(repo_root);
     if let Some(h) = home() {
         let kls = h.join(".travsr").join("kls");
         tracing::debug!(path = %kls.display(), exists = kls.exists(), "kotlin_access: KLS install dir grant (read+execute)");
@@ -1427,8 +1523,13 @@ mod tests {
 
 #[cfg(test)]
 mod android_sdk_tests {
-    use super::{first_android_sdk, looks_like_android_sdk};
-    use std::path::PathBuf;
+    use super::{android_sdk_at, first_android_sdk, repo_uses_android_gradle_plugin};
+    use std::path::{Path, PathBuf};
+
+    fn write(path: &Path, text: &str) {
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+        std::fs::write(path, text).expect("write");
+    }
 
     // The environment names the SDK in order (`ANDROID_HOME` before the
     // deprecated `ANDROID_SDK_ROOT`, the IDE default last) and the first one
@@ -1447,6 +1548,8 @@ mod android_sdk_tests {
         std::fs::create_dir_all(sdk.join("platforms").join("android-36")).expect("mkdir");
         let later_sdk = tmp.path().join("later-sdk");
         std::fs::create_dir_all(later_sdk.join("platform-tools")).expect("mkdir");
+        let real =
+            |p: &Path| super::strip_windows_verbatim(std::fs::canonicalize(p).expect("canon"));
 
         assert_eq!(
             first_android_sdk([
@@ -1455,12 +1558,12 @@ mod android_sdk_tests {
                 sdk.clone(),
                 later_sdk.clone()
             ]),
-            Some(sdk.clone()),
+            Some(real(&sdk)),
             "the first candidate that is an SDK, not the first that exists"
         );
         assert_eq!(
             first_android_sdk([later_sdk.clone(), sdk.clone()]),
-            Some(later_sdk),
+            Some(real(&later_sdk)),
             "order is precedence"
         );
         assert_eq!(first_android_sdk([missing, not_an_sdk]), None);
@@ -1474,30 +1577,100 @@ mod android_sdk_tests {
     fn an_sdk_is_recognised_by_its_marker_directories() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let root = tmp.path();
-        assert!(!looks_like_android_sdk(root));
+        assert_eq!(android_sdk_at(root), None);
         std::fs::write(root.join("platforms"), "").expect("write");
-        assert!(
-            !looks_like_android_sdk(root),
+        assert_eq!(
+            android_sdk_at(root),
+            None,
             "a file named platforms is not a directory"
         );
         std::fs::remove_file(root.join("platforms")).expect("rm");
         std::fs::create_dir_all(root.join("platform-tools")).expect("mkdir");
-        assert!(looks_like_android_sdk(root));
-        assert!(!looks_like_android_sdk(&root.join("platform-tools")));
-        assert!(!looks_like_android_sdk(&root.join("nope")));
+        assert!(android_sdk_at(root).is_some());
+        assert_eq!(android_sdk_at(&root.join("platform-tools")), None);
+        assert_eq!(android_sdk_at(&root.join("nope")), None);
     }
 
-    // A symlinked root is refused, as the write-grant guard refuses one: the
-    // grant would otherwise land on whatever the link points at.
+    // A symlinked root (the SDK kept on another disk) is resolved and the
+    // target is what gets granted; the shape check runs on the target.
     #[cfg(unix)]
     #[test]
-    fn a_symlinked_sdk_root_is_refused() {
+    fn a_symlinked_sdk_root_resolves_to_its_target() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let sdk = tmp.path().join("sdk");
         std::fs::create_dir_all(sdk.join("platforms")).expect("mkdir");
         let link = tmp.path().join("link");
         std::os::unix::fs::symlink(&sdk, &link).expect("symlink");
-        assert!(looks_like_android_sdk(&sdk));
-        assert!(!looks_like_android_sdk(&link));
+        let target = std::fs::canonicalize(&sdk).expect("canon");
+        assert_eq!(android_sdk_at(&link), Some(target.clone()));
+        assert_eq!(android_sdk_at(&sdk), Some(target));
+        let dangling = tmp.path().join("dangling");
+        std::os::unix::fs::symlink(tmp.path().join("gone"), &dangling).expect("symlink");
+        assert_eq!(android_sdk_at(&dangling), None);
+    }
+
+    // The SDK is granted only to a repo that builds with AGP: the plugin id in
+    // a module or root build file, in the version catalog when the build files
+    // only alias it, a nested `android/app` layout, or Android Studio's
+    // `local.properties` next to the settings file. A plain Gradle or Maven
+    // repo gets no grant, and nothing is read as a path.
+    #[test]
+    fn only_an_android_gradle_build_gets_the_sdk_grant() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+
+        // Plain Java Gradle repo: no grant.
+        write(
+            &root.join("settings.gradle.kts"),
+            "rootProject.name = \"plain\"\n",
+        );
+        write(&root.join("build.gradle.kts"), "plugins { id(\"java\") }\n");
+        assert!(!repo_uses_android_gradle_plugin(root));
+
+        // The module applies AGP.
+        write(
+            &root.join("app").join("build.gradle.kts"),
+            "plugins { id(\"com.android.application\") }\n",
+        );
+        assert!(repo_uses_android_gradle_plugin(root));
+        std::fs::remove_dir_all(root.join("app")).expect("rm");
+        assert!(!repo_uses_android_gradle_plugin(root));
+
+        // Version catalog only: the build files carry `alias(libs.plugins...)`.
+        write(
+            &root.join("gradle").join("libs.versions.toml"),
+            "[plugins]\nandroid-application = { id = \"com.android.application\", version = \"9.3.2\" }\n",
+        );
+        assert!(repo_uses_android_gradle_plugin(root));
+        std::fs::remove_dir_all(root.join("gradle")).expect("rm");
+        assert!(!repo_uses_android_gradle_plugin(root));
+
+        // Flutter / React Native: the Android build lives under `android/`.
+        write(
+            &root.join("android").join("app").join("build.gradle"),
+            "apply plugin: 'com.android.application'\n",
+        );
+        assert!(repo_uses_android_gradle_plugin(root));
+        std::fs::remove_dir_all(root.join("android")).expect("rm");
+
+        // Too deep to be a module layout, and a `build/` output dir is skipped.
+        write(
+            &root
+                .join("a")
+                .join("b")
+                .join("c")
+                .join("d")
+                .join("build.gradle"),
+            "apply plugin: 'com.android.library'\n",
+        );
+        write(
+            &root.join("build").join("build.gradle"),
+            "apply plugin: 'com.android.library'\n",
+        );
+        assert!(!repo_uses_android_gradle_plugin(root));
+
+        // Android Studio's marker file; its content is never read.
+        write(&root.join("local.properties"), "sdk.dir=/nowhere\n");
+        assert!(repo_uses_android_gradle_plugin(root));
     }
 }
