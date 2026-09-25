@@ -932,6 +932,7 @@ pub fn build_manifests(language: &str) -> &'static [&'static str] {
             "settings.gradle",
             "settings.gradle.kts",
         ],
+        "scala" => &["build.sbt"],
         _ => &[],
     }
 }
