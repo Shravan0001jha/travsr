@@ -558,8 +558,20 @@ pub fn print_summary(stats: &InitStats, elapsed: Duration, quiet: bool, daemon_r
             }
             if !report.produced_no_nodes.is_empty() {
                 let langs = report.produced_no_nodes.join(", ");
+                // #904: when the analyzer said why, the reason prints right
+                // below; sending the user to `travsr status` for it would
+                // point at a copy of the same line.
+                let explained = report
+                    .diagnostics
+                    .iter()
+                    .any(|d| report.produced_no_nodes.contains(&d.lang));
+                let where_to_look = if explained {
+                    ""
+                } else {
+                    "; see `travsr status` for why"
+                };
                 println!(
-                    "  {} semantic analyzer ran but produced no symbols for: {langs}; see `travsr status` for why",
+                    "  {} semantic analyzer ran but produced no symbols for: {langs}{where_to_look}",
                     pal.orange("⚠"),
                 );
                 if report.produced_no_nodes.iter().any(|l| l == "java") {
@@ -567,6 +579,19 @@ pub fn print_summary(stats: &InitStats, elapsed: Duration, quiet: bool, daemon_r
                         println!("    {hint}");
                     }
                 }
+            }
+            // #904: what the sidecars themselves said about the run. A missing
+            // Android SDK arrives here in AGP's own words, so the user is not
+            // sent to `travsr status` (or to RUST_LOG) to learn what "produced
+            // no symbols" meant.
+            for d in &report.diagnostics {
+                println!(
+                    "  {} {} analysis: {} [{}]",
+                    pal.orange("⚠"),
+                    d.lang,
+                    d.message,
+                    d.code,
+                );
             }
             if !report.produced_no_references.is_empty() {
                 let langs = report.produced_no_references.join(", ");

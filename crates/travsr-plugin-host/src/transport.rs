@@ -21,13 +21,13 @@ use travsr_plugin_protocol::{
 /// 64 lines; these are bounded here.
 const MAX_DIAGNOSTICS: usize = 32;
 const MAX_DIAGNOSTIC_CODE_BYTES: usize = 256;
-const MAX_DIAGNOSTIC_MESSAGE_BYTES: usize = 1024;
+pub(crate) const MAX_DIAGNOSTIC_MESSAGE_BYTES: usize = 1024;
 
 /// Whether `code` has the dotted-identifier shape its wire contract documents
 /// (`java.tests-not-compiled`). Nothing on the wire enforces it, and the host
 /// emits `code` as a tracing FIELD, where an arbitrary value could impersonate a
 /// log key for anything that later selects on it.
-fn is_diagnostic_code(code: &str) -> bool {
+pub(crate) fn is_diagnostic_code(code: &str) -> bool {
     !code.is_empty()
         && code.len() <= MAX_DIAGNOSTIC_CODE_BYTES
         && code
@@ -41,7 +41,7 @@ fn is_diagnostic_code(code: &str) -> bool {
 /// nor tests that, and it does not escape `\n` / `\r` at all: a message with
 /// newlines forges apparent log lines on the plain stderr layer. Owning the
 /// property here makes it one sanitising step rather than a borrowed one.
-fn sanitize_diagnostic(s: &str, limit: usize) -> String {
+pub(crate) fn sanitize_diagnostic(s: &str, limit: usize) -> String {
     let mut out = String::with_capacity(s.len().min(limit));
     for ch in s.chars() {
         let ch = if ch.is_control() { ' ' } else { ch };
@@ -381,7 +381,7 @@ impl Sidecar {
         // explicit user permission; here it means "run as a plain child".
         if unsandboxed {
             return Ok(crate::sandbox::build_unsandboxed_command(
-                program, args, scratch, language,
+                program, args, repo_root, scratch, language,
             ));
         }
         crate::sandbox::windows::build_sandboxed_command(

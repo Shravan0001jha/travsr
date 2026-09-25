@@ -118,7 +118,31 @@ pub struct PhaseBOutcome {
     /// Languages whose sidecar binary responded with a mismatched protocol
     /// version. User-actionable: `travsr lang install <lang>` to upgrade.
     pub version_mismatch: Vec<(String, u32, u32)>,
+    /// #904: warning diagnostics the sidecars sent with their results. Until
+    /// now these were logged by the transport and dropped, so a sidecar that
+    /// knew exactly why it produced nothing (the Android SDK was missing)
+    /// could not say so anywhere the user looks, and `travsr status` fell
+    /// back to the generic "found no symbols". Bounded and sanitized here.
+    pub diagnostics: Vec<SidecarDiagnostic>,
 }
+
+/// A warning a Phase B sidecar attached to its result, kept for `travsr
+/// status` and the `init` summary (#904).
+///
+/// The sidecar is untrusted, so the host owns the shape: `code` is either a
+/// valid dotted identifier or the neutral placeholder the transport also logs
+/// under, and `message` is control-character-free and capped, exactly as the
+/// transport treats the same record before logging it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SidecarDiagnostic {
+    pub lang: String,
+    pub code: String,
+    pub message: String,
+}
+
+/// Cap on the diagnostics kept per run. Enough for every language to say one
+/// or two things; a sidecar cannot grow the meta table by being chatty.
+const MAX_PERSISTED_DIAGNOSTICS: usize = 16;
 
 /// Inputs for [`PluginIndexer::invoke_phase_b_all`].
 ///
@@ -725,6 +749,8 @@ impl PluginIndexer {
             /// Some((expected, got)) when the sidecar binary's protocol version
             /// does not match the daemon's PROTOCOL_VERSION.
             version_mismatch: Option<(u32, u32)>,
+            /// #904: warnings the sidecar sent alongside its result.
+            diagnostics: Vec<travsr_plugin_protocol::PluginDiagnostic>,
         }
 
         // P2: fan out per-language work in parallel. Each thread owns its work
@@ -773,6 +799,7 @@ impl PluginIndexer {
                                             skipped_no_analyzer: false,
                                             crashed: false,
                                             version_mismatch: None,
+                                            diagnostics: Vec::new(),
                                         }
                                     }
                                     Err(e) => {
@@ -790,6 +817,7 @@ impl PluginIndexer {
                                             skipped_no_analyzer: false,
                                             crashed: true,
                                             version_mismatch: None,
+                                            diagnostics: Vec::new(),
                                         }
                                     }
                                 }
@@ -892,6 +920,7 @@ impl PluginIndexer {
                                     skipped_no_analyzer: false,
                                     crashed: false,
                                     version_mismatch: None,
+                                    diagnostics: Vec::new(),
                                 }
                             }
                             LangWork::NativeTypescript => {
@@ -1060,6 +1089,7 @@ impl PluginIndexer {
                                     skipped_no_analyzer: false,
                                     crashed: false,
                                     version_mismatch: None,
+                                    diagnostics: Vec::new(),
                                 }
                             }
                             LangWork::NativePython => {
@@ -1139,6 +1169,7 @@ impl PluginIndexer {
                                     skipped_no_analyzer: false,
                                     crashed: false,
                                     version_mismatch: None,
+                                    diagnostics: Vec::new(),
                                 }
                             }
                             LangWork::Sidecar(spec, invoke_roots) => {
@@ -1160,6 +1191,7 @@ impl PluginIndexer {
                                     skipped_no_analyzer: false,
                                     crashed: false,
                                     version_mismatch: None,
+                                    diagnostics: Vec::new(),
                                 };
                                 let mut declined = 0usize;
                                 for invoke_root in &invoke_roots {
@@ -1239,6 +1271,7 @@ impl PluginIndexer {
                                             acc.edges.extend(resp.edges);
                                             acc.refs.extend(resp.refs);
                                             acc.unresolved_calls.extend(resp.unresolved_calls);
+                                            acc.diagnostics.extend(resp.diagnostics);
                                         }
                                         Err(travsr_error::IndexError::PhaseNotSupported) => {
                                             declined += 1;
@@ -1297,6 +1330,7 @@ impl PluginIndexer {
                         skipped_no_analyzer: false,
                         crashed: true,
                         version_mismatch: None,
+                        diagnostics: Vec::new(),
                     })
                 })
                 .collect()
@@ -1313,7 +1347,42 @@ impl PluginIndexer {
         let mut all_unresolved: Vec<travsr_core::UnresolvedCall> = Vec::new();
         let mut all_positional_refs: Vec<travsr_core::LsifPositionalRef> = Vec::new();
 
-        for r in lang_results {
+        for mut r in lang_results {
+            // #904: keep the sidecar's own account of the run. Warnings only:
+            // an `Info` record is advice for the log, not a state of the index.
+            // Sanitized and bounded the way the transport treats a record
+            // before logging it, since this copy outlives the run. One record
+            // per (language, code): with N build roots and one missing SDK the
+            // sidecar reports the same thing N times, which would print N times
+            // and could fill the cap ahead of another language's record.
+            for d in std::mem::take(&mut r.diagnostics) {
+                if outcome.diagnostics.len() >= MAX_PERSISTED_DIAGNOSTICS {
+                    break;
+                }
+                if matches!(d.severity, travsr_plugin_protocol::DiagnosticSeverity::Info) {
+                    continue;
+                }
+                let code = if crate::transport::is_diagnostic_code(&d.code) {
+                    d.code.clone()
+                } else {
+                    "plugin.invalid-code".to_string()
+                };
+                if outcome
+                    .diagnostics
+                    .iter()
+                    .any(|kept| kept.lang == r.lang && kept.code == code)
+                {
+                    continue;
+                }
+                outcome.diagnostics.push(SidecarDiagnostic {
+                    lang: r.lang.clone(),
+                    code,
+                    message: crate::transport::sanitize_diagnostic(
+                        &d.message,
+                        crate::transport::MAX_DIAGNOSTIC_MESSAGE_BYTES,
+                    ),
+                });
+            }
             // #724 Finding 5: with N build roots one can fail while another
             // succeeds, so `crashed` is recorded outside the `else` ladder and a
             // partial run reports as both ran and crashed rather than clean

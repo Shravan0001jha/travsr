@@ -206,6 +206,12 @@ pub struct PhaseBReport {
     /// started as: rust and python reach this the same way, and a repo can be
     /// missing more than one analyzer at once.
     pub lsif_skipped: Vec<LsifSkip>,
+    /// #904: warnings the sidecars attached to their results, in the sidecar's
+    /// own words (a missing Android SDK, a test scope the build never
+    /// compiled). Shown in the `init` summary and persisted as
+    /// `phase_b_diagnostics` for `travsr status`, so a run that produced
+    /// nothing can say why instead of only that it did.
+    pub diagnostics: Vec<travsr_plugin_host::SidecarDiagnostic>,
 }
 
 /// #878: why the TypeScript LSIF pass produced no edges for a repo that asked
@@ -3527,6 +3533,14 @@ fn write_phase_b_results(
     } else {
         let _ = store.set_meta("phase_b_warnings", "");
     }
+    // #904: the sidecars' own diagnostics, as JSON. Persisted next to the
+    // warning classes for the same reason: the default `init` defers Phase B
+    // to the daemon, so `travsr status` is where the user reads the outcome,
+    // and a class alone (`zero_nodes:java`) cannot name the Android SDK.
+    // Bounded and sanitized by the indexer before it reaches here. Written
+    // on every run, so a stale diagnostic does not outlive its fix.
+    let diagnostics_json = serde_json::to_string(&pb_outcome.diagnostics).unwrap_or_default();
+    let _ = store.set_meta("phase_b_diagnostics", &diagnostics_json);
 
     // M1 degradation flag: surfaced by `travsr status` so the user knows Rust
     // semantic edges are degraded without having to grep logs. Precedence:
@@ -3565,6 +3579,7 @@ fn write_phase_b_results(
         produced_no_references: pb_outcome.produced_no_references,
         version_mismatch: pb_outcome.version_mismatch,
         lsif_skipped: lsif_skips,
+        diagnostics: pb_outcome.diagnostics,
     };
     (report, alias_map, dropped)
 }
@@ -8788,6 +8803,68 @@ mod tests {
         assert!(
             linked(&store),
             "a cycle that writes a crate node links crate -> package"
+        );
+    }
+
+    /// #904: a sidecar's own warning (the Android SDK was missing) is persisted
+    /// as `phase_b_diagnostics` for `travsr status` and carried on the report
+    /// for the `init` summary; a clean run clears it so a fixed cause does not
+    /// keep being reported.
+    #[test]
+    fn write_phase_b_results_persists_sidecar_diagnostics() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".travsr")).unwrap();
+        let mut store =
+            travsr_store::SqliteStore::open(&tmp.path().join(".travsr/graph.db")).unwrap();
+
+        let outcome = travsr_plugin_host::PhaseBOutcome {
+            ran: vec!["java".into()],
+            produced_no_nodes: vec!["java".into()],
+            diagnostics: vec![travsr_plugin_host::SidecarDiagnostic {
+                lang: "java".into(),
+                code: "java.android-sdk-missing".into(),
+                message: "the Android SDK this build needs was not found".into(),
+            }],
+            ..Default::default()
+        };
+        let (report, _, _) = write_phase_b_results(
+            &mut store,
+            "test",
+            vec![],
+            vec![],
+            vec![],
+            outcome,
+            (0, 0),
+            None,
+        );
+        assert_eq!(report.diagnostics.len(), 1);
+        assert_eq!(report.diagnostics[0].code, "java.android-sdk-missing");
+        let persisted: Vec<travsr_plugin_host::SidecarDiagnostic> = serde_json::from_str(
+            &store
+                .get_meta("phase_b_diagnostics")
+                .unwrap()
+                .unwrap_or_default(),
+        )
+        .expect("phase_b_diagnostics is a JSON array");
+        assert_eq!(persisted, report.diagnostics);
+
+        // The next run said nothing: the meta is cleared, not left stale.
+        write_phase_b_results(
+            &mut store,
+            "test",
+            vec![],
+            vec![],
+            vec![],
+            travsr_plugin_host::PhaseBOutcome::default(),
+            (0, 0),
+            None,
+        );
+        assert_eq!(
+            store
+                .get_meta("phase_b_diagnostics")
+                .unwrap()
+                .unwrap_or_default(),
+            "[]"
         );
     }
 
