@@ -63,11 +63,13 @@ pub fn run(dir: &Path, output: &Path, corpus: &str) -> anyhow::Result<()> {
     let (
         phase_b_nodes,
         phase_b_edges,
-        phase_b_refs,
+        mut phase_b_refs,
         _phase_b_unresolved,
         _phase_b_positional,
         _phase_b_outcome,
     ) = indexer.invoke_phase_b_all(&phase_b_inputs);
+    // #833: the same call/non-call split the daemon applies before it writes.
+    travsr_daemon::classify_phase_b_calls(dir, &phase_b_nodes, &mut phase_b_refs);
     for node in phase_b_nodes {
         all_nodes.insert(node.id, node);
     }

@@ -2080,6 +2080,7 @@ pub fn init_repo_with_progress(
                     out
                 })
             };
+            classify_phase_b_calls(repo_root, &pb_nodes, &mut pb_refs);
             // E3 W3b: resolve rust-analyzer LSIF positional refs against the full
             // store (cross-file + incremental-safe) into attributable ScipRefs.
             // Fail closed — a callee that resolves to no node is dropped here, so
@@ -3191,6 +3192,88 @@ fn run_outcome(report: &PhaseBReport, made_progress: bool) -> phase_b_sched::Run
         phase_b_sched::RunOutcome::Partial
     } else {
         phase_b_sched::RunOutcome::AllCrashed
+    }
+}
+
+/// Clear `is_call` on Phase B references that are not calls.
+///
+/// Sidecars flag every reference occurrence `is_call: true` (scip-reader, the
+/// Kotlin wrapper, the Dart emitter), so a parameter type, a supertype or a
+/// local read was written as a `ref/call`. This applies the same call-site
+/// rule `ingest_scip_g2` and the Rust positional path use, where the language
+/// always calls with parentheses and the occurrence has a column. Anything
+/// else is left as the producer sent it.
+pub fn classify_phase_b_calls(
+    repo_root: &Path,
+    nodes: &[travsr_core::Node],
+    refs: &mut [travsr_core::ScipRef],
+) {
+    let languages: std::collections::HashMap<&str, &str> = nodes
+        .iter()
+        .map(|n| (n.vname.path.as_str(), n.vname.language.as_str()))
+        .collect();
+    // Scala calls need no parentheses, but a SemanticDB type symbol (`Animal#`)
+    // is never the callee: construction references `<init>` or `apply`.
+    let scala_types: std::collections::HashSet<travsr_core::NodeId> = nodes
+        .iter()
+        .filter(|n| n.vname.signature.starts_with("sdb:") && n.vname.signature.ends_with('#'))
+        .map(|n| n.id)
+        .collect();
+    // Ruby calls need no parentheses either, but a class reference (a SCIP
+    // type descriptor, `Animal#`; scip-ruby sends no kind) constructs only as
+    // the receiver of `.new`; a superclass or `is_a?` is a mention.
+    let ruby_types: std::collections::HashSet<travsr_core::NodeId> = nodes
+        .iter()
+        .filter(|n| n.vname.language == "ruby" && n.vname.signature.ends_with('#'))
+        .map(|n| n.id)
+        .collect();
+    // A reference to a function is a call however it is spelled (a trailing
+    // lambda, an infix call, explicit type arguments). The rule is for the
+    // mentions that are not: a type, a property, a local.
+    let callables: std::collections::HashSet<travsr_core::NodeId> = nodes
+        .iter()
+        .filter(|n| matches!(n.kind.as_str(), "function" | "method" | "constructor"))
+        .map(|n| n.id)
+        .collect();
+    let mut src = travsr_indexer::callsite::SourceLines::new();
+    for r in refs.iter_mut().filter(|r| r.is_call) {
+        if callables.contains(&r.callee_id) {
+            continue;
+        }
+        if scala_types.contains(&r.callee_id) {
+            r.is_call = false;
+            continue;
+        }
+        let Some(byte_col) = r.caller_col else {
+            continue;
+        };
+        let ruby_type = ruby_types.contains(&r.callee_id);
+        if !ruby_type
+            && !languages
+                .get(r.caller_path.as_str())
+                .is_some_and(|l| travsr_indexer::callsite::uses_call_parens(l))
+        {
+            continue;
+        }
+        let Some(line) = src.line(&repo_root.join(&r.caller_path), r.caller_line) else {
+            continue;
+        };
+        if ruby_type {
+            let rest = line.get(byte_col as usize..).unwrap_or("");
+            let name_len = rest
+                .find(|c: char| !(c.is_alphanumeric() || c == '_'))
+                .unwrap_or(rest.len());
+            r.is_call = rest[name_len..]
+                .strip_prefix(".new")
+                .is_some_and(|after| !after.starts_with(|c: char| c.is_alphanumeric() || c == '_'));
+            continue;
+        }
+        // `caller_col` is a byte offset; the rule takes a UTF-16 column.
+        let Some(prefix) = line.get(..byte_col as usize) else {
+            continue;
+        };
+        let utf16_col = prefix.encode_utf16().count() as u32;
+        r.is_call = travsr_indexer::callsite::occurrence_is_call(line, utf16_col);
     }
 }
 
@@ -5098,6 +5181,7 @@ fn run_background_phase_b_inner(
     };
     let (pb_nodes, pb_edges, mut pb_refs, pb_unresolved, pb_positional, pb_outcome) =
         indexer.invoke_phase_b_all(&inputs);
+    classify_phase_b_calls(repo_root, &pb_nodes, &mut pb_refs);
 
     // ── Single write batch under the lock ─────────────────────────────────────
     let mut s = store.lock().unwrap_or_else(|e| e.into_inner());
@@ -6676,6 +6760,139 @@ mod tests {
             "ambiguous field signature must fabricate no edge: {edges:?}"
         );
         assert!(sites.is_empty());
+    }
+
+    #[test]
+    fn a_reference_to_a_callable_keeps_its_call_flag() {
+        // The `(` rule separates a type or property mention from a call, but a
+        // reference to a function is a call however it is spelled: a Kotlin
+        // trailing lambda `build { }`, an infix call, `new Box<Int>(..)`.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(tmp.path().join("M.kt"), "    build { }\n    a shouldBe b\n")
+            .expect("write");
+        let f = |sig: &str| {
+            travsr_core::Node::new(
+                travsr_core::VName::new("c", "", "M.kt", "kotlin", sig),
+                "function",
+            )
+        };
+        let (build, should) = (f("fn:build"), f("fn:shouldBe"));
+        let r = |callee: travsr_core::NodeId, line: u32, col: u32| travsr_core::ScipRef {
+            caller_path: "M.kt".to_string(),
+            caller_line: line,
+            callee_id: callee,
+            is_call: true,
+            caller_col: Some(col),
+        };
+        let mut refs = vec![r(build.id, 1, 4), r(should.id, 2, 6)];
+        super::classify_phase_b_calls(tmp.path(), &[build, should], &mut refs);
+        let got: Vec<bool> = refs.iter().map(|r| r.is_call).collect();
+        assert_eq!(got, [true, true]);
+    }
+
+    #[test]
+    fn ruby_class_reference_is_a_call_only_before_new() {
+        // Ruby calls need no parentheses. A class reference constructs only as
+        // the receiver of `.new`; a superclass is a mention.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            tmp.path().join("a.rb"),
+            "class Dog < Animal\nzoo = Zoo.new\nz = Zoo.new_from(c)\n",
+        )
+        .expect("write");
+        let class = |name: &str| {
+            travsr_core::Node::new(
+                travsr_core::VName::new("c", "", "a.rb", "ruby", format!("scip:a.rb:x {name}#")),
+                // scip-ruby emits no SymbolInformation kind.
+                "definition",
+            )
+        };
+        let (animal, zoo) = (class("Animal"), class("Zoo"));
+        let r = |callee: travsr_core::NodeId, line: u32, col: u32| travsr_core::ScipRef {
+            caller_path: "a.rb".to_string(),
+            caller_line: line,
+            callee_id: callee,
+            is_call: true,
+            caller_col: Some(col),
+        };
+        let mut refs = vec![r(animal.id, 1, 12), r(zoo.id, 2, 6), r(zoo.id, 3, 4)];
+        super::classify_phase_b_calls(tmp.path(), &[animal, zoo], &mut refs);
+        let got: Vec<bool> = refs.iter().map(|r| r.is_call).collect();
+        assert_eq!(got, [false, true, false]);
+    }
+
+    #[test]
+    fn scala_reference_to_a_type_symbol_is_not_a_call() {
+        // Scala calls need no parentheses, so the `(` rule cannot judge it, but
+        // a SemanticDB type symbol (`Animal#`) is never called: `new Zoo` and
+        // `Zoo()` reference `Zoo#`<init>`().` or `Zoo.apply().` instead.
+        let ty = travsr_core::Node::new(
+            travsr_core::VName::new("c", "", "s/A.scala", "scala", "sdb:_empty_/Animal#"),
+            "class",
+        );
+        let ctor = travsr_core::Node::new(
+            travsr_core::VName::new("c", "", "s/A.scala", "scala", "sdb:_empty_/Zoo#`<init>`()."),
+            "method",
+        );
+        let r = |callee: travsr_core::NodeId| travsr_core::ScipRef {
+            caller_path: "s/A.scala".to_string(),
+            caller_line: 1,
+            callee_id: callee,
+            is_call: true,
+            caller_col: Some(0),
+        };
+        let mut refs = vec![r(ty.id), r(ctor.id)];
+        let tmp = tempfile::tempdir().expect("tempdir");
+        super::classify_phase_b_calls(tmp.path(), &[ty, ctor], &mut refs);
+        let got: Vec<bool> = refs.iter().map(|r| r.is_call).collect();
+        assert_eq!(got, [false, true]);
+    }
+
+    #[test]
+    fn non_call_occurrences_are_not_calls() {
+        // Sidecars flag every reference `is_call: true`, so a parameter type, a
+        // supertype, a generic argument or a local read became a `ref/call`.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("java")).expect("mkdir");
+        std::fs::write(
+            root.join("java/Zoo.java"),
+            "public void add(Animal animal) {\n    Zoo zoo = new Zoo();\n",
+        )
+        .expect("write");
+        std::fs::write(root.join("Main.kt"), "    zoo.add(dog)\n").expect("write");
+        std::fs::write(root.join("a.rb"), "class Dog < Animal\n").expect("write");
+        let node = |path: &str, lang: &str| {
+            travsr_core::Node::new(
+                travsr_core::VName::new("c", "", path, lang, "fn:f"),
+                "function",
+            )
+        };
+        let nodes = [
+            node("java/Zoo.java", "java"),
+            node("Main.kt", "kotlin"),
+            node("a.rb", "ruby"),
+        ];
+        let r = |path: &str, line: u32, col: Option<u32>| travsr_core::ScipRef {
+            caller_path: path.to_string(),
+            caller_line: line,
+            callee_id: travsr_core::NodeId(1),
+            is_call: true,
+            caller_col: col,
+        };
+        let mut refs = vec![
+            r("java/Zoo.java", 1, Some(16)), // `Animal` parameter type
+            r("java/Zoo.java", 2, Some(4)),  // `Zoo zoo` declared type
+            r("java/Zoo.java", 2, Some(18)), // `new Zoo(` constructor call
+            r("Main.kt", 1, Some(4)),        // `zoo.` local read
+            r("Main.kt", 1, Some(12)),       // `dog` argument
+            r("Main.kt", 1, Some(8)),        // `add(` call
+            r("Main.kt", 1, None),           // no column: left alone
+            r("a.rb", 1, Some(12)),          // paren-optional language: left alone
+        ];
+        super::classify_phase_b_calls(root, &nodes, &mut refs);
+        let got: Vec<bool> = refs.iter().map(|r| r.is_call).collect();
+        assert_eq!(got, [false, false, true, false, false, true, true, true]);
     }
 
     #[test]
